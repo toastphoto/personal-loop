@@ -71,3 +71,20 @@ test("malformed or duplicate project identities fail the provider visibly", asyn
     assert.equal(view.projects.length, 0);
   }
 });
+
+test("a scoped metadata read passes native project identity to the provider", async () => {
+  let options;
+  const catalog = new ProjectCatalog({
+    codex: connector([project("p")], {
+      readWork: async (id, input) => {
+        options = input;
+        return { nativeId: id, projectId: input.projectId, nativeProjectId: null, membership: "cwd-unassigned" };
+      },
+    }),
+  });
+  await catalog.refresh();
+  const item = await catalog.readWork(projectKey("codex", "local", "p"), "old-thread");
+  assert.deepEqual(options, { projectId: "p" });
+  assert.equal(item.nativeProjectId, null);
+  assert.equal(item.membership, "cwd-unassigned");
+});

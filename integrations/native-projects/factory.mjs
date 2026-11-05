@@ -1,8 +1,10 @@
 import { readFileSync } from "node:fs";
-import { ProjectCatalog, failure } from "./catalog.mjs";
+import path from "node:path";
+import { ProjectCatalog, failure, projectKey } from "./catalog.mjs";
 import { CodexConnector } from "./codex.mjs";
 import { MulticaConnector } from "./multica.mjs";
 import { DshConnector } from "./dsh.mjs";
+import { DshBridgeConnector } from "./dsh-bridge.mjs";
 
 export function readConfig(file) {
   const value = JSON.parse(readFileSync(file, "utf8"));
@@ -17,7 +19,31 @@ export function createCatalog(config) {
   for (const [name, options] of Object.entries(config.providers)) {
     if (options.enabled === false) continue;
     // Read connections never inherit write permission from arbitrary provider options.
-    connectors[name] = new constructors[name]({ ...options, writeEnabled: false });
+    const Constructor = name === "dsh" && options.bridgeSocket ? DshBridgeConnector : constructors[name];
+    const connector = new Constructor({ ...options, writeEnabled: false });
+    if (name === "codex" && config.managedCodex?.enabled === true) {
+      const original = connector.listProjects.bind(connector);
+      connector.listProjects = async () => {
+        const result = await original();
+        return {
+          ...result,
+          projects: result.projects.map((p) => {
+            const key = projectKey(name, p.host ?? "local", p.nativeId),
+              root = config.managedCodex.projectRoots?.[key];
+            const available = typeof root === "string" && path.isAbsolute(root) && p.roots.includes(root);
+            return {
+              ...p,
+              capabilities: {
+                ...p.capabilities,
+                startOwned: available,
+                continuationMode: available ? "managed-read-only" : undefined,
+              },
+            };
+          }),
+        };
+      };
+    }
+    connectors[name] = connector;
   }
   return new ProjectCatalog(connectors);
 }

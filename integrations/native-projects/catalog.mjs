@@ -81,7 +81,7 @@ export class ProjectCatalog {
   }
   async readWork(key, nativeId) {
     const { project, backend } = this.resolve(key);
-    const result = await backend.readWork(nativeId);
+    const result = await backend.readWork(nativeId, { projectId: project.nativeId });
     if (result?.projectId !== project.nativeId) throw failure("PROJECT_MISMATCH");
     return { ...result, projectKey: key, provider: project.provider };
   }

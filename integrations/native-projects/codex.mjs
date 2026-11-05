@@ -71,6 +71,7 @@ export class CodexConnector {
   async listProjects() {
     const rows = await this.pages("project/list", { limit: 100 });
     const seen = new Set();
+    const projectRoots = new Map();
     const projects = rows.map((row) => {
       if (!row || !validId(row.id) || typeof row.name !== "string" || !Array.isArray(row.roots))
         fail("CODEX_PROTOCOL_ERROR", "Codex项目元数据无效");
@@ -79,7 +80,7 @@ export class CodexConnector {
       const roots = row.roots.map((root) => root.path);
       if (roots.some((path) => typeof path !== "string" || !(posix.isAbsolute(path) || win32.isAbsolute(path))))
         fail("CODEX_PROTOCOL_ERROR", "Codex项目目录无效");
-      this.projectRoots.set(row.id, roots);
+      projectRoots.set(row.id, roots);
       return {
         provider: "codex",
         host: this.host,
@@ -89,6 +90,7 @@ export class CodexConnector {
         capabilities: { read: true, continue: this.writeEnabled, cancel: this.writeEnabled },
       };
     });
+    this.projectRoots = projectRoots;
     return {
       projects,
       observedAt: now(),
@@ -108,8 +110,10 @@ export class CodexConnector {
       nativeProjectId: thread.projectId ?? null,
       membership,
       title: typeof thread.name === "string" ? thread.name : "",
-      state: stateOf(thread),
+      state: this.mode === "isolated-readonly-api" ? "unknown" : stateOf(thread),
       nativeState: nativeStatus(thread),
+      runtimeStateTrusted: this.mode === "control-proxy",
+      statusSource: this.mode === "isolated-readonly-api" ? "stored" : "native-runtime",
       updatedAt: epoch(thread.updatedAt),
       canContinue:
         this.writeEnabled &&
@@ -163,15 +167,25 @@ export class CodexConnector {
 
   async rawWork(id) {
     requireId(id);
-    if (this.mode !== "control-proxy")
-      fail("CODEX_CONTROL_UNAVAILABLE", "独立只读API仅提供项目和会话目录，未连接当前桌面运行状态");
     const result = await this.rpc("thread/read", { threadId: id, includeTurns: false });
     if (result?.thread?.id !== id) fail("CODEX_WORK_MISMATCH", "Codex返回的会话与请求不符");
     return result.thread;
   }
 
-  async readWork(id) {
-    return this.metadata(await this.rawWork(id));
+  async readWork(id, { projectId } = {}) {
+    if (projectId !== undefined) requireId(projectId);
+    const thread = await this.rawWork(id);
+    if (projectId !== undefined && thread.projectId !== projectId) {
+      if (this.options.includeUnassignedByRoot !== true || thread.projectId !== null)
+        fail("CODEX_PROJECT_MISMATCH", "Codex会话不属于请求的项目，未推断其他归属");
+      if (!this.projectRoots.has(projectId)) await this.listProjects();
+      const roots = this.projectRoots.get(projectId);
+      if (!roots?.includes(thread.cwd)) fail("CODEX_PROJECT_MISMATCH", "旧会话目录不等于已核实的原生项目根目录");
+      return this.metadata(thread, projectId, "cwd-unassigned");
+    }
+    const membership =
+      typeof thread.projectId === "string" ? "native-project" : thread.projectId === null ? "unassigned" : "unknown";
+    return this.metadata(thread, undefined, membership);
   }
 
   assertWrite() {

@@ -24,7 +24,7 @@ export function observationEvent(subject, snapshot) {
   const digest = createHash("sha256").update(JSON.stringify(fields)).digest("hex");
   return {
     id: `native-${subject}-${digest}`,
-    type: `native.project.${subject}.changed`,
+    type: `native.project.${subject.slice(0, 32)}.changed`,
     subject,
     summary: "原生项目状态有变化，请核实目标与当前事实后决定是否推进",
     detail: JSON.stringify(fields),

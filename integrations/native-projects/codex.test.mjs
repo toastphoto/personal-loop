@@ -227,7 +227,10 @@ test("cancellation checks exact active turn and reports request acceptance, not 
 
 test("isolated catalogue mode never advertises or permits control even if writeEnabled is set", async () => {
   const { connector, calls } = fakeConnector(
-    () => ({ data: [{ id: "p1", name: "Project", roots: [] }], nextCursor: null }),
+    (method) =>
+      method === "thread/read"
+        ? { thread: thread("notLoaded") }
+        : { data: [{ id: "p1", name: "Project", roots: [] }], nextCursor: null },
     { mode: "isolated-readonly-api", writeEnabled: true },
   );
   const r = await connector.listProjects();
@@ -236,8 +239,10 @@ test("isolated catalogue mode never advertises or permits control even if writeE
   await assert.rejects(connector.continueWork({ nativeId: "t1", text: "task", requestId: "r1" }), {
     code: "CODEX_WRITE_DISABLED",
   });
-  await assert.rejects(connector.readWork("t1"), { code: "CODEX_CONTROL_UNAVAILABLE" });
-  assert.equal(calls.length, 1);
+  const metadata = await connector.readWork("t1");
+  assert.equal(metadata.runtimeStateTrusted, false);
+  assert.equal(metadata.state, "unknown");
+  assert.equal(calls.length, 2);
 });
 
 test("transport readonly allowlist prevents hidden resume or control requests", async () => {
@@ -417,4 +422,76 @@ test("guard runs after transport connection awaits immediately before the write 
     (e) => e === blocked,
   );
   assert.deepEqual(calls, ["thread/read", "thread/resume"]);
+});
+
+test("isolated readWork uses metadata-only thread/read and never treats fresh-host state as desktop idle", async () => {
+  const { connector, calls } = fakeConnector(
+    () => ({ thread: thread("idle", { preview: "PRIVATE", turns: [{ items: ["PRIVATE_BODY"] }] }) }),
+    { mode: "isolated-readonly-api", writeEnabled: true },
+  );
+  const result = await connector.readWork("t1", { projectId: "p1" });
+  assert.equal(result.projectId, "p1");
+  assert.equal(result.state, "unknown");
+  assert.equal(result.nativeState, "idle");
+  assert.equal(result.runtimeStateTrusted, false);
+  assert.equal(result.statusSource, "stored");
+  assert.equal(result.canContinue, false);
+  assert.equal(result.canCancel, false);
+  assert.deepEqual(calls, [{ method: "thread/read", params: { threadId: "t1", includeTurns: false } }]);
+  assert.ok(!JSON.stringify(result).includes("PRIVATE"));
+});
+
+test("readonly transport permits exact metadata reads but refuses full-history and every control method", async () => {
+  const calls = [];
+  const p = child((q, c) => {
+    calls.push(q);
+    if (q.id) result(c, q.id, {});
+  });
+  const rpc = new CodexRpcProxy({ mode: "isolated-readonly-api", spawn: () => p });
+  await rpc.connect();
+  await rpc.request("thread/read", { threadId: "t1", includeTurns: false });
+  for (const params of [{ threadId: "t1" }, { threadId: "t1", includeTurns: true }]) {
+    await assert.rejects(rpc.request("thread/read", params), { code: "CODEX_HISTORY_READ_DENIED" });
+  }
+  for (const method of ["thread/resume", "turn/start", "turn/interrupt"]) {
+    await assert.rejects(rpc.request(method, { threadId: "t1" }), { code: "CODEX_CONTROL_UNAVAILABLE" });
+  }
+  assert.equal(calls.filter((q) => q.method === "thread/read").length, 1);
+  await rpc.close();
+});
+
+test("readWork labels only explicitly permitted exact-root unassigned legacy sessions", async () => {
+  const { connector } = fakeConnector(
+    (method) =>
+      method === "project/list"
+        ? { data: [{ id: "p1", name: "Project", roots: [{ path: "/tmp/approved" }] }], nextCursor: null }
+        : { thread: thread("notLoaded", { projectId: null, cwd: "/tmp/approved" }) },
+    { mode: "isolated-readonly-api", includeUnassignedByRoot: true },
+  );
+  const scoped = await connector.readWork("t1", { projectId: "p1" });
+  assert.equal(scoped.projectId, "p1");
+  assert.equal(scoped.nativeProjectId, null);
+  assert.equal(scoped.membership, "cwd-unassigned");
+  assert.equal(scoped.state, "unknown");
+  const unscoped = await connector.readWork("t1");
+  assert.equal(unscoped.projectId, null);
+  assert.equal(unscoped.membership, "unassigned");
+});
+
+test("readWork rejects disabled legacy mapping, another native project, missing membership, and nonexact roots", async () => {
+  for (const [value, enabled] of [
+    [{ projectId: null, cwd: "/tmp/approved" }, false],
+    [{ projectId: "p2", cwd: "/tmp/approved" }, true],
+    [{ projectId: undefined, cwd: "/tmp/approved" }, true],
+    [{ projectId: null, cwd: "/tmp/approved/child" }, true],
+  ]) {
+    const { connector } = fakeConnector(
+      (method) =>
+        method === "project/list"
+          ? { data: [{ id: "p1", name: "Project", roots: [{ path: "/tmp/approved" }] }] }
+          : { thread: thread("notLoaded", value) },
+      { mode: "isolated-readonly-api", includeUnassignedByRoot: enabled },
+    );
+    await assert.rejects(connector.readWork("t1", { projectId: "p1" }), { code: "CODEX_PROJECT_MISMATCH" });
+  }
 });

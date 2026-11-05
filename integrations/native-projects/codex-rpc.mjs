@@ -10,7 +10,7 @@ export class CodexConnectorError extends Error {
 }
 
 const error = (code, message, extra) => new CodexConnectorError(code, message, extra);
-const CATALOG_METHODS = new Set(["initialize", "project/list", "thread/list"]);
+const CATALOG_METHODS = new Set(["initialize", "project/list", "thread/list", "thread/read"]);
 
 // Own only this transport process; never start/restart a managed daemon or reach into its database.
 export class CodexRpcProxy {
@@ -81,7 +81,12 @@ export class CodexRpcProxy {
 
   request(method, params = {}) {
     if (this.mode === "isolated-readonly-api" && !CATALOG_METHODS.has(method)) {
-      return Promise.reject(error("CODEX_CONTROL_UNAVAILABLE", "独立只读API仅允许列出项目与会话，不能控制桌面任务"));
+      return Promise.reject(
+        error("CODEX_CONTROL_UNAVAILABLE", "独立只读API仅允许读取项目与会话元数据，不能控制桌面任务"),
+      );
+    }
+    if (this.mode === "isolated-readonly-api" && method === "thread/read" && params?.includeTurns !== false) {
+      return Promise.reject(error("CODEX_HISTORY_READ_DENIED", "只读连接只允许明确排除对话正文的元数据查询"));
     }
     if (this.closed || !this.child) return Promise.reject(error("CODEX_DISCONNECTED", "Codex连接不可用"));
     const id = this.nextId++;

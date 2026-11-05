@@ -16,8 +16,8 @@
     "agent-autoloop": "bin/agent-autoloop.ts"
   },
   "scripts": {
-    "test": "node --disable-warning=ExperimentalWarning --test tests/*.test.ts integrations/native-projects/*.test.mjs",
-    "test:quick": "node --disable-warning=ExperimentalWarning --test $(ls tests/*.test.ts | grep -v /simulation.test.ts) integrations/native-projects/*.test.mjs",
+    "test": "node --disable-warning=ExperimentalWarning --test tests/*.test.ts integrations/*/*.test.mjs",
+    "test:quick": "node --disable-warning=ExperimentalWarning --test $(ls tests/*.test.ts | grep -v /simulation.test.ts) integrations/*/*.test.mjs",
     "typecheck": "tsc -p .",
     "format": "prettier --write \"**/*.{ts,mjs,json,yml}\"",
     "format:check": "prettier --check \"**/*.{ts,mjs,json,yml}\"",
@@ -25,7 +25,7 @@
     "test:deep": "node --disable-warning=ExperimentalWarning --test --test-concurrency=1 sim/*.test.ts",
     "test:nightly": "npm run test:deep && node --disable-warning=ExperimentalWarning scripts/benchmark.ts --check",
     "benchmark": "node --disable-warning=ExperimentalWarning scripts/benchmark.ts --check",
-    "test:native": "node --disable-warning=ExperimentalWarning --test integrations/native-projects/*.test.mjs"
+    "test:native": "node --disable-warning=ExperimentalWarning --test integrations/*/*.test.mjs"
   },
   "devDependencies": {
     "@types/node": "26.6.4",

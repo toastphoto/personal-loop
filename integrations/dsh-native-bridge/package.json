@@ -1,0 +1,38 @@
+{
+  "name": "@personal-loop/dsh-native-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Read-only native Workspace and Session metadata from the existing DeepSeek Harness Host",
+  "type": "module",
+  "main": "./index.mjs",
+  "exports": {
+    ".": "./index.mjs",
+    "./cordis.patch.yml": "./cordis.patch.yml"
+  },
+  "files": [
+    "index.mjs",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=24",
+    "dsh": "0.2.1-rc.3"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "~4.0.5"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/cordis": {
+      "optional": true
+    }
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "scripts": {
+    "test": "node --test bridge.test.mjs"
+  },
+  "license": "MIT"
+}

@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -73,4 +73,47 @@ test("paused or manual observer returns before opening any native connector", (t
   const cli = fileURLToPath(new URL("./cli.mjs", import.meta.url));
   const out = execFileSync(process.execPath, [cli, "--config", configFile, "observe", "goal"], { encoding: "utf8" });
   assert.equal(JSON.parse(out).reason, "LOOP_NOT_ACTIVE");
+});
+
+test("a replayed command returns its receipt without undoing a later pause", (t) => {
+  const { store } = setup(t);
+  const first = store.set("p", "active", {
+    objective: "Task",
+    maxSteps: 3,
+    actor: "owner",
+    requestId: "message-1",
+    expectedRevision: 0,
+  });
+  store.set("p", "paused", { actor: "owner", requestId: "message-2", expectedRevision: 1 });
+  const replay = store.set("p", "active", {
+    objective: "Task",
+    maxSteps: 3,
+    actor: "owner",
+    requestId: "message-1",
+    expectedRevision: 2,
+  });
+  assert.equal(replay.revision, first.revision);
+  assert.equal(store.get("p").mode, "paused");
+  assert.equal(store.get("p").revision, 2);
+  assert.throws(
+    () =>
+      store.set("p", "active", { objective: "Different task", maxSteps: 3, actor: "owner", requestId: "message-1" }),
+    /CONTROL_REQUEST_ID_REUSED/,
+  );
+});
+
+test("a process killed while saving cannot leave pause permanently locked", (t) => {
+  const { store, file } = setup(t);
+  store.set("p", "active", { objective: "Task", maxSteps: 3, actor: "owner" });
+  const source = `import fs from 'node:fs'; import { syncBuiltinESMExports } from 'node:module'; fs.renameSync=()=>process.kill(process.pid,'SIGKILL'); syncBuiltinESMExports(); const {LoopControls}=await import(${JSON.stringify(new URL("./controls.mjs", import.meta.url).href)}); new LoopControls(${JSON.stringify(file)}).set('p','paused',{actor:'owner'});`;
+  const child = spawnSync(process.execPath, ["--input-type=module", "-e", source]);
+  assert.equal(child.signal, "SIGKILL");
+  assert.equal(store.get("p").mode, "active");
+  assert.equal(store.set("p", "paused", { actor: "owner" }).mode, "paused");
+});
+
+test("a verified project display name is retained for offline pause lookup", (t) => {
+  const { store } = setup(t);
+  store.set("codex:local:p", "paused", { actor: "owner", projectName: "Example Project" });
+  assert.equal(store.get("codex:local:p").projectName, "Example Project");
 });

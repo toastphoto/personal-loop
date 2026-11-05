@@ -1,12 +1,14 @@
 #!/usr/bin/env node
 import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import path from "node:path";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { createCatalog, readConfig } from "./factory.mjs";
 import { safeError } from "./catalog.mjs";
 import { serveMcp } from "./mcp.mjs";
 import { publishObservation } from "./observe.mjs";
 import { LoopControls } from "./controls.mjs";
+import { NativeLoopRuntime } from "./loop-runtime.mjs";
+import { handleLoopCommand } from "./feishu-commands.mjs";
 
 const args = process.argv.slice(2);
 const at = args.indexOf("--config");
@@ -20,6 +22,42 @@ const config = readConfig(file);
 const catalog = createCatalog(config);
 const controls = new LoopControls(config.controlsFile ?? path.join(path.dirname(file), "loop-modes.json"));
 async function main() {
+  if (command === "mode") {
+    const input = JSON.parse(readFileSync(0, "utf8"));
+    const requestId = input.requestId ?? "local-" + randomUUID();
+    const runtime = config.loopHub ? new NativeLoopRuntime({ nativeConfig: config, configFile: file, controls }) : null;
+    let result;
+    if (nativeId === "manual") {
+      const before = controls.get(projectKey);
+      const control = controls.set(projectKey, "manual", {
+        actor: "local-owner",
+        requestId,
+        expectedRevision: input.expectedRevision ?? before.revision,
+      });
+      const sync = runtime ? await runtime.sync({ projectKey, control, action: "manual", requestId }) : { ok: true };
+      result = { ok: sync.ok, control };
+    } else {
+      if (!["active", "paused"].includes(nativeId)) throw Object.assign(new Error(), { code: "INVALID_MODE_CHANGE" });
+      result = await handleLoopCommand(
+        {
+          action: nativeId === "paused" ? "pause" : input.objective ? "enable" : "resume",
+          target: projectKey,
+          objective: input.objective,
+          maxSteps: input.maxSteps,
+        },
+        {
+          catalog,
+          controls,
+          actor: "local-owner",
+          requestId,
+          ...(runtime ? { readiness: (p) => runtime.readiness(p), syncRules: (a) => runtime.sync(a) } : {}),
+        },
+      );
+    }
+    console.log(JSON.stringify(result, null, 2));
+    if (result.ok === false) process.exitCode = 1;
+    return;
+  }
   if (command === "observe") {
     const configured = config.goals?.find((g) => g.id === projectKey);
     if (!configured?.projectKey) throw Object.assign(new Error(), { code: "GOAL_NOT_CONFIGURED" });
@@ -45,13 +83,7 @@ async function main() {
           ...controls.get(p.key),
         })),
       };
-    else if (command === "mode") {
-      const { project: selectedProject } = catalog.resolve(projectKey);
-      if (nativeId === "active" && selectedProject.capabilities?.continue !== true)
-        throw Object.assign(new Error(), { code: "PROJECT_CONTROL_NOT_READY" });
-      const change = JSON.parse(readFileSync(0, "utf8"));
-      result = controls.set(projectKey, nativeId, { ...change, actor: "local-owner" });
-    } else if (command === "tasks") result = await catalog.listWork(projectKey);
+    else if (command === "tasks") result = await catalog.listWork(projectKey);
     else if (command === "read") result = await catalog.readWork(projectKey, nativeId);
     else if (command === "observe") {
       const goal = config.goals?.find((g) => g.id === projectKey);

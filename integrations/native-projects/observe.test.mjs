@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { publishObservation } from "./observe.mjs";
+import { publishObservation, observationEvent } from "./observe.mjs";
 test("failed publication keeps checkpoint; identical retry is idempotent; clock-only change does not wake models", async (t) => {
   const folder = mkdtempSync(path.join(tmpdir(), "native-observe-"));
   t.after(() => rmSync(folder, { recursive: true, force: true }));
@@ -73,4 +73,12 @@ test("a duplicate acknowledgement is not reported as a newly emitted event", asy
   }));
   assert.equal(result.emitted, false);
   assert.equal(result.acknowledged, true);
+});
+
+test("project event types fit the upstream protocol limit", () => {
+  const snapshot = {
+    project: { key: "codex:local:p", provider: "codex", host: "local", nativeId: "p" },
+    tasks: { complete: true, items: [] },
+  };
+  assert.ok(observationEvent("a".repeat(64), snapshot).type.length <= 64);
 });
