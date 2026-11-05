@@ -79,7 +79,8 @@ export class NativeLoopRuntime {
   async readiness(project) {
     try {
       const managed = this.config?.managedCodex,
-        root = managed?.projectRoots?.[project?.key] ?? (project?.roots?.length === 1 ? project.roots[0] : null);
+        roots = Array.isArray(project?.roots) ? [...project.roots] : [],
+        root = managed?.projectRoots?.[project?.key] ?? (roots.length === 1 ? roots[0] : null);
       if (
         project?.provider !== "codex" ||
         !project.key ||
@@ -87,7 +88,7 @@ export class NativeLoopRuntime {
         managed?.enabled !== true ||
         typeof root !== "string" ||
         !path.isAbsolute(root) ||
-        !project.roots?.includes(root) ||
+        !roots.includes(root) ||
         !path.isAbsolute(managed.stateDir ?? "")
       )
         throw failure("LOOP_NATIVE_ROOT_UNCONFIRMED");
@@ -109,7 +110,7 @@ export class NativeLoopRuntime {
         !state.sources?.some((s) => s.id === layout.sourceName)
       )
         throw failure("LOOP_HUB_UNAVAILABLE");
-      this.projects.set(project.key, { root, nativeId: project.nativeId });
+      this.projects.set(project.key, { root, nativeId: project.nativeId, roots });
       return { ready: true, rulesReady: true };
     } catch (error) {
       this.projects.delete(project?.key);
@@ -325,12 +326,11 @@ export class NativeLoopRuntime {
     const active = control.mode === "active",
       layout = this.layout(),
       target = this.desired(projectKey, control, layout);
-    if (
-      active &&
-      (!this.projects.has(projectKey) ||
-        this.config.managedCodex?.enabled !== true ||
-        this.config.managedCodex.projectRoots?.[projectKey] !== this.projects.get(projectKey).root)
-    )
+    const verified = this.projects.get(projectKey),
+      selectedRoot =
+        this.config.managedCodex?.projectRoots?.[projectKey] ??
+        (verified?.roots.length === 1 ? verified.roots[0] : null);
+    if (active && (!verified || this.config.managedCodex?.enabled !== true || selectedRoot !== verified.root))
       throw failure("LOOP_READINESS_REQUIRED");
     if (active && (typeof requestId !== "string" || !/^[A-Za-z0-9_.:-]{1,512}$/.test(requestId)))
       throw failure("CONTROL_REQUEST_ID_REQUIRED");

@@ -9,28 +9,12 @@ import { parseLoopCommand, handleLoopCommand } from "./feishu-commands.mjs";
 import { failure, safeError } from "./catalog.mjs";
 import { NativeLoopRuntime } from "./loop-runtime.mjs";
 import { startLoopHub } from "./hub-host.mjs";
+import { commandText, routeProjectMessage, readRouting } from "./feishu-route.mjs";
+export { commandText } from "./feishu-route.mjs";
+import { CardSessions, ProjectCardController } from "./feishu-card-control.mjs";
+import { CardEventSubscriber } from "./callback-consumer.mjs";
+import { FeishuCardRelay } from "./feishu-card-relay.mjs";
 import { renderProjectCard } from "./feishu-project-card.mjs";
-
-export function commandText(event) {
-  if (typeof event?.content !== "string") return "";
-  let text = event.content.trim();
-  const prefixes = (Array.isArray(event.mentions) ? event.mentions : [])
-    .slice(0, 50)
-    .flatMap((mention) => {
-      if (!mention || typeof mention !== "object") return [];
-      return [
-        typeof mention.key === "string" ? mention.key : null,
-        typeof mention.name === "string" ? "@" + mention.name : null,
-      ].filter(Boolean);
-    })
-    .sort((a, b) => b.length - a.length);
-  for (let count = 0; count < 50; count++) {
-    const prefix = prefixes.find((p) => text.startsWith(p) && (text.length === p.length || /\s/.test(text[p.length])));
-    if (!prefix) break;
-    text = text.slice(prefix.length).trimStart();
-  }
-  return text;
-}
 
 export function acceptsCommand(event, config) {
   return (
@@ -40,7 +24,7 @@ export function acceptsCommand(event, config) {
     event.message_type === "text" &&
     typeof event.message_id === "string" &&
     /^om_[A-Za-z0-9_-]{1,160}$/.test(event.message_id) &&
-    /^\/?loop(?:\s|$)/i.test(commandText(event))
+    routeProjectMessage(event, config.naturalRoutingFile ? readRouting(config.naturalRoutingFile) : {}) === "loop"
   );
 }
 export function runProgram(program, args, { input = "", timeoutMs = 30000 } = {}) {
@@ -118,7 +102,7 @@ export async function larkReply(config, item, execute = runProgram) {
 }
 
 export class FeishuLoopRelay {
-  constructor(config, { queue, catalog, controls, reply, readiness, syncRules, answerCard } = {}) {
+  constructor(config, { queue, catalog, controls, reply, readiness, syncRules, answerCard, cards } = {}) {
     if (
       !config?.chatId ||
       !Array.isArray(config.allowedSenderIds) ||
@@ -134,6 +118,7 @@ export class FeishuLoopRelay {
     this.readiness = readiness ?? (async () => ({ ready: false, rulesReady: false }));
     this.syncRules = syncRules;
     this.answerCard = answerCard;
+    this.cards = cards;
     this.stopping = false;
     this.editedCommandsIgnored = 0;
   }
@@ -162,6 +147,13 @@ export class FeishuLoopRelay {
       try {
         let command;
         let result;
+        let directorySnapshot;
+        const requestCatalog = {
+          refresh: async () => {
+            directorySnapshot = await this.catalog.refresh();
+            return directorySnapshot;
+          },
+        };
         try {
           command = parseLoopCommand(commandText(item.event));
         } catch (error) {
@@ -171,9 +163,10 @@ export class FeishuLoopRelay {
             text: error.userMessage ?? "项目指令格式不正确，请使用 /loop 项目 查看说明。",
           };
         }
+        if (!result && !command && this.cards) result = await this.cards.natural(item, commandText(item.event));
         if (!result)
           result = await handleLoopCommand(command, {
-            catalog: this.catalog,
+            catalog: requestCatalog,
             controls: this.controls,
             actor: item.event.sender_id,
             requestId: item.requestId,
@@ -181,7 +174,10 @@ export class FeishuLoopRelay {
             syncRules: this.syncRules,
             answerCard: this.answerCard,
           });
-        this.queue.saveResult(item.id, result, projectReply(result, this.config));
+        const prepared =
+          result.response ?? (this.cards ? await this.cards.prepare(item, result, directorySnapshot) : null);
+        const { response: unused, ...savedResult } = result;
+        this.queue.saveResult(item.id, savedResult, prepared ?? projectReply(result, this.config));
       } catch (error) {
         this.queue.markFailure(item.id, "handling", safeError(error), { retryAfterMs: this.config.retryMs ?? 15000 });
       }
@@ -198,7 +194,9 @@ export class FeishuLoopRelay {
           continue;
         }
         try {
-          this.queue.markReply(item.id, await this.reply(item));
+          const ref = await this.reply(item);
+          if (item.response?.sessionId && this.cards) this.cards.bind(item.response.sessionId, ref);
+          this.queue.markReply(item.id, ref);
         } catch (error) {
           const failed = this.queue.markFailure(item.id, "reply", safeError(error), {
             retryAfterMs: this.config.retryMs ?? Math.min(60000, 5000 * 2 ** item.replyAttempts),
@@ -228,10 +226,37 @@ async function main() {
     ? new NativeLoopRuntime({ nativeConfig: native, configFile: config.nativeConfigFile, controls })
     : null;
   const hub = !process.argv.includes("--once") ? await startLoopHub(native) : { stop: async () => {}, ready: false };
+  let subscriber, callbackQueue, callbackRelay, cards, cardStore, wake;
+  if (config.cardCallbacks?.enabled === true && !process.argv.includes("--once")) {
+    const c = { ...config, ...config.cardCallbacks };
+    try {
+      cardStore = new CardSessions(c.sessionsFile);
+      subscriber = new CardEventSubscriber(c, { onEvent: () => wake?.() });
+      await subscriber.start();
+      callbackQueue = new RelayQueue(c.databaseFile);
+      cards = new ProjectCardController(config, {
+        store: cardStore,
+        catalog,
+        controls,
+        runtime,
+        transportReady: () => subscriber.status().ready,
+      });
+      callbackRelay = new FeishuCardRelay(c, { queue: callbackQueue, controller: cards, execute: runProgram });
+    } catch (error) {
+      await subscriber?.stop();
+      callbackQueue?.close();
+      cardStore?.close();
+      queue.close();
+      await catalog.close();
+      await hub.stop();
+      throw error;
+    }
+  }
   const relay = new FeishuLoopRelay(config, {
     queue,
     catalog,
     controls,
+    cards,
     ...(runtime
       ? {
           readiness: (project) => runtime.readiness(project),
@@ -251,22 +276,45 @@ async function main() {
   };
   process.on("SIGTERM", () => {
     relay.stopping = true;
+    wake?.();
   });
   process.on("SIGINT", () => {
     relay.stopping = true;
+    wake?.();
   });
   try {
     do {
       try {
-        record({ status: "ready", ...(await relay.tick({ sendReplies: !noReply })) });
+        const callbackState = callbackRelay ? await callbackRelay.tick() : undefined;
+        record({
+          status: "ready",
+          ...(await relay.tick({ sendReplies: !noReply })),
+          ...(subscriber
+            ? { callbacks: { ...subscriber.status(), verified: cards.enabled(), queue: callbackState?.queue } }
+            : {}),
+        });
+        if (subscriber && !subscriber.status().ready) throw failure("CARD_SUBSCRIBER_STOPPED");
       } catch (error) {
         record({ status: "blocked", errorCode: safeError(error), observedAt: new Date().toISOString() });
-        if (once) throw error;
+        if (once || error.code === "CARD_SUBSCRIBER_STOPPED") throw error;
       }
       if (once || relay.stopping) break;
-      await new Promise((resolve) => setTimeout(resolve, 2000));
+      await new Promise((resolve) => {
+        const timer = setTimeout(() => {
+          wake = undefined;
+          resolve();
+        }, 2000);
+        wake = () => {
+          clearTimeout(timer);
+          wake = undefined;
+          resolve();
+        };
+      });
     } while (!relay.stopping);
   } finally {
+    await subscriber?.stop();
+    callbackQueue?.close();
+    cardStore?.close();
     queue.close();
     await catalog.close();
     await hub.stop();

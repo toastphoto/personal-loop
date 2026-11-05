@@ -472,7 +472,32 @@ test("a unique native root needs no redundant mapping, but an explicit non-membe
   delete f.nativeConfig.managedCodex.projectRoots[f.key];
   f.saveConfig();
   assert.equal((await f.runtime.readiness(f.project)).ready, true);
+  assert.equal((await f.sync(f.set("active"))).ok, true);
+  assert.equal(f.events.length, 1);
   f.nativeConfig.managedCodex.projectRoots[f.key] = "/not-a-native-root";
   f.saveConfig();
   assert.equal((await f.runtime.readiness(f.project)).ready, false);
+});
+
+test("removing a multi-root mapping cannot reinterpret a mutable catalogue array as a verified sole root", async (t) => {
+  const f = fixture(t);
+  f.project.roots.push("/another-native-root");
+  assert.equal((await f.runtime.readiness(f.project)).ready, true);
+  delete f.nativeConfig.managedCodex.projectRoots[f.key];
+  f.project.roots.pop();
+  f.saveConfig();
+  await assert.rejects(f.sync(f.set("active")), { code: "LOOP_READINESS_REQUIRED" });
+  assert.equal(f.events.length, 0);
+  assert.deepEqual(f.readRules(), f.rules);
+});
+
+test("a root mapping changed after readiness cannot retarget the selected project", async (t) => {
+  const f = fixture(t);
+  delete f.nativeConfig.managedCodex.projectRoots[f.key];
+  assert.equal((await f.runtime.readiness(f.project)).ready, true);
+  f.nativeConfig.managedCodex.projectRoots[f.key] = "/another-native-root";
+  f.saveConfig();
+  await assert.rejects(f.sync(f.set("active")), { code: "LOOP_READINESS_REQUIRED" });
+  assert.equal(f.events.length, 0);
+  assert.deepEqual(f.readRules(), f.rules);
 });

@@ -664,3 +664,15 @@ test("projects and status add matching views without changing original text or c
   assert.equal(status.projectKey, a.key);
   assert.equal(ctx.controls.list().length, 0);
 });
+
+test("an explicit card control revision cannot overwrite a newer owner decision", async (t) => {
+  const env = setup(t, [a]);
+  env.controls.set(a.key, "paused", { actor: "owner" });
+  const result = await handleLoopCommand(
+    { action: "enable", target: a.key, objective: "Old card goal", expectedRevision: 0 },
+    env,
+  );
+  assert.equal(result.code, "CONTROL_REVISION_CHANGED");
+  assert.equal(env.controls.get(a.key).mode, "paused");
+  assert.equal(env.controls.get(a.key).revision, 1);
+});

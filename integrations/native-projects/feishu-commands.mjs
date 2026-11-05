@@ -334,6 +334,13 @@ export async function handleLoopCommand(
     }
     if (!project) return failed(action, "PROJECT_TARGET_NOT_FOUND");
     const before = controls.get(project.key);
+    if (
+      command.expectedRevision !== undefined &&
+      (!Number.isSafeInteger(command.expectedRevision) ||
+        command.expectedRevision < 0 ||
+        command.expectedRevision !== before.revision)
+    )
+      return failed(action, "CONTROL_REVISION_CHANGED");
     if (before.revision !== (revisions.get(project.key) ?? 0)) return failed(action, "CONTROL_REVISION_CHANGED");
     if (action === "status")
       return {

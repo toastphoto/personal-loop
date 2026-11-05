@@ -69,18 +69,47 @@ test("manual is explained once while active and paused states remain visible in 
   budget(card);
 });
 
-test("home uses a project picker instead of visible rows and separates same-name native entries", () => {
-  const v = view();
-  v.projects[0].name = v.projects[1].name = "同名项目";
-  const card = renderProjectCard(v, { screen: "home" }, context);
-  const picker = tagged(card, "select_static")[0];
-  assert.equal(picker.options.length, 39);
-  assert.equal(new Set(picker.options.map((o) => o.value)).size, 39);
-  assert.notEqual(picker.options[0].text.content, picker.options[1].text.content);
-  assert.equal(picker.name, "project");
-  assert.equal(picker.behaviors[0].value.action, "select");
+test("home natively folds three sources and exposes all 40 projects without a picker or pagination", () => {
+  const projects = Array.from({ length: 40 }, (_, i) => project(i, i < 28 ? "codex" : i < 37 ? "multica" : "dsh"));
+  projects[0].name = projects[1].name = "同名项目";
+  projects[2].mode = "active";
+  projects[3].mode = "paused";
+  const card = renderProjectCard(view(projects), { screen: "home" }, context);
+  const sources = card.body.elements.filter(
+    (o) => o.tag === "collapsible_panel" && /^(Codex|Multica|DeepSeek) · /.test(o.header.title.content),
+  );
+  assert.equal(sources.length, 3);
+  assert.ok(sources.every((source) => source.expanded === false && !source.behaviors));
+  const buttons = tagged(card, "button");
+  assert.equal(buttons.length, 40);
+  assert.equal(tagged(card, "select_static").length, 0);
+  assert.equal(new Set(buttons.map((b) => b.behaviors[0].value.alias)).size, 40);
+  assert.ok(buttons.every((b) => b.width === "fill" && b.behaviors[0].value.action === "detail"));
+  for (const p of projects) assert.ok(buttons.some((b) => b.behaviors[0].value.alias === p.alias));
+  assert.notEqual(buttons[0].text.content, buttons[1].text.content);
+  assert.match(buttons[0].text.content, /^同名项目 · [a-f0-9]{6}$/);
+  assert.equal(buttons[2].text.content, "项目 2 · 推进中");
+  assert.equal(buttons[3].text.content, "项目 3 · 已暂停");
+  assert.equal(buttons[4].text.content, "项目 4");
+  assert.ok(!/上一页|下一页|翻页/.test(JSON.stringify(card)));
   assert.ok(JSON.stringify(card).includes("查看不会启用"));
   budget(card);
+});
+
+test("returning from a project keeps its source expanded without introducing another source callback", () => {
+  const v = view();
+  const p = v.projects.find((project) => project.provider === "multica");
+  const detail = renderProjectCard(v, { screen: "detail", alias: p.alias }, context);
+  const back = tagged(detail, "button").find((b) => b.behaviors[0].value.action === "home");
+  assert.equal(back.behaviors[0].value.provider, "multica");
+  const home = renderProjectCard(v, { screen: "home", provider: back.behaviors[0].value.provider }, context);
+  const sources = home.body.elements.filter(
+    (o) => o.tag === "collapsible_panel" && /^(Codex|Multica|DeepSeek) · /.test(o.header.title.content),
+  );
+  assert.equal(sources.filter((s) => s.expanded).length, 1);
+  assert.match(sources.find((s) => s.expanded).header.title.content, /^Multica/);
+  assert.ok(tagged(home, "button").every((b) => b.behaviors[0].value.action === "detail"));
+  budget(home);
 });
 
 test("list pages show at most four projects and clamp stale, negative or oversized pages", () => {
@@ -221,4 +250,153 @@ test("static titles colliding after truncation are distinct and reveal their ful
   assert.ok(JSON.stringify(panels[0].elements).includes(a.name));
   assert.ok(JSON.stringify(panels[1].elements).includes(b.name));
   budget(card);
+});
+
+const mutationContext = { sessionId: "a".repeat(24), revision: 8, interactive: true, mutationEnabled: true };
+const actions = (card) =>
+  tagged(card, "button").flatMap((button) => (button.behaviors ?? []).map((b) => b.value.action));
+function controlledProject(extra = {}) {
+  return {
+    ...project(1),
+    execution: "managed-read-only",
+    controlRevision: 3,
+    canSetGoal: true,
+    canStart: false,
+    canPause: false,
+    canResume: false,
+    ...extra,
+  };
+}
+
+test("project controls follow backend capabilities and remain hidden from old read-only card contexts", () => {
+  const cases = [
+    {
+      mode: "manual",
+      canStart: true,
+      draft: { objective: "检查文件", maxSteps: 3, revision: 1 },
+      expected: ["edit-goal", "start"],
+    },
+    { mode: "active", canPause: true, expected: ["edit-goal", "pause"] },
+    { mode: "paused", objective: "原目标", maxSteps: 3, canResume: true, expected: ["edit-goal", "resume"] },
+  ];
+  for (const item of cases) {
+    const p = controlledProject(item);
+    const card = renderProjectCard(view([p]), { screen: "detail", alias: p.alias }, mutationContext);
+    for (const action of item.expected) assert.ok(actions(card).includes(action));
+    for (const action of ["edit-goal", "start", "pause", "resume"].filter((a) => !item.expected.includes(a)))
+      assert.ok(!actions(card).includes(action));
+    const old = renderProjectCard(view([p]), { screen: "detail", alias: p.alias }, context);
+    assert.deepEqual(new Set(actions(old)), new Set(["home", "refresh"]));
+    budget(card);
+  }
+  const offline = controlledProject({ execution: "unavailable", canSetGoal: false, canPause: true, mode: "active" });
+  const card = renderProjectCard(view([offline]), { screen: "detail", alias: offline.alias }, mutationContext);
+  assert.ok(actions(card).includes("pause"));
+  assert.ok(!actions(card).includes("start"));
+  const pause = tagged(card, "button").find((b) => b.behaviors?.[0].value.action === "pause");
+  assert.ok(pause.confirm.text.content.includes("不会取消"));
+});
+
+test("goal draft form binds submit to the exact session and revision without a mutating behavior", () => {
+  const objective = "第一行\n第二行 <保留原文>";
+  const p = controlledProject({ draft: { objective, maxSteps: 5, revision: 2 } });
+  const card = renderProjectCard(view([p]), { screen: "goal", alias: p.alias }, mutationContext);
+  const form = card.body.elements.find((o) => o.tag === "form");
+  assert.equal(form.name, "goal_form");
+  const input = tagged(form, "input")[0];
+  assert.equal(input.name, "objective");
+  assert.equal(input.input_type, "multiline_text");
+  assert.equal(input.required, true);
+  assert.equal(input.max_length, 1000);
+  assert.equal(input.default_value, objective);
+  const steps = tagged(form, "select_static")[0];
+  assert.equal(steps.name, "max_steps");
+  assert.deepEqual(
+    steps.options.map((o) => o.value),
+    ["1", "3", "5", "10"],
+  );
+  assert.equal(steps.initial_option, "5");
+  const submit = tagged(form, "button")[0];
+  assert.equal(submit.name, `plgoal_${mutationContext.sessionId}_${mutationContext.revision}`);
+  assert.equal(submit.form_action_type, "submit");
+  assert.equal(submit.behaviors, undefined);
+  assert.ok(JSON.stringify(card).includes("保存草稿不会启动"));
+  assert.ok(!actions(card).includes("confirm-start"));
+  assert.ok(actions(card).includes("detail"));
+  budget(card);
+});
+
+test("start confirmation shows the full 1000-character draft and explicit step budget before confirming", () => {
+  const objective = "目标".repeat(500);
+  const p = controlledProject({ canStart: true, draft: { objective, maxSteps: 3, revision: 2 } });
+  const card = renderProjectCard(view([p]), { screen: "confirm-start", alias: p.alias }, mutationContext);
+  assert.ok(tagged(card, "markdown").some((o) => o.content.includes(objective)));
+  assert.ok(JSON.stringify(card).includes("最多 3 步"));
+  const confirm = tagged(card, "button").find((b) => b.behaviors?.[0].value.action === "confirm-start");
+  assert.ok(confirm);
+  assert.equal(confirm.behaviors[0].value.alias, p.alias);
+  assert.equal(confirm.behaviors[0].value.session, mutationContext.sessionId);
+  assert.equal(confirm.behaviors[0].value.revision, mutationContext.revision);
+  assert.ok(confirm.confirm.text.content.includes(objective));
+  assert.ok(confirm.confirm.text.content.includes("3 步"));
+  budget(card);
+});
+
+test("resume confirmation uses the running goal rather than an unrelated saved draft", () => {
+  const p = controlledProject({
+    mode: "paused",
+    objective: "继续原目标",
+    maxSteps: 5,
+    canResume: true,
+    draft: { objective: "以后才做的新目标", maxSteps: 1, revision: 2 },
+  });
+  const card = renderProjectCard(view([p]), { screen: "confirm-resume", alias: p.alias }, mutationContext);
+  assert.ok(JSON.stringify(card).includes("继续原目标"));
+  assert.ok(!JSON.stringify(card).includes("以后才做的新目标"));
+  assert.ok(actions(card).includes("confirm-resume"));
+  assert.ok(JSON.stringify(card).includes("不会重置"));
+  budget(card);
+});
+
+test("no capability, oversized goals or invalid budgets can create a live confirmation or form", () => {
+  for (const extra of [
+    { canStart: false, draft: { objective: "valid", maxSteps: 3, revision: 1 } },
+    { canStart: true, draft: { objective: "x".repeat(1001), maxSteps: 3, revision: 1 } },
+    { canStart: true, draft: { objective: "valid", maxSteps: 101, revision: 1 } },
+    { canStart: true, draft: { objective: "valid", maxSteps: 0, revision: 1 } },
+  ]) {
+    const p = controlledProject(extra);
+    const card = renderProjectCard(view([p]), { screen: "confirm-start", alias: p.alias }, mutationContext);
+    assert.ok(!actions(card).includes("confirm-start"));
+    budget(card);
+  }
+  const p = controlledProject({ canSetGoal: false, canStart: true });
+  for (const ctx of [mutationContext, context, { interactive: false }]) {
+    const card = renderProjectCard(view([p]), { screen: "goal", alias: p.alias }, ctx);
+    assert.equal(tagged(card, "form").length, 0);
+    assert.ok(!actions(card).includes("confirm-start"));
+  }
+  assert.throws(
+    () => renderProjectCard(view(), {}, { ...mutationContext, sessionId: "not-an-issued-session" }),
+    /PROJECT_CARD_CONTEXT_INVALID/,
+  );
+});
+
+test("probe is a single non-mutating verification action and notices stay within the page summary", () => {
+  const card = renderProjectCard(view(), { screen: "probe" }, { ...context, notice: "尚未启动任何项目" });
+  assert.deepEqual(actions(card), ["probe"]);
+  assert.ok(JSON.stringify(card).includes("验证按钮连接"));
+  assert.ok(JSON.stringify(card).includes("尚未启动任何项目"));
+  assert.ok(JSON.stringify(card).includes("不会启动项目"));
+  budget(card);
+  const p = controlledProject({ draft: { objective: "已保存的目标", maxSteps: 3, revision: 1 } });
+  const detail = renderProjectCard(
+    view([p]),
+    { screen: "detail", alias: p.alias },
+    { ...mutationContext, notice: "草稿已保存" },
+  );
+  assert.ok(JSON.stringify(detail).includes("草稿已保存"));
+  assert.ok(JSON.stringify(detail).includes("当前 仅查看"));
+  assert.ok(!JSON.stringify(detail).includes("当前 推进中"));
+  budget(detail);
 });

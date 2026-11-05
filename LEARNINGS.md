@@ -16,3 +16,10 @@
 
 - A correct 39-row text inventory was difficult to use on the owner's phone. Start with source groups, fold per-project details, and show identifiers only for disambiguation. User-visible success includes reading and navigation, not just message delivery.
 - Same-name and truncated-name project titles need stable disambiguation even in the static folded view; unique callback IDs alone do not make the UI distinguishable.
+
+- Adding controls must preserve a navigation pattern the user already finds clear. The first interactive menu introduced pagination and was rejected; keep native source folds and a full project list, then show controls in project details.
+- Re-reading all native providers for every click made navigation slow; the initial query also read twice. Cache directory selection data, overlay local controls/drafts, wake on events, and reserve live reads for refresh and execution checks.
+- A pending callback after activation can leave active controls without confirmed rule sync. Recovery must reconcile the exact operation revision; this implementation safely pauses the still-current activation instead of repeating work.
+- Unsent cards and idempotent rebinding of older cards must not steal the user's current project context. Remember context only on first successful binding or an authenticated selection.
+- Card PATCH has no cross-service revision transaction: an unknown older request can arrive late. Block stale actions and refresh on another click; do not promise atomic remote ordering.
+- Synthetic test renaming must update partial-name cases too; otherwise a test stops exercising its intended ambiguity contract.

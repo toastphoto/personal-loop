@@ -16,3 +16,7 @@
 - Preserve readiness failures and rollback evidence. Respect macOS volume authorization; do not bypass it. Real group command/response acceptance remains a distinct next check.
 
 - Use native Card 2.0 folding for the mobile project directory now. Hide technical identifiers until needed and distinguish duplicate names. Native expansion is view-only; callbacks are a separate deployment/acceptance step. Reassess pagination/search once the existing application's callback route is verified.
+
+- 2026-11-05: The owner requested actionable project cards and natural project questions. Save goals as drafts; start/resume require explicit confirmation. Native controls remain capability-gated. Preserve the existing receiver and use one additional consumer on its event bus.
+- Restore the previously preferred native source folds after user feedback. Full project lists and cached navigation are the default; live checks belong at refresh/execution boundaries. Reassess only with user feedback or platform limits.
+- Natural language produces bounded queries/proposals, not unrestricted automatic execution. Ambiguity is resolved in cards. Keep actor/group/message/revision proof and do not infer a context from an undelivered or retried old card.

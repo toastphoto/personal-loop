@@ -319,3 +319,50 @@ test("project-card retries preserve the saved view and never activate a project"
   assert.equal(controls.get(p.key).mode, "manual");
   assert.equal(queue.get("om_card_query").state, "replied");
 });
+
+test("owner natural language is handled by cards once and its delivery is bound before acknowledgement", async (t) => {
+  const dir = mkdtempSync(path.join(tmpdir(), "natural-relay-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const queuePath = path.join(dir, "queue.ndjson");
+  writeFileSync(queuePath, "");
+  const routing = path.join(dir, "routing.json");
+  writeFileSync(
+    routing,
+    JSON.stringify({
+      enabled: true,
+      chatId: "oc_group",
+      allowedSenderIds: ["ou_owner"],
+      botMentionIds: ["ou_bot"],
+      projectNames: ["Demo"],
+    }),
+  );
+  const queue = new RelayQueue(path.join(dir, "queue.db"));
+  t.after(() => queue.close());
+  let calls = 0;
+  const bound = [];
+  const cards = {
+    natural: async () => {
+      calls++;
+      return {
+        ok: true,
+        response: { type: "interactive", sessionId: "s", card: { schema: "2.0", body: { elements: [] } } },
+      };
+    },
+    prepare: async () => null,
+    bind: (id, ref) => bound.push([id, ref]),
+  };
+  const relay = new FeishuLoopRelay(
+    { ...config, queuePath, naturalRoutingFile: routing },
+    { queue, catalog: {}, controls: {}, cards, reply: async () => "om_response" },
+  );
+  await relay.tick();
+  appendFileSync(
+    queuePath,
+    JSON.stringify(event("om_natural", "Demo现在怎样了", { mentions: [{ id: "ou_bot", name: "Bot" }] })) + "\n",
+  );
+  await relay.tick();
+  await relay.tick();
+  assert.equal(calls, 1);
+  assert.deepEqual(bound, [["s", "om_response"]]);
+  assert.equal(queue.get("om_natural").state, "replied");
+});

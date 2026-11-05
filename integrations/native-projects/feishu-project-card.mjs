@@ -23,6 +23,20 @@ const plain = (value, limit = 140) =>
 const escape = (value, limit = 500) =>
   short(value, limit).replace(/[&<>*~\[\]()#:_`!\\|./=+-]/g, (c) => `&#${c.charCodeAt(0)};`);
 const text = (content) => ({ tag: "plain_text", content });
+const goalValid = (goal) =>
+  typeof goal?.objective === "string" &&
+  goal.objective.trim().length > 0 &&
+  goal.objective.length <= 1000 &&
+  Number.isSafeInteger(goal.maxSteps) &&
+  goal.maxSteps >= 1 &&
+  goal.maxSteps <= 100;
+// Confirmation must preserve the full goal, including line breaks, without creating markup.
+const goalMarkdown = (value) => String(value).replace(/[&<>*~\[\]()#:_`!\\|./=+-]/g, (c) => `&#${c.charCodeAt(0)};`);
+const goalPlain = (value) =>
+  String(value)
+    .replaceAll("<", "＜")
+    .replaceAll(">", "＞")
+    .replace(/https?:\/\//gi, (v) => v.replace(":", "："));
 const md = (content, text_size = "normal") => ({ tag: "markdown", content, text_size });
 const muted = (content) => md(`<font color='grey'>${content}</font>`, "notation");
 const column = (elements, extra = {}) => ({
@@ -63,8 +77,23 @@ function normalize(view) {
       provider: p.provider,
       mode: p.mode,
       execution: p.execution,
-      ...(typeof p.objective === "string" && p.objective ? { objective: short(p.objective, 500) } : {}),
+      ...(typeof p.objective === "string" && p.objective ? { objective: p.objective } : {}),
       ...(Number.isSafeInteger(p.maxSteps) && p.maxSteps > 0 ? { maxSteps: p.maxSteps } : {}),
+      controlRevision: p.controlRevision ?? p.revision,
+      canSetGoal: p.canSetGoal === true,
+      canStart: p.canStart === true,
+      canPause: p.canPause === true,
+      canResume: p.canResume === true,
+      ...(typeof p.controlReason === "string" ? { controlReason: short(p.controlReason, 300) } : {}),
+      ...(p.draft && typeof p.draft === "object"
+        ? {
+            draft: {
+              objective: typeof p.draft.objective === "string" ? p.draft.objective : "",
+              maxSteps: p.draft.maxSteps,
+              revision: p.draft.revision,
+            },
+          }
+        : {}),
     };
   });
   return { projects, providers: Array.isArray(view.providers) ? view.providers : [], complete: view.complete === true };
@@ -149,7 +178,7 @@ function button(context, title, action, extra = {}, primary = false) {
     behaviors: callback(context, action, extra),
   };
 }
-function navigationButtons(context, navigation) {
+function navigationButtons(context, navigation, primary = true) {
   const refresh =
     navigation.screen === "detail"
       ? { alias: navigation.alias }
@@ -157,44 +186,63 @@ function navigationButtons(context, navigation) {
         ? { provider: navigation.provider, page: navigation.page }
         : {};
   return row([
-    column([button(context, "返回目录", "home", {}, true)]),
+    column([
+      button(
+        context,
+        "返回目录",
+        "home",
+        Object.hasOwn(PROVIDERS, navigation.provider) ? { provider: navigation.provider } : {},
+        primary,
+      ),
+    ]),
     column([button(context, "刷新", "refresh", refresh)]),
   ]);
 }
-function interactiveHome(v, context, maxOptions) {
-  const selected = v.projects.slice(0, maxOptions);
+function projectTitles(projects) {
   const names = new Map();
-  for (const p of selected) {
-    const base = `${PROVIDERS[p.provider]} · ${plain(p.name, 60)}`;
-    names.set(base, (names.get(base) ?? 0) + 1);
+  for (const p of projects) {
+    const title = plain(p.name, 70);
+    if (!names.has(title)) names.set(title, []);
+    names.get(title).push(p.alias);
   }
-  const picker = selected.length
-    ? {
-        tag: "select_static",
-        name: "project",
-        width: "fill",
-        placeholder: text("选择一个项目查看详情"),
-        options: selected.map((p) => {
-          const base = `${PROVIDERS[p.provider]} · ${plain(p.name, 60)}`;
-          return { text: text(base + (names.get(base) > 1 ? ` · ${p.alias}` : "")), value: p.alias };
-        }),
-        behaviors: callback(context, "select"),
-      }
-    : muted(v.complete ? "当前没有项目" : "目录待连接 请稍后刷新");
-  return rootCard("个人项目", "按来源浏览 或直接选择项目", [
+  const titles = new Map();
+  for (const [title, aliases] of names) {
+    // Compare the full source, not the visible slice, so budget trimming cannot rename entries.
+    let length = 6;
+    while (length < 10 && new Set(aliases.map((alias) => alias.slice(-length))).size < aliases.length) length++;
+    for (const alias of aliases) titles.set(alias, title + (aliases.length > 1 ? ` · ${alias.slice(-length)}` : ""));
+  }
+  return titles;
+}
+function selectedAliases(v, limit) {
+  const groups = Object.keys(PROVIDERS).map((provider) => v.projects.filter((p) => p.provider === provider));
+  const selected = new Set();
+  for (let i = 0; selected.size < limit && groups.some((g) => g[i]); i++)
+    for (const group of groups) if (group[i] && selected.size < limit) selected.add(group[i].alias);
+  return selected;
+}
+function interactiveHome(v, navigation, context, maxProjects) {
+  const selected = selectedAliases(v, maxProjects);
+  return rootCard("个人项目", "展开来源查看完整清单", [
     summary(v, true),
-    row(
-      Object.keys(PROVIDERS).map((provider, i) =>
-        column([
-          button(context, PROVIDERS[provider], "list", { provider, page: 0 }, i === 0),
-          muted(escape(providerStatus(v, provider).replace(`${PROVIDERS[provider]} · `, ""))),
-        ]),
-      ),
-    ),
-    block([
-      picker,
-      ...(selected.length < v.projects.length ? [muted("这里仅列出部分项目 更多项目请按来源翻页查看")] : []),
-    ]),
+    ...Object.keys(PROVIDERS).map((provider) => {
+      const projects = v.projects.filter((p) => p.provider === provider);
+      const shown = projects.filter((p) => selected.has(p.alias));
+      const titles = projectTitles(projects);
+      const source = panel(providerStatus(v, provider), [
+        ...shown.map((p) =>
+          button(context, titles.get(p.alias) + (p.mode !== "manual" ? ` · ${mode(p)}` : ""), "detail", {
+            alias: p.alias,
+          }),
+        ),
+        ...(shown.length < projects.length
+          ? [muted(`此处展示 ${shown.length} / ${projects.length} 项 其余请用 /loop 状态 精确项目名 查询`)]
+          : []),
+        ...(!projects.length ? [muted(providerStatus(v, provider))] : []),
+      ]);
+      source.expanded = navigation.provider === provider;
+      return source;
+    }),
     commandHelp(),
   ]);
 }
@@ -228,6 +276,29 @@ function interactiveList(v, navigation, context) {
     navigationButtons(context, { screen: "list", provider, page }),
   ]);
 }
+function projectControls(p, context) {
+  if (context.interactive === false || context.mutationEnabled !== true) return null;
+  const buttons = [];
+  if (p.canPause) {
+    const pause = button(context, "暂停后续推进", "pause", { alias: p.alias }, true);
+    pause.confirm = { title: text("暂停这个项目"), text: text("暂停后续自动推进 不会取消已经开始的当前任务") };
+    buttons.push(pause);
+  }
+  if (p.canResume) buttons.push(button(context, "恢复原目标", "resume", { alias: p.alias }, !buttons.length));
+  if (p.canStart && goalValid(p.draft))
+    buttons.push(button(context, "检查并启动", "start", { alias: p.alias }, !buttons.length));
+  if (p.canSetGoal)
+    buttons.push(
+      button(
+        context,
+        p.mode === "active" ? "设置下一目标" : "设置目标",
+        "edit-goal",
+        { alias: p.alias },
+        !buttons.length,
+      ),
+    );
+  return buttons.length ? row(buttons.map((b) => column([b]))) : null;
+}
 function detail(v, navigation, context) {
   const p = v.projects.find((p) => p.alias === navigation.alias);
   if (!p)
@@ -237,41 +308,160 @@ function detail(v, navigation, context) {
         ? navigationButtons(context, { screen: "home" })
         : block([md("刷新目录：/loop 项目")]),
     ]);
+  const controls = projectControls(p, context);
+  const draft = p.draft?.objective
+    ? [
+        md(`**目标草稿 · 尚未启动**\n${escape(p.draft.objective, 500)}`),
+        ...(Number.isSafeInteger(p.draft.maxSteps) ? [muted(`草稿步数上限 ${p.draft.maxSteps}`)] : []),
+      ]
+    : [];
   return rootCard("项目详情", PROVIDERS[p.provider], [
-    block([md(`**${escape(p.name, 140)}**`, "heading-3"), md(`当前 ${mode(p)}`), muted(escape(capability(p)))], true),
+    block(
+      [
+        md(`**${escape(p.name, 140)}**`, "heading-3"),
+        md(`当前 ${mode(p)}`),
+        muted(escape(capability(p))),
+        ...(p.controlReason ? [muted(escape(p.controlReason))] : []),
+      ],
+      true,
+    ),
     block([
       md(p.objective ? `**当前目标**\n${escape(p.objective)}` : "尚未设置自动推进目标"),
       ...(p.maxSteps ? [muted(`步数上限 ${p.maxSteps}`)] : []),
+      ...draft,
     ]),
+    ...(controls ? [controls] : []),
     commandHelp(p),
-    ...(context.interactive !== false ? [navigationButtons(context, { screen: "detail", alias: p.alias })] : []),
+    ...(context.interactive !== false
+      ? [navigationButtons(context, { screen: "detail", alias: p.alias, provider: p.provider }, !controls)]
+      : []),
   ]);
+}
+function backToProject(context, alias) {
+  return row([column([button(context, "返回项目", "detail", { alias })])]);
+}
+function goalForm(v, navigation, context) {
+  const p = v.projects.find((p) => p.alias === navigation.alias);
+  if (!p || context.interactive === false || context.mutationEnabled !== true || !p.canSetGoal)
+    return detail(v, navigation, context);
+  const validDraft = goalValid(p.draft);
+  const choices = [1, 3, 5, 10];
+  if (validDraft && !choices.includes(p.draft.maxSteps)) choices.push(p.draft.maxSteps);
+  return rootCard("设置项目目标", plain(p.name, 80), [
+    block(
+      [
+        md("**保存草稿不会启动**", "heading-3"),
+        muted("当前项目模式和正在执行的目标保持不变"),
+        ...(p.draft?.objective && !validDraft ? [muted("旧草稿内容或步数超出表单范围 未截断预填 请重新填写")] : []),
+      ],
+      true,
+    ),
+    {
+      tag: "form",
+      name: "goal_form",
+      direction: "vertical",
+      vertical_spacing: "12px",
+      elements: [
+        {
+          tag: "input",
+          name: "objective",
+          label: text("希望完成什么"),
+          label_position: "top",
+          placeholder: text("写清目标和怎样算完成"),
+          input_type: "multiline_text",
+          rows: 4,
+          max_length: 1000,
+          required: true,
+          width: "fill",
+          ...(validDraft ? { default_value: p.draft.objective } : {}),
+        },
+        {
+          tag: "select_static",
+          name: "max_steps",
+          placeholder: text("最多推进几步"),
+          required: true,
+          width: "fill",
+          initial_option: String(validDraft ? p.draft.maxSteps : 3),
+          options: choices.map((n) => ({
+            text: text(`${n} 步${[1, 3, 5, 10].includes(n) ? "" : "（当前）"}`),
+            value: String(n),
+          })),
+        },
+        {
+          tag: "button",
+          name: `plgoal_${context.sessionId}_${context.revision}`,
+          form_action_type: "submit",
+          text: text("保存目标草稿"),
+          type: "primary_filled",
+          width: "fill",
+        },
+      ],
+    },
+    backToProject(context, p.alias),
+  ]);
+}
+function confirmGoal(v, navigation, context, resume) {
+  const p = v.projects.find((p) => p.alias === navigation.alias);
+  const goal = resume ? p : p?.draft;
+  const permitted =
+    p && context.interactive !== false && context.mutationEnabled === true && (resume ? p.canResume : p.canStart);
+  if (!permitted || !goalValid(goal)) {
+    return rootCard(resume ? "恢复原目标" : "启动前确认", p ? plain(p.name, 80) : "项目待核对", [
+      block(
+        [
+          md("**暂时不能确认启动**"),
+          muted(!permitted ? "项目控制未就绪 请返回项目刷新状态" : "请先保存完整目标和有效步数 目标最多1000字"),
+        ],
+        true,
+      ),
+      context.interactive !== false && p ? backToProject(context, p.alias) : block([md("刷新目录：/loop 项目")]),
+    ]);
+  }
+  const confirm = button(
+    context,
+    resume ? "确认恢复" : "确认启动",
+    resume ? "confirm-resume" : "confirm-start",
+    { alias: p.alias },
+    true,
+  );
+  confirm.confirm = {
+    title: text(resume ? "确认恢复原目标" : "确认启动这个目标"),
+    text: text(
+      `${goalPlain(goal.objective)}\n\n最多 ${goal.maxSteps} 步${resume ? " · 不会重置已使用步数" : ""}\n${capability(p)}`,
+    ),
+  };
+  return rootCard(resume ? "恢复前确认" : "启动前确认", plain(p.name, 80), [
+    block([md(resume ? "**继续原目标**" : "**启动这个目标**", "heading-3"), muted(escape(capability(p)))], true),
+    block([
+      md(goalMarkdown(goal.objective)),
+      md(`最多 ${goal.maxSteps} 步`),
+      ...(resume ? [muted("恢复不会重置已使用步数 不采用另存的新草稿")] : [muted("确认后才开始自动推进")]),
+    ]),
+    row([column([confirm]), column([button(context, "返回项目", "detail", { alias: p.alias })])]),
+  ]);
+}
+function probeCard(context) {
+  return rootCard("连接验证", "验证卡片按钮能否正常响应", [
+    block([md("**验证按钮连接**", "heading-3"), muted("本次验证不会启动项目 或改变项目模式")], true),
+    context.interactive !== false
+      ? block([button(context, "验证按钮连接", "probe", {}, true)])
+      : block([muted("按钮连接尚未开启 请使用 /loop 项目 查看目录")]),
+  ]);
+}
+function withNotice(card, notice) {
+  if (typeof notice === "string" && notice.trim())
+    card.body.elements[0]?.columns?.[0]?.elements.push(muted(escape(notice, 300)));
+  return card;
 }
 function staticDirectory(v, maxProjects) {
   // Fair source allocation keeps a large first provider from concealing the others.
-  const groups = Object.keys(PROVIDERS).map((provider) => v.projects.filter((p) => p.provider === provider));
-  const selected = new Set();
-  for (let i = 0; selected.size < maxProjects && groups.some((g) => g[i]); i++)
-    for (const group of groups) if (group[i] && selected.size < maxProjects) selected.add(group[i].alias);
+  const selected = selectedAliases(v, maxProjects);
   return rootCard("个人项目", "按来源展开 再点项目名称", [
     summary(v, false),
     ...Object.keys(PROVIDERS).map((provider) => {
       const projects = v.projects.filter((p) => p.provider === provider);
       const shown = projects.filter((p) => selected.has(p.alias));
-      const names = new Map();
-      for (const p of projects) {
-        const title = plain(p.name, 70);
-        if (!names.has(title)) names.set(title, []);
-        names.get(title).push(p.alias);
-      }
-      const titles = new Map();
-      for (const [title, aliases] of names) {
-        // Compare the full source, not the visible slice, so budget trimming cannot rename entries.
-        let length = 6;
-        while (length < 10 && new Set(aliases.map((alias) => alias.slice(-length))).size < aliases.length) length++;
-        for (const alias of aliases)
-          titles.set(alias, title + (aliases.length > 1 ? ` · ${alias.slice(-length)}` : ""));
-      }
+      const titles = projectTitles(projects);
       return panel(providerStatus(v, provider), [
         ...shown.map((p) =>
           panel(titles.get(p.alias) + (p.mode !== "manual" ? ` · ${mode(p)}` : ""), [
@@ -299,7 +489,7 @@ function fits(card) {
 }
 
 // P0: every project is reachable or omissions are explicit. P1: one highlighted summary.
-// P2/P3: 2–5 root blocks, native folding/pickers, no horizontal table or separator wall.
+// P2/P3: 2–5 root blocks, native source folding, no horizontal table or separator wall.
 // P4–P7: restrained type hierarchy, container spacing, blue/grey and weighted columns.
 export function renderProjectCard(view, navigation = {}, context = {}) {
   const interactive = context.interactive !== false;
@@ -307,7 +497,8 @@ export function renderProjectCard(view, navigation = {}, context = {}) {
     interactive &&
     (!/^[A-Za-z0-9_-]{1,120}$/.test(context.sessionId ?? "") ||
       !Number.isSafeInteger(context.revision) ||
-      context.revision < 0)
+      context.revision < 0 ||
+      (context.mutationEnabled === true && !/^[a-f0-9]{24}$/.test(context.sessionId ?? "")))
   )
     throw fail("PROJECT_CARD_CONTEXT_INVALID");
   const v = normalize(view);
@@ -315,17 +506,22 @@ export function renderProjectCard(view, navigation = {}, context = {}) {
     view.kind === "project-status" && !navigation.screen
       ? { screen: "detail", alias: v.projects[0]?.alias }
       : navigation;
+  const decorated = (card) => withNotice(card, context.notice);
   let card;
-  if (nav.screen === "detail") card = detail(v, nav, context);
+  if (nav.screen === "probe") card = decorated(probeCard(context));
+  else if (nav.screen === "goal") card = decorated(goalForm(v, nav, context));
+  else if (nav.screen === "confirm-start") card = decorated(confirmGoal(v, nav, context, false));
+  else if (nav.screen === "confirm-resume") card = decorated(confirmGoal(v, nav, context, true));
+  else if (nav.screen === "detail") card = decorated(detail(v, nav, context));
   else if (!interactive) {
     for (let limit = Math.min(45, v.projects.length); limit >= 0; limit--) {
-      card = staticDirectory(v, limit);
+      card = decorated(staticDirectory(v, limit));
       if (fits(card)) break;
     }
-  } else if (nav.screen === "list") card = interactiveList(v, nav, context);
+  } else if (nav.screen === "list") card = decorated(interactiveList(v, nav, context));
   else {
-    for (let limit = Math.min(60, v.projects.length); limit >= 0; limit--) {
-      card = interactiveHome(v, context, limit);
+    for (let limit = Math.min(80, v.projects.length); limit >= 0; limit--) {
+      card = decorated(interactiveHome(v, nav, context, limit));
       if (fits(card)) break;
     }
   }
