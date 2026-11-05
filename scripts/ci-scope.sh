@@ -22,7 +22,7 @@ while IFS= read -r file; do
     docs/* | .github/ISSUE_TEMPLATE/* | .github/pull_request_template.md) kind=docs ;;
     tests/simulation.test.ts) kind=full ;;
     kernel/* | protocol/*) kind=kernel ;;
-    plugins/* | examples/* | skills/* | worker/* | host/* | cli/* | bin/* | scripts/* | tests/* | install.sh) kind=normal ;;
+    integrations/* | plugins/* | examples/* | skills/* | worker/* | host/* | cli/* | bin/* | scripts/* | tests/* | install.sh) kind=normal ;;
     *) kind=full ;;
   esac
   case "$kind" in

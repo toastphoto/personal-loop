@@ -1,0 +1,22 @@
+{
+  "version": 1,
+  "controlsFile": "/private/path/loop-modes.json",
+  "providers": {
+    "codex": {
+      "mode": "isolated-readonly-api",
+      "includeUnassignedByRoot": true,
+      "writeEnabled": false
+    },
+    "multica": {
+      "profile": "existing-profile",
+      "workspaceId": "replace-with-existing-workspace",
+      "writeEnabled": false
+    },
+    "dsh": {
+      "gatewayUrl": "http://127.0.0.1:12345",
+      "launchTokenEnv": "DSH_NATIVE_LAUNCH_TOKEN",
+      "writeEnabled": false
+    }
+  },
+  "goals": []
+}

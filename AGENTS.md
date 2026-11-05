@@ -69,3 +69,7 @@
 现有测试是行为规格，不为迁就实现改预期。模拟、穷举、强杀和变异检查在本地只在相关改动需要时运行，不扩写验证框架。新测试先写失败方式再写实现，不补复述实现的测试。模拟吞吐只记录观察，不作为发布门槛，不为加速模拟保留另一套内核。预算检查采用 README 和协议的口径：空闲内存与千连接内存分开，持久化写入不换成批量提交。
 
 真机脚本在 `scripts/real-agents.ts`、`scripts/real-protocols.ts` 和 `scripts/delivery-e2e.ts`。真实交付脚本要求 `owner/name --run`，会创建并删除指定私有测试仓库；只有用户明确要求运行时才执行。其他测试使用临时 `AGENT_AUTOLOOP_HOME` 和随机端口，退出清理。飞书用假 CLI；不能拿已在线的应用再开一个事件监听。通道用本地假 HTTP 服务，不发真消息。桌面通知用放在 PATH 最前面的假命令，不真的弹：`init` 之后再跑 `up` 的测试都要带上。`scripts/install-smoke.sh` 在临时 HOME 里走一遍从安装到卸载，装的是已提交的代码，CI 在 ubuntu 和 macOS 上都跑。
+
+## Personal-loop integration
+
+For `integrations/native-projects/`, read [current context](docs/project_memory/ACTIVE_CONTEXT.md), [decisions](docs/project_memory/DECISIONS.md) and [handoff](docs/project_memory/HANDOFF_TEMPLATE.md). All projects default to manual. Project selection and pause are explicit persistent choices; an unavailable native connection never means an empty successful catalogue. Keep runtime metadata and credentials outside Git. Update these memory files and root LEARNINGS after corrections. Run `python3 scripts/verify_project_memory.py` and `npm run test:native`, plus the existing applicable checks.
