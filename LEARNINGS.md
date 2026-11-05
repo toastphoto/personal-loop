@@ -23,3 +23,10 @@
 - Unsent cards and idempotent rebinding of older cards must not steal the user's current project context. Remember context only on first successful binding or an authenticated selection.
 - Card PATCH has no cross-service revision transaction: an unknown older request can arrive late. Block stale actions and refresh on another click; do not promise atomic remote ordering.
 - Synthetic test renaming must update partial-name cases too; otherwise a test stops exercising its intended ambiguity contract.
+
+- Project-control status alone did not let the owner judge real progress. Add the selected native Issue/session and its last visible Agent reply with source/time/truncation, without relabelling stored metadata as live execution.
+- Remaining run budget does not schedule another run. A valid later/event/answer or observer trigger is needed; do not call configured capability a fully accepted autonomous workflow.
+- Upstream receipt repair reused a run ID that our wrapper deduplicated, replaying the same invalid receipt and usage. Validate before hand-in; preserve the original and stop safely for investigation instead of redoing business.
+- Package staging must use explicit paths when the shell working directory is the plugin subdirectory; a failed documentation edit must not be mistaken for a completed release update.
+
+- Validate protocol enums against the installed native schema. The owned executor's active-turn read/cancel preflight used obsolete itemsView="none"; switch to notLoaded without weakening project/turn identity checks.

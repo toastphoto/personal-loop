@@ -2,7 +2,7 @@
 
 One catalogue over native Codex, Multica and DeepSeek Harness projects. It preserves each provider's identity. It does not migrate projects or treat a new Multica Run as an existing model conversation.
 
-Current delivery includes the native catalogue, explicit project selection/pause, a reliable Feishu command relay, existing-hub rule synchronization and decision replies, and an executor for loop-owned Codex threads. Live catalogue reads have verified 27 Codex projects, 9 Multica projects and 3 DSH workspaces on one installation, for 39 native entries. Every project still defaults to manual. One bounded read-only owned Codex task completed with an artifact; this is not business-workflow completion. Existing manual-chat control and Multica/DSH writes remain unaccepted.
+Current delivery includes the native catalogue, explicit project selection/pause, a reliable Feishu command relay, existing-hub rule synchronization and decision replies, and an executor for loop-owned Codex threads. Live catalogue reads have verified 27 Codex projects, 9 Multica projects and 4 DSH workspaces on one installation, for 40 native entries. Every project still defaults to manual. One bounded read-only owned Codex task completed with an artifact; this is not business-workflow completion. Existing manual-chat control and Multica/DSH writes remain unaccepted.
 
 The reviewed [read-only Host plugin](../dsh-native-bridge/README.md) is installed through the supported DSH plugin mechanism, and the Desktop app was normally quit and reopened with explicit user approval. The existing Host now supplies real workspace metadata without credential extraction or a second shared-storage Host.
 
@@ -20,7 +20,7 @@ node integrations/native-projects/cli.mjs --config /private/path/config.json mod
 node integrations/native-projects/cli.mjs --config /private/path/config.json mcp
 ```
 
-MCP exposes only `native_projects_list`, `native_project_tasks`, `native_task_read`, and `native_loop_modes`. Its output explicitly lists unavailable providers. An unavailable provider is not an empty successful catalogue. There is no chat-body export or public network listener.
+MCP exposes only `native_projects_list`, `native_project_tasks`, `native_task_read`, and `native_loop_modes`. Its output explicitly lists unavailable providers. An unavailable provider is not an empty successful catalogue. These MCP tools do not export conversation bodies, and there is no public network listener. The separately opt-in card activity reader is described below.
 
 ## Project selection and pause
 
@@ -72,7 +72,7 @@ This fragment belongs in the existing private native configuration and does not 
 
 ## Feishu control commands
 
-The dedicated relay only accepts new text commands from configured sender IDs in the configured group. It starts at the current queue tail; ordinary messages retain the existing dispatcher path. The existing dispatcher has the minimal reviewed hook reserving the `/loop` namespace so commands cannot also create Issues. The live patch and new service were deployed after explicit approval. Service readiness has passed; real group command handling and delivery still require acceptance.
+The dedicated relay only accepts new text commands from configured sender IDs in the configured group. It starts at the current queue tail; ordinary messages retain the existing dispatcher path. The existing dispatcher has the minimal reviewed hook reserving the `/loop` namespace so commands cannot also create Issues. The live patch and new service were deployed after explicit approval. Service readiness, real owner queries/replies and navigation callbacks have passed; task execution and business acceptance remain separate.
 
 Examples after deployment:
 
@@ -107,6 +107,16 @@ The complete card payload is saved before delivery or patching. Unknown PATCH re
 
 The owner has exercised real navigation callbacks, and the corrected folding directory has been patched onto the original card. Synthetic goal/start/resume/probe cards also passed official CardKit create-entity validation without being sent. Real goal submission and actual native task execution from a control button remain separate acceptance steps; tests do not establish business completion.
 
+## Selected task and Agent reply
+
+`projectActivity.enabled` on the private relay enables a selected-project activity panel. Each provider separately requires `allowConversationPreview:true`; DSH Desktop additionally requires the 0.1.1 Host plugin with `allowReplyPreview:true`. Existing metadata/MCP methods remain body-free.
+
+`ProjectActivity` queries only the selected provider, validates project and task membership, lists up to three selectable records and reads one bounded assistant reply. Native running records are preferred when trusted; otherwise selection is based on known update times or is explicitly marked as uncertain. A recent record is not automatically the currently running task. Codex isolated reads remain stored/unknown runtime state; directory-associated old chats keep that label.
+
+Only public Agent text is shown, normally at most 1600 Unicode characters, with source/time/truncation labels. Reasoning, tool payloads and arbitrary native fields are excluded. Obvious credential shapes are masked; this finite filter is not a general data-classification guarantee. Replies are data for the owner, never commands or permission to take over the original session. The panel can switch recent records and refresh replies.
+
+Reads coalesce, cache for 30 seconds and have an 8-second UI deadline. Failed reads show a missing/stale state without claiming the Agent has done no work. A selected reply read is distinct from browsing the directory, which remains cached.
+
 ## Owned Codex execution
 
 `ManagedCodexExecutor` creates and registers a new thread within a verified native project. It never takes ownership of an arbitrary desktop chat. Fresh threads follow the official `thread/start → turn/start` sequence; a restarted empty thread is not silently recreated. Existing owned threads preserve strict project/directory identity.
@@ -116,6 +126,8 @@ The first execution scope is **read-only**. Final report text is saved to a priv
 `plugins/native-managed/` runs this executor for one existing-hub run. Stable run IDs and durable intent records prevent duplicate dispatch. Unknown results block further work and create an attention request. The step budget survives pause/resume. Stop targets the exact owned turn and separately verifies its terminal state.
 
 `managedCodex` uses `enabled`, `stateDir`, `projectRoots`, `timeoutMs` and `waitTimeoutMs`. `loopHub` uses `autoStart`, `configFile`, `rulesFile`, `workerName` and `controlCwd`. Rules remain the authority in the original hub; the helper does not add a separate scheduler. `startOwned` means a separate read-only execution is supported, not control of old manual chats. All projects still default to manual.
+
+`maxSteps` limits automatic run rounds, not internal tool calls and not a promise to run exactly that many times. Valid `later/ask/notice` receipts reach the upstream kernel. A malformed receipt is preserved and safely surfaced as an attention request without repeating business or its usage; affected goals remain isolated until explicitly investigated.
 
 Token usage uses a persisted cumulative-total baseline per owned turn. Native `last` is the last model request, not the whole user turn. Missing baselines or counters are reported as missing rather than zero; raw usage is retained privately and is not a monetary bill.
 
@@ -130,4 +142,4 @@ npm run format:check
 
 The latest recorded quick suite contains 723 tests: 721 passed and 2 skipped. This result must be rerun after relevant code changes.
 
-Tests use fake transports, temporary files and local HTTP/WebSocket servers. They cannot prove account authorization, live mutation semantics, business acceptance, or the user's desired notification experience. The separate live evidence is limited to the three-provider catalogue, one owned read-only Codex task, DSH Host plugin loading after a normal restart, and Feishu service readiness. No real group command/response trial has been performed.
+Tests use fake transports, temporary files and local HTTP/WebSocket servers. They cannot prove account authorization, live mutation semantics, business acceptance, or the user's desired notification experience. The separate live evidence is limited to the three-provider catalogue, one owned read-only Codex task, DSH Host plugin loading after a normal restart, and Feishu service readiness. Real owner group queries, replies and navigation callbacks have been exercised. Bounded reply samples from all three native sources were read without starting models.

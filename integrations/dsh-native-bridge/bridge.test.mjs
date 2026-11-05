@@ -272,3 +272,130 @@ test("a rejected half-open UDS client cannot keep Host disposal waiting", async 
     accepted.socket.destroy();
   }
 });
+
+function previewHost() {
+  const ctx = fake();
+  const calls = [];
+  ctx.replyCalls = calls;
+  ctx.sessionQuery.listEvents = async (sessionId) => {
+    calls.push({ method: "listEvents", sessionId });
+    return [
+      { sessionId, seq: 0, type: "turn/start", time: 1000, surface: "log-only" },
+      { sessionId, seq: 1, type: "assistant/message", time: 2000, surface: "current" },
+    ];
+  };
+  ctx.sessionQuery.readEvent = async (request, signal) => {
+    calls.push({ method: "readEvent", request });
+    signal.throwIfAborted();
+    return {
+      session: { id: "s1", private: "private-header" },
+      target: {
+        seq: 1,
+        type: "assistant/message",
+        time: 2000,
+        data: {
+          message: {
+            content: [
+              { type: "reasoning", text: "private-reasoning" },
+              { type: "text", text: "可见回复" },
+              { type: "tool-call", name: "private-tool", arguments: "private-input" },
+            ],
+          },
+        },
+      },
+      events: ["private-neighbor"],
+    };
+  };
+  return ctx;
+}
+test("reply previews require explicit plugin opt-in and exact workspace/session input", async (t) => {
+  const ctx = previewHost();
+  const f = await fixture(t, {}, ctx);
+  const c = await client(f.socketPath);
+  t.after(() => c.socket.destroy());
+  assert.equal(
+    (await c.request("session/reply", { workspaceId: "w1", sessionId: "s1" })).error.code,
+    "REPLY_PREVIEW_DISABLED",
+  );
+  assert.equal(ctx.replyCalls.length, 0);
+  const g = await fixture(t, { allowReplyPreview: true }, previewHost());
+  const d = await client(g.socketPath);
+  t.after(() => d.socket.destroy());
+  for (const params of [
+    { sessionId: "s1" },
+    { workspaceId: "w1" },
+    { workspaceId: "w1", sessionId: "s1", includeAll: "yes" },
+  ])
+    assert.equal((await d.request("session/reply", params)).error.code, "INVALID_REQUEST");
+  assert.equal(
+    (await d.request("session/reply", { workspaceId: "other", sessionId: "s1" })).error.code,
+    "WORKSPACE_NOT_FOUND",
+  );
+  g.ctx.workspace.sessionIds = [];
+  assert.equal(
+    (await d.request("session/reply", { workspaceId: "w1", sessionId: "s1" })).error.code,
+    "SESSION_WORKSPACE_MISMATCH",
+  );
+  assert.equal(g.ctx.replyCalls.length, 0);
+});
+test("reply preview returns only bounded visible text, event time and exact event identity", async (t) => {
+  const f = await fixture(t, { allowReplyPreview: true }, previewHost());
+  const c = await client(f.socketPath);
+  t.after(() => c.socket.destroy());
+  const r = await c.request("session/reply", { workspaceId: "w1", sessionId: "s1" });
+  assert.equal(r.ok, true);
+  assert.equal(r.result.projectId, "w1");
+  assert.equal(r.result.latestReply.text, "可见回复");
+  assert.equal(r.result.latestReply.at, "1970-01-01T00:00:02.000Z");
+  assert.equal(r.result.latestReply.seq, 1);
+  assert.equal(r.result.updatedAt, null);
+  assert.equal(r.result.title, null);
+  assert.ok(!JSON.stringify(r).includes("private-"));
+  assert.deepEqual(f.ctx.replyCalls[1].request, { sessionId: "s1", seq: 1, before: 0, after: 0 });
+  f.ctx.sessionQuery.readEvent = async () => ({
+    session: { id: "s1" },
+    target: {
+      seq: 1,
+      type: "assistant/message",
+      time: 2000,
+      data: { message: { content: [{ type: "text", text: "🙂".repeat(2100) }] } },
+    },
+  });
+  const long = await c.request("session/reply", { workspaceId: "w1", sessionId: "s1" });
+  assert.equal(Array.from(long.result.latestReply.text).length, 2000);
+  assert.equal(long.result.latestReply.truncated, true);
+  assert.equal((await c.request("session/read", { sessionId: "s1" })).result.latestReply, undefined);
+});
+test("reply identity mismatch and a concurrent workspace move never return a body", async (t) => {
+  for (const fault of ["session", "seq", "type", "move"]) {
+    const ctx = previewHost(),
+      original = ctx.sessionQuery.readEvent;
+    ctx.sessionQuery.readEvent = async (...args) => {
+      const result = await original(...args);
+      if (fault === "session") result.session.id = "another";
+      if (fault === "seq") result.target.seq = 9;
+      if (fault === "type") result.target.type = "user/message";
+      if (fault === "move") ctx.workspace.sessionIds = [];
+      return result;
+    };
+    const f = await fixture(t, { allowReplyPreview: true }, ctx);
+    const c = await client(f.socketPath);
+    t.after(() => c.socket.destroy());
+    const r = await c.request("session/reply", { workspaceId: "w1", sessionId: "s1" });
+    assert.equal(r.ok, false);
+    assert.equal(r.error.code, fault === "move" ? "SESSION_WORKSPACE_MISMATCH" : "INVALID_NATIVE_REPLY");
+    assert.ok(!JSON.stringify(r).includes("可见回复"));
+  }
+});
+test("no assistant text and unavailable reply API are explicit without fake timestamps", async (t) => {
+  const f = await fixture(t, { allowReplyPreview: true }, previewHost());
+  const c = await client(f.socketPath);
+  t.after(() => c.socket.destroy());
+  f.ctx.sessionQuery.listEvents = async () => [];
+  const empty = await c.request("session/reply", { workspaceId: "w1", sessionId: "s1" });
+  assert.equal(empty.result.latestReply, null);
+  assert.equal(empty.result.reason, "REPLY_ABSENT");
+  delete f.ctx.sessionQuery.readEvent;
+  const unsupported = await c.request("session/reply", { workspaceId: "w1", sessionId: "s1" });
+  assert.equal(unsupported.error.code, "REPLY_PREVIEW_UNSUPPORTED");
+});

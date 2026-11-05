@@ -487,7 +487,7 @@ export class ManagedCodexExecutor {
       if (s.activeTurnId) {
         const page = await this.rpc("thread/turns/list", {
           threadId,
-          itemsView: "none",
+          itemsView: "notLoaded",
           limit: 1,
           sortDirection: "desc",
         });
@@ -521,7 +521,7 @@ export class ManagedCodexExecutor {
       if (status(thread) !== "active") fail("MANAGED_NOT_ACTIVE", "原生会话未运行，先读取结果");
       const page = await this.rpc("thread/turns/list", {
         threadId,
-        itemsView: "none",
+        itemsView: "notLoaded",
         limit: 1,
         sortDirection: "desc",
       });

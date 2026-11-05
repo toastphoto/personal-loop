@@ -1,8 +1,8 @@
 {
   "name": "@personal-loop/dsh-native-bridge",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
-  "description": "Read-only native Workspace and Session metadata from the existing DeepSeek Harness Host",
+  "description": "Read-only native project metadata and opt-in bounded assistant replies from the existing Host",
   "type": "module",
   "main": "./index.mjs",
   "exports": {

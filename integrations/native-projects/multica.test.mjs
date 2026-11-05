@@ -429,3 +429,261 @@ test("control revision changes during cancellation preflight block the native wr
   );
   assert.equal(writes, 0);
 });
+
+test("conversation previews are disabled before any native command unless explicitly allowed", async () => {
+  let calls = 0;
+  const c = new MulticaConnector(
+    options(async () => {
+      calls++;
+      return output({});
+    }),
+  );
+  await assert.rejects(c.readConversation("issue-1"), { code: "MULTICA_CONVERSATION_DISABLED" });
+  assert.equal(calls, 0);
+});
+test("conversation preview validates the expected project and Issue before reading message bodies", async () => {
+  const calls = [];
+  const c = new MulticaConnector(
+    options(
+      async (_command, args) => {
+        calls.push(args);
+        return output(issue);
+      },
+      { allowConversationPreview: true },
+    ),
+  );
+  await assert.rejects(c.readConversation("issue-1", { projectId: "other-project" }), { code: "MULTICA_SCOPE_DENIED" });
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].includes("run-messages"), false);
+  const wrong = new MulticaConnector(
+    options(async () => output({ ...issue, id: "other-issue", identifier: "OTHER-1" }), {
+      allowConversationPreview: true,
+    }),
+  );
+  await assert.rejects(wrong.readConversation("issue-1"), { code: "MULTICA_INVALID_RESPONSE" });
+});
+test("latest active Run is preferred and only its last text message is returned", async () => {
+  const calls = [];
+  const selected = { ...run, id: "active-run", created_at: "2026-11-05T00:00:00Z" };
+  const finished = { ...run, id: "later-finished", status: "completed", created_at: "2026-11-05T01:00:00Z" };
+  const messages = [
+    {
+      task_id: "active-run",
+      seq: 5,
+      type: "thinking",
+      content: "private thoughts",
+      created_at: "2026-11-05T01:10:02Z",
+    },
+    {
+      task_id: "active-run",
+      seq: 4,
+      type: "text",
+      content: "Latest visible reply",
+      created_at: "2026-11-05T01:10:01Z",
+    },
+    {
+      task_id: "active-run",
+      seq: 6,
+      type: "tool_result",
+      content: "private tool data",
+      created_at: "2026-11-05T01:10:03Z",
+    },
+    { task_id: "active-run", seq: 2, type: "text", content: "Older visible reply", created_at: "2026-11-05T01:00:00Z" },
+  ];
+  const c = new MulticaConnector(
+    options(
+      async (_command, args, opts) => {
+        calls.push({ args, opts });
+        return output(args.includes("run-messages") ? messages : args.includes("runs") ? [finished, selected] : issue);
+      },
+      { allowConversationPreview: true },
+    ),
+  );
+  const result = await c.readConversation("TEST-1", { projectId: "project-1" });
+  assert.equal(result.nativeId, "issue-1");
+  assert.equal(result.projectId, "project-1");
+  assert.equal(result.state, "running");
+  assert.equal(result.runtimeStateTrusted, true);
+  assert.equal(result.latestReply.text, "Latest visible reply");
+  assert.equal(result.latestReply.id, "active-run:4");
+  assert.equal(result.latestReply.phase, "progress");
+  assert.equal(result.latestReply.at, "2026-11-05T01:10:01Z");
+  assert.equal(result.complete, true);
+  assert.ok(!JSON.stringify(result).includes("private thoughts"));
+  assert.ok(!JSON.stringify(result).includes("private tool data"));
+  const call = calls.find((c) => c.args.includes("run-messages"));
+  assert.deepEqual(call.args.slice(-6), ["run-messages", "active-run", "--issue", "issue-1", "--output", "json"]);
+  assert.equal(call.opts.shell, false);
+  assert.ok(call.opts.maxBuffer <= 256 * 1024);
+});
+test("wrong Issue Run or a foreign task_id in any message rejects the preview", async () => {
+  let messagesCalled = false;
+  const badRun = new MulticaConnector(
+    options(
+      async (_command, args) => {
+        if (args.includes("run-messages")) messagesCalled = true;
+        return output(args.includes("runs") ? [{ ...run, issue_id: "other-issue" }] : issue);
+      },
+      { allowConversationPreview: true },
+    ),
+  );
+  await assert.rejects(badRun.readConversation("issue-1"), { code: "MULTICA_INVALID_RESPONSE" });
+  assert.equal(messagesCalled, false);
+  const foreign = new MulticaConnector(
+    options(
+      async (_command, args) =>
+        output(
+          args.includes("run-messages")
+            ? [
+                { task_id: "run-1", seq: 1, type: "text", content: "valid" },
+                { task_id: "foreign-run", seq: 2, type: "tool_result", content: "hidden" },
+              ]
+            : args.includes("runs")
+              ? [run]
+              : issue,
+        ),
+      { allowConversationPreview: true },
+    ),
+  );
+  await assert.rejects(foreign.readConversation("issue-1"), { code: "MULTICA_EXECUTION_MISMATCH" });
+});
+test("empty or non-text results do not invent an Agent reply from errors or wait reasons", async () => {
+  for (const messages of [
+    [],
+    [{ task_id: "run-1", seq: 1, type: "thinking", content: "secret" }],
+    [{ task_id: "run-1", seq: 1, type: "text", content: "   " }],
+  ]) {
+    const c = new MulticaConnector(
+      options(
+        async (_command, args) =>
+          output(
+            args.includes("run-messages")
+              ? messages
+              : args.includes("runs")
+                ? [{ ...run, error: "private error", wait_reason: "private reason" }]
+                : issue,
+          ),
+        { allowConversationPreview: true },
+      ),
+    );
+    const result = await c.readConversation("issue-1");
+    assert.equal(result.latestReply, null);
+    assert.equal(result.reason, "NO_TEXT_REPLY");
+    assert.equal(result.complete, true);
+    assert.ok(!JSON.stringify(result).includes("private"));
+    assert.ok(!JSON.stringify(result).includes("secret"));
+  }
+});
+test("no Run is an explicit empty preview without querying message history", async () => {
+  let calls = 0;
+  const c = new MulticaConnector(
+    options(
+      async (_command, args) => {
+        calls++;
+        return output(args.includes("runs") ? [] : issue);
+      },
+      { allowConversationPreview: true },
+    ),
+  );
+  const result = await c.readConversation("issue-1");
+  assert.equal(result.latestReply, null);
+  assert.equal(result.reason, "NO_RUN");
+  assert.equal(calls, 2);
+});
+test("preview truncation respects Unicode characters and marks the excerpt", async () => {
+  const c = new MulticaConnector(
+    options(
+      async (_command, args) =>
+        output(
+          args.includes("run-messages")
+            ? [
+                {
+                  task_id: "run-1",
+                  seq: 1,
+                  type: "text",
+                  content: "你好🙂世界更多内容",
+                  created_at: "2026-11-05T00:00:02Z",
+                },
+              ]
+            : args.includes("runs")
+              ? [{ ...run, status: "completed", completed_at: "2026-11-05T00:00:03Z" }]
+              : issue,
+        ),
+      { allowConversationPreview: true },
+    ),
+  );
+  const result = await c.readConversation("issue-1", { maxChars: 4 });
+  assert.equal(result.latestReply.text, "你好🙂世");
+  assert.equal(result.latestReply.truncated, true);
+  assert.equal(result.latestReply.phase, "final");
+  await assert.rejects(c.readConversation("issue-1", { maxChars: 0 }), { code: "MULTICA_INVALID_ARGUMENT" });
+});
+test("oversized message output is rejected even when a test transport ignores maxBuffer", async () => {
+  const c = new MulticaConnector(
+    options(
+      async (_command, args) =>
+        output(
+          args.includes("run-messages")
+            ? [{ task_id: "run-1", seq: 1, type: "text", content: "private".repeat(50000) }]
+            : args.includes("runs")
+              ? [run]
+              : issue,
+        ),
+      { allowConversationPreview: true },
+    ),
+  );
+  await assert.rejects(c.readConversation("issue-1"), { code: "MULTICA_RESPONSE_TOO_LARGE" });
+});
+test("readWork stays metadata-only even when conversation previews are enabled", async () => {
+  const c = new MulticaConnector(
+    options(
+      async (_command, args) =>
+        output(
+          args.includes("runs")
+            ? [
+                {
+                  ...run,
+                  result: { comment: "private final reply" },
+                  error: "private error",
+                  wait_reason: "private wait",
+                },
+              ]
+            : { ...issue, description: "private issue body" },
+        ),
+      { allowConversationPreview: true },
+    ),
+  );
+  const result = await c.readWork("issue-1");
+  assert.ok(!JSON.stringify(result).includes("private"));
+  assert.equal(Object.hasOwn(result, "latestReply"), false);
+});
+
+test("conversation previews reject wrong-workspace and duplicate execution metadata", async () => {
+  for (const rows of [[{ ...run, workspace_id: "foreign-workspace" }], [run, { ...run, status: "completed" }]]) {
+    const c = new MulticaConnector(
+      options(async (_command, args) => output(args.includes("runs") ? rows : issue), {
+        allowConversationPreview: true,
+      }),
+    );
+    await assert.rejects(c.readConversation("issue-1"), {
+      code: rows.length === 1 ? "MULTICA_SCOPE_DENIED" : "MULTICA_INVALID_RESPONSE",
+    });
+  }
+});
+test("latest active execution is selected by timestamp rather than timestamp spelling", async () => {
+  const older = { ...run, id: "older-run", created_at: "2026-11-05T10:00:00+08:00" };
+  const newer = { ...run, id: "newer-run", created_at: "2026-11-05T03:00:00Z" };
+  const c = new MulticaConnector(
+    options(
+      async (_command, args) => {
+        if (args.includes("run-messages")) {
+          assert.equal(args[args.indexOf("run-messages") + 1], "newer-run");
+          return output([{ task_id: "newer-run", seq: 1, type: "text", content: "newer reply" }]);
+        }
+        return output(args.includes("runs") ? [older, newer] : issue);
+      },
+      { allowConversationPreview: true },
+    ),
+  );
+  assert.equal((await c.readConversation("issue-1")).latestReply.text, "newer reply");
+});

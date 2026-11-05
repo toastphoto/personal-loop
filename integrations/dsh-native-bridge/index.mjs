@@ -6,7 +6,7 @@ import { mkdir, lstat, chmod, unlink } from "node:fs/promises";
 
 export const name = "personal-loop-native-metadata";
 export const inject = ["workspaceRegistry", "sessionQuery", "agents"];
-const methods = new Set(["workspace/list", "session/list", "session/read", "session/status"]);
+const methods = new Set(["workspace/list", "session/list", "session/read", "session/status", "session/reply"]);
 const plain = (value) => value !== null && typeof value === "object" && !Array.isArray(value);
 const text = (value) => typeof value === "string" && value.length > 0;
 const failure = (code) => Object.assign(new Error(code), { code });
@@ -28,6 +28,7 @@ function configuration(value = {}) {
     throw failure("INVALID_SOCKET_PATH");
   return {
     socketPath: path.resolve(value.socketPath),
+    allowReplyPreview: value.allowReplyPreview === true,
     requestTimeoutMs: integer(value.requestTimeoutMs, 3000, 1, 60000),
     maxMessageBytes: integer(value.maxMessageBytes, 16384, 64, 1048576),
     maxResponseBytes: integer(value.maxResponseBytes, 2097152, 1024, 16777216),
@@ -47,11 +48,18 @@ function request(value) {
   if (!methods.has(value.method)) throw failure("METHOD_NOT_ALLOWED");
   const params = value.params ?? {};
   const fields =
-    value.method === "workspace/list" ? [] : value.method === "session/list" ? ["workspaceId"] : ["sessionId"];
+    value.method === "workspace/list"
+      ? []
+      : value.method === "session/list"
+        ? ["workspaceId"]
+        : value.method === "session/reply"
+          ? ["workspaceId", "sessionId"]
+          : ["sessionId"];
   if (
     Object.keys(params).some((k) => !fields.includes(k)) ||
     Object.values(params).some((v) => !validId(v)) ||
-    ((value.method === "session/read" || value.method === "session/status") && !validId(params.sessionId))
+    ((value.method === "session/read" || value.method === "session/status") && !validId(params.sessionId)) ||
+    (value.method === "session/reply" && (!validId(params.workspaceId) || !validId(params.sessionId)))
   )
     throw failure("INVALID_REQUEST");
   return { id: value.id, method: value.method, params };
@@ -87,7 +95,89 @@ function workspaces(ctx) {
     };
   });
 }
-async function read(ctx, method, params, signal, instanceId) {
+function assertReplyMembership(ctx, workspaceId, sessionId) {
+  const workspace = workspaces(ctx).find((p) => p.workspaceId === workspaceId);
+  if (!workspace?.sessionIds.includes(sessionId)) throw failure("SESSION_WORKSPACE_MISMATCH");
+}
+async function replyPreview(ctx, params, signal) {
+  if (typeof ctx.sessionQuery.listEvents !== "function" || typeof ctx.sessionQuery.readEvent !== "function")
+    throw failure("REPLY_PREVIEW_UNSUPPORTED");
+  signal.throwIfAborted();
+  const records = await ctx.sessionQuery.listEvents(params.sessionId);
+  signal.throwIfAborted();
+  if (!Array.isArray(records)) throw failure("INVALID_NATIVE_REPLY");
+  let latest,
+    previous = -1;
+  for (const record of records) {
+    if (
+      record?.sessionId !== params.sessionId ||
+      !Number.isSafeInteger(record.seq) ||
+      record.seq <= previous ||
+      typeof record.type !== "string"
+    )
+      throw failure("INVALID_NATIVE_REPLY");
+    previous = record.seq;
+    if (record.type === "assistant/message") latest = record;
+  }
+  let latestReply = null,
+    reason = "REPLY_ABSENT";
+  if (latest) {
+    const read = await ctx.sessionQuery.readEvent(
+      { sessionId: params.sessionId, seq: latest.seq, before: 0, after: 0 },
+      signal,
+    );
+    signal.throwIfAborted();
+    const event = read?.target;
+    if (
+      read?.session?.id !== params.sessionId ||
+      event?.seq !== latest.seq ||
+      event.type !== "assistant/message" ||
+      !Array.isArray(event.data?.message?.content)
+    )
+      throw failure("INVALID_NATIVE_REPLY");
+    const chunks = [];
+    for (const block of event.data.message.content) {
+      if (block?.type !== "text") continue;
+      if (typeof block.text !== "string") throw failure("INVALID_NATIVE_REPLY");
+      chunks.push(block.text);
+    }
+    const visible = chunks.join("\n");
+    reason = "REPLY_NO_TEXT";
+    if (visible.trim()) {
+      let text = "",
+        count = 0,
+        truncated = false;
+      for (const char of visible) {
+        if (count++ >= 2000) {
+          truncated = true;
+          break;
+        }
+        text += char;
+      }
+      const milliseconds =
+        typeof event.time === "number" ? event.time : typeof event.time === "string" ? Date.parse(event.time) : NaN;
+      const at =
+        Number.isFinite(milliseconds) && Math.abs(milliseconds) <= 8.64e15
+          ? new Date(milliseconds).toISOString()
+          : null;
+      latestReply = {
+        text,
+        at,
+        id: String(event.seq),
+        seq: event.seq,
+        phase: null,
+        truncated,
+        timeSource: at === null ? "unknown" : "session-event",
+      };
+      reason = undefined;
+    }
+  }
+  assertReplyMembership(ctx, params.workspaceId, params.sessionId);
+  return { latestReply, ...(reason ? { reason } : {}) };
+}
+async function read(ctx, method, params, signal, instanceId, config) {
+  if (method === "session/reply" && config.allowReplyPreview !== true) throw failure("REPLY_PREVIEW_DISABLED");
+
   const projects = workspaces(ctx);
   const observedAt = () => new Date().toISOString();
   const envelope = (result) => ({
@@ -101,6 +191,8 @@ async function read(ctx, method, params, signal, instanceId) {
   if (params.workspaceId && !projects.some((p) => p.workspaceId === params.workspaceId))
     throw failure("WORKSPACE_NOT_FOUND");
   const owner = new Map(projects.flatMap((p) => p.sessionIds.map((id) => [id, p.workspaceId])));
+  if (method === "session/reply" && owner.get(params.sessionId) !== params.workspaceId)
+    throw failure("SESSION_WORKSPACE_MISMATCH");
   const rows = await ctx.sessionQuery.listSessions(signal);
   if (!Array.isArray(rows)) throw failure("INVALID_NATIVE_METADATA");
   const known = new Set();
@@ -139,6 +231,20 @@ async function read(ctx, method, params, signal, instanceId) {
   }
   const item = items.find((item) => item.sessionId === params.sessionId);
   if (!item) throw failure("SESSION_NOT_FOUND");
+  if (method === "session/reply") {
+    const preview = await replyPreview(ctx, params, signal);
+    const agent = ctx.agents.get(item.sessionId);
+    const nativeState =
+      agent?.status === "running" ? "running" : agent?.status === "idle" ? "idle" : agent ? "unknown" : "not_loaded";
+    return envelope({
+      ...item,
+      ...preview,
+      nativeState,
+      agentAvailable: agent !== undefined,
+      state: ["running", "idle"].includes(nativeState) ? nativeState : "unknown",
+      running: nativeState === "running" ? true : nativeState === "idle" ? false : null,
+    });
+  }
   return envelope(item);
 }
 async function deadline(action, ms, cancelled) {
@@ -242,7 +348,7 @@ export async function startBridge(ctx, input = {}) {
         pending++;
         try {
           const result = await deadline(
-            (signal) => read(ctx, message.method, message.params, signal, instanceId),
+            (signal) => read(ctx, message.method, message.params, signal, instanceId, config),
             config.requestTimeoutMs,
             lifetime.signal,
           );
@@ -261,6 +367,10 @@ export async function startBridge(ctx, input = {}) {
           "WORKSPACE_NOT_FOUND",
           "SESSION_NOT_FOUND",
           "INVALID_NATIVE_METADATA",
+          "REPLY_PREVIEW_DISABLED",
+          "REPLY_PREVIEW_UNSUPPORTED",
+          "SESSION_WORKSPACE_MISMATCH",
+          "INVALID_NATIVE_REPLY",
         ]);
         send({ id, ok: false, error: { code: known.has(error?.code) ? error.code : "READ_FAILED" } });
       }

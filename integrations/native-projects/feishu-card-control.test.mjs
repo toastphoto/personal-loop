@@ -348,3 +348,44 @@ test("cached browsing never checks native readiness or fabricates a fresh read t
   assert.equal(f.store.get(r.sessionId).data.view.observedAt, initial);
   assert.equal(f.controls.get(project.key).mode, "manual");
 });
+
+test("project detail reads only its bounded activity and draft navigation does not reread it", async (t) => {
+  const f = fixture(t);
+  const calls = [];
+  f.controller.activity = {
+    read: async (key, options) => {
+      calls.push({ key, options });
+      return {
+        status: "available",
+        projectKey: key,
+        observedAt: "2026-11-05T00:00:00Z",
+        complete: true,
+        selection: "latest-updated",
+        works: [{ nativeId: "work-1", title: "Visible task", state: "unknown", membership: "native-project" }],
+        selected: {
+          nativeId: "work-1",
+          title: "Visible task",
+          state: "unknown",
+          membership: "native-project",
+          latestReply: {
+            id: "reply-1",
+            text: "Visible agent reply",
+            at: null,
+            phase: "final_answer",
+            truncated: false,
+          },
+        },
+      };
+    },
+  };
+  let r = await detailed(f);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].key, project.key);
+  assert.ok(JSON.stringify(r.card).includes("Visible agent reply"));
+  r = await saveGoal(f, r);
+  assert.equal(calls.length, 1);
+  r = await f.controller.handle(event(r, action(r, "activity-refresh")));
+  assert.equal(calls.length, 2);
+  assert.equal(calls[1].options.force, true);
+  assert.equal(f.controls.get(project.key).mode, "manual");
+});

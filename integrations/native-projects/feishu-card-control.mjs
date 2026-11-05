@@ -180,8 +180,8 @@ export class CardSessions {
 }
 
 export class ProjectCardController {
-  constructor(config, { store, catalog, controls, runtime, transportReady = () => true } = {}) {
-    Object.assign(this, { config, store, catalog, controls, runtime, transportReady });
+  constructor(config, { store, catalog, controls, runtime, activity, transportReady = () => true } = {}) {
+    Object.assign(this, { config, store, catalog, controls, runtime, activity, transportReady });
     this.scope = digest([config.profile ?? "", config.chatId, [...config.allowedSenderIds].sort()]);
   }
   enabled() {
@@ -278,6 +278,33 @@ export class ProjectCardController {
     if (!ready) p.controlReason = "目前可查看和保存目标 自动执行尚未就绪";
     if (current.mode === "active") p.controlReason = "保存新草稿不会覆盖正在推进的目标";
   }
+  async readActivity(view, targets, alias, { workId, force = false } = {}) {
+    if (!this.activity || !alias) return;
+    const project = view.projects.find((p) => p.alias === alias);
+    if (!project) return;
+    const key = targets[alias];
+    if (!key) {
+      project.activity = {
+        status: "unavailable",
+        complete: false,
+        works: [],
+        selected: null,
+        note: "当前项目归属尚未核对 没有读取会话正文",
+      };
+      return;
+    }
+    try {
+      project.activity = await this.activity.read(key, { workId, force });
+    } catch {
+      project.activity = {
+        status: "unavailable",
+        complete: false,
+        works: [],
+        selected: null,
+        note: "会话归属或读取结果未能确认 没有显示回复 请刷新目录后再试",
+      };
+    }
+  }
   render(sessionId, revision, view, navigation, notice) {
     return renderProjectCard(view, navigation, {
       sessionId,
@@ -295,6 +322,7 @@ export class ProjectCardController {
     const { view, overview } = await this.overview(snapshot);
     if (navigation.alias) await this.enrich(view, overview, navigation.alias, actor, chat, previewDraft);
     if (!this.enabled()) navigation = { screen: "probe" };
+    if (navigation.screen === "detail") await this.readActivity(view, this.targets(overview), navigation.alias);
     const s = this.store.create(item.requestId, actor, chat, (id) => ({
       view,
       targets: this.targets(overview),
@@ -410,7 +438,12 @@ export class ProjectCardController {
       throw failure("CARD_ACTION_NOT_ISSUED");
     return null;
   }
-  async refreshSession(session, navigation, notice, { fresh = false } = {}) {
+  async refreshSession(
+    session,
+    navigation,
+    notice,
+    { fresh = false, activity = false, workId, forceActivity = false } = {},
+  ) {
     let view, targets;
     if (fresh || !session.data.targets) {
       const result = await this.overview();
@@ -421,6 +454,10 @@ export class ProjectCardController {
       view = structuredClone(session.data.view);
       targets = session.data.targets;
       for (const p of view.projects) this.decorateLocal(view, targets, p.alias, session.actor, session.chat);
+    }
+    if (activity && navigation.screen === "detail") {
+      await this.readActivity(view, targets, navigation.alias, { workId, force: forceActivity });
+      this.decorateLocal(view, targets, navigation.alias, session.actor, session.chat);
     }
     const next = {
       view,
@@ -500,6 +537,7 @@ export class ProjectCardController {
         navigation = { screen: "detail", alias };
         this.store.remember(e.actor, e.chat, alias);
       } else if (value.action === "refresh") navigation = { ...navigation };
+      else if (["activity-work", "activity-refresh"].includes(value.action)) navigation = { screen: "detail", alias };
       else if (value.action === "edit-goal") navigation = { screen: "goal", alias };
       else if (value.action === "save-goal") {
         if (!shown?.canSetGoal || navigation.screen !== "goal") throw failure("CARD_ACTION_NOT_ISSUED");
@@ -532,6 +570,9 @@ export class ProjectCardController {
         e.eventId,
         await this.refreshSession(session, navigation, notice, {
           fresh: ["start", "resume", "refresh"].includes(value.action),
+          activity: ["detail", "select", "activity-work", "activity-refresh", "refresh"].includes(value.action),
+          workId: value.action === "activity-work" ? value.workId : undefined,
+          forceActivity: ["activity-refresh", "refresh"].includes(value.action),
         }),
       );
     } catch (error) {

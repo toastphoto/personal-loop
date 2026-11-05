@@ -41,7 +41,9 @@ function nativeCommand(command, args, options) {
     const { input, ...processOptions } = options;
     const child = execFile(command, args, processOptions, (error, stdout, stderr) => {
       if (error) {
-        if (error.code === "ENOENT") reject(failure("MULTICA_UNAVAILABLE", "Multica executable is unavailable"));
+        if (error.code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER")
+          reject(failure("MULTICA_RESPONSE_TOO_LARGE", "Multica output exceeded the configured read bound"));
+        else if (error.code === "ENOENT") reject(failure("MULTICA_UNAVAILABLE", "Multica executable is unavailable"));
         else if (error.killed || error.name === "AbortError")
           reject(failure("MULTICA_TIMEOUT", "Multica command timed out"));
         else resolve({ stdout, stderr, exitCode: typeof error.code === "number" ? error.code : 1 });
@@ -79,6 +81,7 @@ export class MulticaConnector {
       throw failure("MULTICA_INVALID_ARGUMENT", "Invalid Multica bounds");
     }
     this.writeEnabled = options.writeEnabled === true;
+    this.allowConversationPreview = options.allowConversationPreview === true;
     if (options.allowedProjectIds !== undefined && !Array.isArray(options.allowedProjectIds)) {
       throw failure("MULTICA_INVALID_ARGUMENT", "allowedProjectIds must be an array");
     }
@@ -105,7 +108,9 @@ export class MulticaConnector {
     }
   }
 
-  async _call(args, { input } = {}) {
+  async _call(args, { input, maxBuffer = 8 * 1024 * 1024 } = {}) {
+    if (!Number.isSafeInteger(maxBuffer) || maxBuffer < 1024 || maxBuffer > 8 * 1024 * 1024)
+      throw failure("MULTICA_INVALID_ARGUMENT", "Invalid Multica output bound");
     const prefix = [
       ...(this.profile ? ["--profile", this.profile] : []),
       ...(this.workspaceId ? ["--workspace-id", this.workspaceId] : []),
@@ -120,7 +125,7 @@ export class MulticaConnector {
             encoding: "utf8",
             timeout: this.timeoutMs,
             killSignal: "SIGTERM",
-            maxBuffer: 8 * 1024 * 1024,
+            maxBuffer,
             signal: controller.signal,
             ...(input === undefined ? {} : { input }),
           }),
@@ -135,6 +140,8 @@ export class MulticaConnector {
       if (!object(response) || response.exitCode !== 0 || typeof response.stdout !== "string") {
         throw failure("MULTICA_COMMAND_FAILED", "Multica command did not succeed");
       }
+      if (Buffer.byteLength(response.stdout) > maxBuffer)
+        throw failure("MULTICA_RESPONSE_TOO_LARGE", "Multica output exceeded the configured read bound");
       let value;
       try {
         value = JSON.parse(response.stdout);
@@ -265,21 +272,26 @@ export class MulticaConnector {
     throw failure("MULTICA_LIMIT_REACHED", "Issue pagination exceeded its configured bound");
   }
 
-  async _read(nativeId) {
+  async _read(nativeId, { projectId } = {}) {
     id(nativeId, "issue");
+    if (projectId !== undefined) this._scope(projectId);
     const issue = await this._call(["issue", "get", nativeId, "--output", "json"]);
-    const item = this._issue(issue);
+    const item = this._issue(issue, projectId);
     if (issue.id !== nativeId && issue.identifier !== nativeId) {
       throw failure("MULTICA_INVALID_RESPONSE", "Issue identity changed");
     }
     const rows = await this._call(["issue", "runs", issue.id, "--output", "json"]);
     if (!Array.isArray(rows)) throw failure("MULTICA_INVALID_RESPONSE", "Invalid native execution list");
+    const seenRuns = new Set();
     const runs = rows
       .map((row) => {
         if (!object(row) || typeof row.id !== "string" || typeof row.status !== "string" || row.issue_id !== issue.id) {
           throw failure("MULTICA_INVALID_RESPONSE", "Execution does not belong to this Issue");
         }
         id(row.id, "execution");
+        this._workspace(row);
+        if (seenRuns.has(row.id)) throw failure("MULTICA_INVALID_RESPONSE", "Repeated native execution identity");
+        seenRuns.add(row.id);
         return {
           nativeId: row.id,
           state: row.status,
@@ -288,7 +300,11 @@ export class MulticaConnector {
           finishedAt: timestamp(row.completed_at),
         };
       })
-      .sort((a, b) => (b.createdAt ?? "").localeCompare(a.createdAt ?? "") || b.nativeId.localeCompare(a.nativeId));
+      .sort(
+        (a, b) =>
+          (b.createdAt === null ? -Infinity : Date.parse(b.createdAt)) -
+            (a.createdAt === null ? -Infinity : Date.parse(a.createdAt)) || b.nativeId.localeCompare(a.nativeId),
+      );
     const active = runs.filter((r) => ACTIVE.has(r.state));
     const latest = active[0] ?? runs[0];
     return {
@@ -305,6 +321,65 @@ export class MulticaConnector {
 
   async readWork(nativeId) {
     return this._read(nativeId);
+  }
+
+  async readConversation(nativeId, { projectId, maxChars = 1600 } = {}) {
+    if (!this.allowConversationPreview)
+      throw failure("MULTICA_CONVERSATION_DISABLED", "Conversation previews require explicit configuration");
+    if (!Number.isSafeInteger(maxChars) || maxChars < 1 || maxChars > 8000)
+      throw failure("MULTICA_INVALID_ARGUMENT", "Invalid conversation preview length");
+    const item = await this._read(nativeId, { projectId });
+    const result = {
+      nativeId: item.nativeId,
+      projectId: item.projectId,
+      title: item.title,
+      state: item.state,
+      nativeState: item.nativeState,
+      runtimeStateTrusted: true,
+      updatedAt: item.updatedAt,
+      observedAt: item.observedAt,
+      complete: true,
+      latestReply: null,
+    };
+    const selected = item.runs.find((run) => run.nativeId === item.executionId);
+    if (!selected) return { ...result, reason: "NO_RUN" };
+    // Only this verified Run is read. The smaller bound prevents loading an entire large execution transcript.
+    const messages = await this._call(
+      ["issue", "run-messages", selected.nativeId, "--issue", item.nativeId, "--output", "json"],
+      { maxBuffer: 256 * 1024 },
+    );
+    if (!Array.isArray(messages)) throw failure("MULTICA_INVALID_RESPONSE", "Invalid execution message list");
+    const seen = new Set();
+    let last = null;
+    for (const message of messages) {
+      if (!object(message) || message.task_id !== selected.nativeId)
+        throw failure("MULTICA_EXECUTION_MISMATCH", "Message does not belong to the selected execution");
+      if (
+        !Number.isSafeInteger(message.seq) ||
+        message.seq < 0 ||
+        seen.has(message.seq) ||
+        typeof message.type !== "string"
+      )
+        throw failure("MULTICA_INVALID_RESPONSE", "Invalid execution message metadata");
+      seen.add(message.seq);
+      if (message.type !== "text") continue;
+      if (typeof message.content !== "string")
+        throw failure("MULTICA_INVALID_RESPONSE", "Invalid execution text message");
+      if (message.content.trim() && (!last || message.seq > last.seq)) last = message;
+    }
+    if (!last) return { ...result, observedAt: new Date().toISOString(), reason: "NO_TEXT_REPLY" };
+    const chars = Array.from(last.content);
+    return {
+      ...result,
+      observedAt: new Date().toISOString(),
+      latestReply: {
+        text: chars.slice(0, maxChars).join(""),
+        at: timestamp(last.created_at),
+        id: `${selected.nativeId}:${last.seq}`,
+        phase: selected.state === "completed" ? "final" : ACTIVE.has(selected.state) ? "progress" : "unknown",
+        truncated: chars.length > maxChars,
+      },
+    };
   }
 
   _write() {

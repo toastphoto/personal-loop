@@ -14,6 +14,7 @@ export { commandText } from "./feishu-route.mjs";
 import { CardSessions, ProjectCardController } from "./feishu-card-control.mjs";
 import { CardEventSubscriber } from "./callback-consumer.mjs";
 import { FeishuCardRelay } from "./feishu-card-relay.mjs";
+import { ProjectActivity } from "./project-activity.mjs";
 import { renderProjectCard } from "./feishu-project-card.mjs";
 
 export function acceptsCommand(event, config) {
@@ -239,6 +240,8 @@ async function main() {
         catalog,
         controls,
         runtime,
+        activity:
+          config.projectActivity?.enabled === true ? new ProjectActivity(catalog, config.projectActivity) : undefined,
         transportReady: () => subscriber.status().ready,
       });
       callbackRelay = new FeishuCardRelay(c, { queue: callbackQueue, controller: cards, execute: runProgram });

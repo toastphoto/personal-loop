@@ -259,3 +259,90 @@ test("sensitive or unknown fields in native metadata do not appear in public res
   assert.ok(!JSON.stringify(result).includes("private conversation"));
   assert.ok(!JSON.stringify(result).includes("private credential"));
 });
+
+test("conversation preview is opt-in and scope/limits are validated before connecting", async () => {
+  const denied = new DshBridgeConnector({ bridgeSocket: "/not/available.sock" });
+  await assert.rejects(denied.readConversation("s", { projectId: "w" }), code("DSH_BRIDGE_PREVIEW_DISABLED"));
+  const enabled = new DshBridgeConnector({ bridgeSocket: "/not/available.sock", allowConversationPreview: true });
+  for (const options of [{}, { projectId: "w", maxChars: 0 }, { projectId: "w", maxChars: 2001 }])
+    await assert.rejects(enabled.readConversation("s", options), code("DSH_BRIDGE_INVALID_INPUT"));
+});
+test("scoped client reply previews preserve exact metadata and clip only the approved text", async (t) => {
+  const values = host();
+  values.sessionQuery.listEvents = async (sessionId) => [
+    { sessionId, seq: 2, type: "assistant/message", time: 3000, surface: "current" },
+  ];
+  values.sessionQuery.readEvent = async () => ({
+    session: { id: "session-one" },
+    target: {
+      seq: 2,
+      type: "assistant/message",
+      time: 3000,
+      data: {
+        message: {
+          content: [
+            { type: "text", text: "🙂可见回复" },
+            { type: "reasoning", text: "private-thought" },
+          ],
+        },
+      },
+    },
+  });
+  const at = await plugin(t, values, { allowReplyPreview: true });
+  const connector = new DshBridgeConnector({ bridgeSocket: at.socket, allowConversationPreview: true });
+  t.after(() => connector.close());
+  const r = await connector.readConversation("session-one", { projectId: "workspace-one", maxChars: 3 });
+  assert.equal(r.latestReply.text, "🙂可见");
+  assert.equal(r.latestReply.truncated, true);
+  assert.equal(r.latestReply.at, "1970-01-01T00:00:03.000Z");
+  assert.equal(r.projectId, "workspace-one");
+  assert.equal(r.state, "running");
+  assert.equal(r.title, "");
+  assert.equal(r.updatedAt, null);
+  assert.ok(!JSON.stringify(r).includes("private-thought"));
+  await assert.rejects(
+    connector.readConversation("session-one", { projectId: "another" }),
+    code("DSH_BRIDGE_PROJECT_MISMATCH"),
+  );
+  assert.equal((await connector.readWork("session-one")).latestReply, undefined);
+});
+test("old plugins explicitly reject reply capability rather than appearing to have no replies", async (t) => {
+  const at = await fakeServer(t, (request, channel) =>
+    channel.end(
+      JSON.stringify(
+        request.method === "workspace/list"
+          ? { id: request.id, ok: true, result: envelope({ items: [workspace()] }) }
+          : { id: request.id, ok: false, error: { code: "METHOD_NOT_ALLOWED" } },
+      ) + "\n",
+    ),
+  );
+  const connector = new DshBridgeConnector({ bridgeSocket: at.socket, allowConversationPreview: true });
+  t.after(() => connector.close());
+  await assert.rejects(connector.readConversation("s", { projectId: "w" }), code("DSH_BRIDGE_PREVIEW_UNSUPPORTED"));
+});
+test("reply source Host changes and post-read workspace moves cannot leak the response", async (t) => {
+  for (const fault of ["host", "membership"]) {
+    let directories = 0;
+    const at = await fakeServer(t, (request, channel) => {
+      let value;
+      if (request.method === "workspace/list") {
+        directories++;
+        value = envelope({
+          items: [{ ...workspace(), sessionIds: fault === "membership" && directories > 1 ? [] : ["s"] }],
+        });
+      } else
+        value = {
+          ...envelope(session()),
+          latestReply: { text: "private-reply", at: null, id: "1", seq: 1, phase: null, truncated: false },
+          ...(fault === "host" ? { bridgeInstance: "different" } : {}),
+        };
+      channel.end(JSON.stringify({ id: request.id, ok: true, result: value }) + "\n");
+    });
+    const connector = new DshBridgeConnector({ bridgeSocket: at.socket, allowConversationPreview: true });
+    t.after(() => connector.close());
+    await assert.rejects(
+      connector.readConversation("s", { projectId: "w" }),
+      code(fault === "host" ? "DSH_BRIDGE_HOST_CHANGED" : "DSH_BRIDGE_PROJECT_MISMATCH"),
+    );
+  }
+});

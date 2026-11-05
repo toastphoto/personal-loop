@@ -80,11 +80,35 @@ export class CodexRpcProxy {
   }
 
   request(method, params = {}) {
-    if (this.mode === "isolated-readonly-api" && !CATALOG_METHODS.has(method)) {
+    const preview = method === "thread/turns/list" && this.options.allowConversationPreview === true;
+    if (this.mode === "isolated-readonly-api" && !CATALOG_METHODS.has(method) && !preview) {
       return Promise.reject(
         error("CODEX_CONTROL_UNAVAILABLE", "独立只读API仅允许读取项目与会话元数据，不能控制桌面任务"),
       );
     }
+    if (
+      this.mode === "isolated-readonly-api" &&
+      preview &&
+      (!params ||
+        typeof params !== "object" ||
+        Array.isArray(params) ||
+        Object.keys(params).some(
+          (key) => !["threadId", "limit", "sortDirection", "itemsView", "cursor"].includes(key),
+        ) ||
+        typeof params.threadId !== "string" ||
+        !params.threadId.trim() ||
+        params.threadId.length > 256 ||
+        /[\p{Cc}]/u.test(params.threadId) ||
+        params.limit !== 1 ||
+        params.sortDirection !== "desc" ||
+        params.itemsView !== "full" ||
+        (Object.hasOwn(params, "cursor") &&
+          (typeof params.cursor !== "string" ||
+            !params.cursor ||
+            params.cursor.length > 2048 ||
+            /[\p{Cc}]/u.test(params.cursor))))
+    )
+      return Promise.reject(error("CODEX_PREVIEW_READ_DENIED", "回复读取只允许指定会话的一个逆序完整轮次页"));
     if (this.mode === "isolated-readonly-api" && method === "thread/read" && params?.includeTurns !== false) {
       return Promise.reject(error("CODEX_HISTORY_READ_DENIED", "只读连接只允许明确排除对话正文的元数据查询"));
     }

@@ -7,6 +7,8 @@ import path from "node:path";
 import { runManagedWorker } from "./managed-worker.mjs";
 import { LoopControls } from "./controls.mjs";
 import adapter from "../../plugins/native-managed/agent.ts";
+import { DatabaseSync } from "node:sqlite";
+import { readMessage, resultFrom, repairPrompt } from "../../worker/contract.ts";
 
 function fixture(t, options = {}) {
   const dir = mkdtempSync(path.join(tmpdir(), "managed-worker-"));
@@ -77,7 +79,9 @@ function fixture(t, options = {}) {
           executionId: options.wrongUsageTurn ? "other-turn" : args.turnId,
           status: options.signal ? "interrupted" : "completed",
           completionVerified: true,
-          text: '核查完成\n```agent-autoloop\n{"notice":[{"title":"已完成","text":"已核对项目"}]}\n```',
+          text:
+            options.finalText ??
+            '核查完成\n```agent-autoloop\n{"notice":[{"title":"已完成","text":"已核对项目"}]}\n```',
           sessionUsage: {
             input: 20 * calls.filter((c) => c[0] === "continue").length,
             output: 10 * calls.filter((c) => c[0] === "continue").length,
@@ -353,4 +357,124 @@ test("only the executor's persisted turn delta is reported, never the final LLM 
   const reading = adapter.read(JSON.stringify({ type: "native.result", ...result }), 0, "");
   assert.deepEqual(reading.usage, { input: 20 });
   assert.equal(reading.usage.output, undefined);
+});
+
+const receiptResult = (text) => resultFrom(readMessage(text), {});
+const brokenReceipt = '本轮已有产物\n```agent-autoloop\n{"later":[broken JSON]}\n```';
+
+test("malformed model receipt degrades to a valid ask without another model invocation", async (t) => {
+  const f = fixture(t, { finalText: brokenReceipt });
+  const output = await f.run();
+  assert.equal(f.calls.filter((c) => c[0] === "continue").length, 1);
+  const parsed = receiptResult(output.text);
+  assert.equal(parsed.problem, undefined);
+  assert.equal(parsed.result.outcome, "done");
+  assert.equal(parsed.result.ask.length, 1);
+  assert.equal(parsed.result.later, undefined);
+  assert.match(output.text, /已有产物|业务/);
+  assert.ok(!output.text.includes("broken JSON"));
+  const artifact = JSON.parse(readFileSync(output.artifact, "utf8"));
+  assert.equal(artifact.originalText, brokenReceipt);
+  assert.equal(typeof artifact.receiptError, "string");
+  assert.ok(artifact.receiptError.length > 0);
+  assert.deepEqual(output.usage, { input: 20, output: 10, cached: 4 });
+  assert.equal(statSync(output.artifact).mode & 0o777, 0o600);
+  assert.notEqual((await f.run("2")).state, "completed");
+  assert.equal(f.calls.filter((c) => c[0] === "continue").length, 1);
+});
+
+test("schema-invalid receipt is also quarantined even when its JSON parses", async (t) => {
+  const raw = '已有结果\n```agent-autoloop\n{"later":[{"key":"review","at":3}]}\n```';
+  const f = fixture(t, { finalText: raw });
+  const output = await f.run();
+  assert.equal(receiptResult(output.text).problem, undefined);
+  assert.equal(receiptResult(output.text).result.ask.length, 1);
+  assert.equal(JSON.parse(readFileSync(output.artifact, "utf8")).originalText, raw);
+});
+
+test("valid ask, notice and later receipts are unchanged and ordinary replay keeps original usage", async (t) => {
+  const body = {
+    ask: [{ key: "decision", title: "需要决定", text: "请选择", options: ["继续", "暂停"], about: "保留已有结果" }],
+    notice: [{ title: "已有进展", text: "本轮检查完成" }],
+    later: [{ key: "review", at: "2030-01-01T00:00:00+08:00", about: "核实结果" }],
+  };
+  const text = "本轮结束，事项待继续\n```agent-autoloop\n" + JSON.stringify(body) + "\n```";
+  const f = fixture(t, { finalText: text });
+  const first = await f.run(),
+    replay = await f.run("1", { prompt: "普通业务重放" });
+  assert.equal(first.text, text);
+  assert.equal(replay.text, text);
+  assert.equal(first.state, "completed");
+  assert.equal(receiptResult(first.text).problem, undefined);
+  assert.deepEqual(replay.usage, first.usage);
+  assert.equal(first.originalText, undefined);
+  assert.equal(f.calls.filter((c) => c[0] === "continue").length, 1);
+});
+
+test("legacy bad result repair replays a safe ask without repeating usage or rewriting the old record", async (t) => {
+  const f = fixture(t, { finalText: brokenReceipt });
+  const first = await f.run();
+  const database = path.join(path.dirname(first.artifact), "worker.db");
+  const db = new DatabaseSync(database);
+  const legacy = {
+    state: "completed",
+    text: brokenReceipt,
+    session: first.session,
+    usage: first.usage,
+    cumulativeUsage: first.cumulativeUsage,
+    artifact: first.artifact,
+  };
+  const encoded = JSON.stringify(legacy);
+  db.prepare("UPDATE requests SET state='completed',result=? WHERE run_id='1'").run(encoded);
+  db.exec("DELETE FROM receipt_blocks");
+  db.close();
+  const fixed = await f.run("1", { prompt: repairPrompt("invalid JSON") });
+  const parsed = receiptResult(fixed.text);
+  assert.equal(parsed.problem, undefined);
+  assert.equal(parsed.result.ask.length, 1);
+  assert.equal(fixed.usage, undefined);
+  assert.equal(fixed.cumulativeUsage, undefined);
+  assert.equal(fixed.receiptRepairReplay, true);
+  assert.equal(adapter.read(JSON.stringify({ type: "native.result", ...fixed }), 0, "").usage, undefined);
+  const original = new DatabaseSync(database, { readOnly: true });
+  assert.equal(original.prepare("SELECT result FROM requests WHERE run_id='1'").get().result, encoded);
+  original.close();
+  assert.equal(JSON.parse(readFileSync(fixed.artifact, "utf8")).originalText, brokenReceipt);
+  assert.notEqual((await f.run("2")).state, "completed");
+  assert.equal(f.calls.filter((c) => c[0] === "continue").length, 1);
+});
+
+test("repair replay of an already valid result does not duplicate usage", async (t) => {
+  const f = fixture(t);
+  const first = await f.run();
+  const repair = await f.run("1", { prompt: repairPrompt("legacy upstream repair") });
+  assert.equal(repair.text, first.text);
+  assert.equal(repair.usage, undefined);
+  assert.equal(repair.cumulativeUsage, undefined);
+  assert.equal(f.calls.filter((c) => c[0] === "continue").length, 1);
+});
+
+test("a repair request without its original business record cannot launch a new model task", async (t) => {
+  const f = fixture(t);
+  const output = await f.run("1", { prompt: repairPrompt("orphaned repair") });
+  assert.equal(f.calls.filter((c) => c[0] === "continue").length, 0);
+  assert.equal(receiptResult(output.text).problem, undefined);
+  assert.equal(receiptResult(output.text).result.ask.length, 1);
+  assert.equal(output.errorCode, "MANAGED_RECEIPT_REPAIR_CONTEXT_MISSING");
+});
+
+test("repair wording embedded inside a normal upstream prompt does not alter ordinary business execution", async (t) => {
+  const f = fixture(t);
+  const output = await f.run("1", { prompt: "正常上游任务，以下是一段资料：" + repairPrompt("quoted diagnostic") });
+  assert.equal(output.state, "completed");
+  assert.equal(f.calls.filter((c) => c[0] === "continue").length, 1);
+  assert.deepEqual(output.usage, { input: 20, output: 10, cached: 4 });
+});
+
+test("later blocked runs reuse the same receipt-attention key", async (t) => {
+  const f = fixture(t, { finalText: brokenReceipt });
+  const first = await f.run("1"),
+    later = await f.run("2");
+  assert.equal(receiptResult(first.text).result.ask[0].key, receiptResult(later.text).result.ask[0].key);
+  assert.equal(f.calls.filter((c) => c[0] === "continue").length, 1);
 });

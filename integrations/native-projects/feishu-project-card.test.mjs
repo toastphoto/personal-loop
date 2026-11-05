@@ -63,7 +63,7 @@ test("manual is explained once while active and paused states remain visible in 
   const card = renderProjectCard(view(projects), {}, { interactive: false });
   const titles = tagged(card, "collapsible_panel").map((o) => o.header.title.content);
   assert.ok(titles.includes("项目 1"));
-  assert.ok(titles.includes("项目 2 · 推进中"));
+  assert.ok(titles.includes("项目 2 · 已启用"));
   assert.ok(titles.includes("项目 3 · 已暂停"));
   assert.ok(JSON.stringify(card).includes("默认仅查看"));
   budget(card);
@@ -88,7 +88,7 @@ test("home natively folds three sources and exposes all 40 projects without a pi
   for (const p of projects) assert.ok(buttons.some((b) => b.behaviors[0].value.alias === p.alias));
   assert.notEqual(buttons[0].text.content, buttons[1].text.content);
   assert.match(buttons[0].text.content, /^同名项目 · [a-f0-9]{6}$/);
-  assert.equal(buttons[2].text.content, "项目 2 · 推进中");
+  assert.equal(buttons[2].text.content, "项目 2 · 已启用");
   assert.equal(buttons[3].text.content, "项目 3 · 已暂停");
   assert.equal(buttons[4].text.content, "项目 4");
   assert.ok(!/上一页|下一页|翻页/.test(JSON.stringify(card)));
@@ -139,7 +139,7 @@ test("detail exposes the current mode, goal and bounded capability with controls
   assert.ok(text.includes("只读任务"));
   assert.ok(text.includes("不接管原聊天"));
   assert.ok(text.includes(`/loop 启用 ${p.alias} | 明确目标`));
-  assert.ok(text.includes("步数上限 3"));
+  assert.ok(text.includes("自动运行上限 3"));
   assert.ok(tagged(card, "collapsible_panel").every((panel) => panel.expanded === false));
   assert.deepEqual(
     new Set(tagged(card, "button").map((b) => b.behaviors[0].value.action)),
@@ -331,14 +331,14 @@ test("start confirmation shows the full 1000-character draft and explicit step b
   const p = controlledProject({ canStart: true, draft: { objective, maxSteps: 3, revision: 2 } });
   const card = renderProjectCard(view([p]), { screen: "confirm-start", alias: p.alias }, mutationContext);
   assert.ok(tagged(card, "markdown").some((o) => o.content.includes(objective)));
-  assert.ok(JSON.stringify(card).includes("最多 3 步"));
+  assert.ok(JSON.stringify(card).includes("最多 3 轮"));
   const confirm = tagged(card, "button").find((b) => b.behaviors?.[0].value.action === "confirm-start");
   assert.ok(confirm);
   assert.equal(confirm.behaviors[0].value.alias, p.alias);
   assert.equal(confirm.behaviors[0].value.session, mutationContext.sessionId);
   assert.equal(confirm.behaviors[0].value.revision, mutationContext.revision);
   assert.ok(confirm.confirm.text.content.includes(objective));
-  assert.ok(confirm.confirm.text.content.includes("3 步"));
+  assert.ok(confirm.confirm.text.content.includes("3 轮"));
   budget(card);
 });
 
@@ -397,6 +397,136 @@ test("probe is a single non-mutating verification action and notices stay within
   );
   assert.ok(JSON.stringify(detail).includes("草稿已保存"));
   assert.ok(JSON.stringify(detail).includes("当前 仅查看"));
-  assert.ok(!JSON.stringify(detail).includes("当前 推进中"));
+  assert.ok(!JSON.stringify(detail).includes("当前 已启用"));
   budget(detail);
+});
+
+const activityWork = (nativeId = "native-work-1", extra = {}) => ({
+  nativeId,
+  title: "所选会话",
+  state: "completed",
+  nativeState: "idle",
+  updatedAt: "2026-11-05T08:00:00Z",
+  membership: "native-project",
+  ...extra,
+});
+const activity = (extra = {}) => ({
+  status: "available",
+  observedAt: "2026-11-05T09:00:00Z",
+  complete: true,
+  selection: "latest-updated",
+  works: [activityWork()],
+  selected: {
+    ...activityWork(),
+    latestReply: {
+      text: "这是助手原文\n下一行",
+      at: "2026-11-05T08:30:00Z",
+      id: "reply-id",
+      phase: "final_answer",
+      truncated: false,
+      timeSource: "turn-completed",
+    },
+  },
+  ...extra,
+});
+
+test("project mode and native progress stay separate while the latest reply keeps its provenance", () => {
+  const p = controlledProject({ mode: "active", canPause: true, activity: activity() });
+  const card = renderProjectCard(view([p]), { screen: "detail", alias: p.alias }, mutationContext);
+  const raw = JSON.stringify(card);
+  assert.ok(raw.includes("当前 已启用"));
+  assert.ok(raw.includes("本轮已结束"));
+  assert.ok(raw.includes("所选会话"));
+  assert.ok(raw.includes("按更新时间选择"));
+  assert.ok(raw.includes("最近最终回复"));
+  assert.ok(raw.includes("本轮结束时间"));
+  assert.ok(raw.includes("读取时间"));
+  assert.ok(tagged(card, "markdown").some((m) => m.content.includes("> 这是助手原文\n> 下一行")));
+  assert.ok(!raw.includes("当前正在执行"));
+  assert.ok(
+    actions(card).includes("pause") && actions(card).includes("refresh") && actions(card).includes("activity-refresh"),
+  );
+  budget(card);
+});
+
+test("activity selectors are scoped callbacks only, capped at three and never display native identifiers", () => {
+  const works = Array.from({ length: 6 }, (_, i) => activityWork("native-secret-id-" + i, { title: "会话 " + i }));
+  const p = controlledProject({ activity: activity({ works, selected: { ...works[0], latestReply: null } }) });
+  const card = renderProjectCard(view([p]), { screen: "detail", alias: p.alias }, mutationContext);
+  const selectors = tagged(card, "button").filter((b) => b.behaviors?.[0]?.value.action === "activity-work");
+  assert.equal(selectors.length, 3);
+  for (const [i, b] of selectors.entries()) {
+    assert.equal(b.behaviors[0].value.alias, p.alias);
+    assert.equal(b.behaviors[0].value.workId, works[i].nativeId);
+    assert.equal(b.behaviors[0].value.session, mutationContext.sessionId);
+    assert.equal(b.behaviors[0].value.revision, mutationContext.revision);
+    assert.ok(!b.text.content.includes("native-secret-id"));
+  }
+  assert.ok(tagged(card, "markdown").every((m) => !m.content.includes("native-secret-id")));
+  budget(card);
+});
+
+test("activity replies preserve lines, escape markup and explicitly cap excerpts at 1600 characters", () => {
+  const selected = {
+    ...activityWork(),
+    root: "/private/not-for-card",
+    secret: "private-credential",
+    latestReply: {
+      text: "<at id=all>测试</at>\n[链接](https://bad.test) " + "字".repeat(1700),
+      at: null,
+      id: "private-reply-id",
+      phase: "commentary",
+      truncated: false,
+      timeSource: "unknown",
+      tool: "private-tool",
+    },
+  };
+  const p = controlledProject({ activity: activity({ selected, secret: "private-activity", note: "仅显示有限回复" }) });
+  const card = renderProjectCard(view([p]), { screen: "detail", alias: p.alias }, mutationContext);
+  const raw = JSON.stringify(card),
+    mds = tagged(card, "markdown").map((m) => m.content);
+  assert.ok(raw.includes("最近进展"));
+  assert.ok(raw.includes("已截断"));
+  assert.ok(!raw.includes("<at"));
+  assert.ok(!raw.includes("https://bad.test"));
+  assert.ok(
+    !raw.includes("private-credential") &&
+      !raw.includes("private-tool") &&
+      !raw.includes("private-activity") &&
+      !raw.includes("private-reply-id"),
+  );
+  assert.ok(!raw.includes("/private/not-for-card"));
+  assert.ok(mds.some((m) => m.includes("\n> ")));
+  assert.ok(!raw.includes("字".repeat(1601)));
+  budget(card);
+});
+
+test("unknown, empty, stale and failed activity do not imply that the Agent has done no work", () => {
+  for (const status of ["empty", "unavailable", "stale", "loading"]) {
+    const p = controlledProject({
+      activity: activity({
+        status,
+        complete: false,
+        selected: { ...activityWork("x", { state: "unknown", membership: "cwd-unassigned" }), latestReply: null },
+        note: "连接需要核对",
+      }),
+    });
+    const card = renderProjectCard(view([p]), { screen: "detail", alias: p.alias }, mutationContext);
+    const raw = JSON.stringify(card);
+    assert.ok(raw.includes("待核对") || raw.includes("尚未") || raw.includes("暂时") || raw.includes("缓存"));
+    assert.ok(!raw.includes("Agent没有工作") && !raw.includes("Agent 没有工作"));
+    if (status === "stale") assert.ok(raw.includes("缓存"));
+    if (status !== "empty" && status !== "unavailable" && status !== "loading") assert.ok(raw.includes("目录关联"));
+    budget(card);
+  }
+  const p = controlledProject({
+    activity: activity({
+      selected: { ...activityWork("x", { state: "unknown", membership: "cwd-unassigned" }), latestReply: null },
+    }),
+  });
+  const card = renderProjectCard(view([p]), { screen: "detail", alias: p.alias }, { interactive: false });
+  assert.ok(JSON.stringify(card).includes("待核对"));
+  assert.ok(JSON.stringify(card).includes("目录关联"));
+  assert.equal(tagged(card, "button").length, 0);
+  budget(card);
 });

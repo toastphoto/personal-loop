@@ -188,6 +188,101 @@ export class CodexConnector {
     return this.metadata(thread, undefined, membership);
   }
 
+  async readConversation(id, { projectId, maxChars = 1600 } = {}) {
+    if (this.options.allowConversationPreview !== true)
+      fail("CODEX_PREVIEW_DISABLED", "此连接尚未开启所选会话的有限回复读取");
+    requireId(id);
+    if (!Number.isSafeInteger(maxChars) || maxChars < 1 || maxChars > 4000)
+      fail("CODEX_INVALID_INPUT", "回复预览长度必须是1到4000的整数");
+    const initial = await this.readWork(id, { projectId });
+    const selectedProject = projectId ?? initial.projectId;
+    if (!validId(selectedProject)) fail("CODEX_PREVIEW_SCOPE_REQUIRED", "读取回复前必须核实所选原生项目或精确目录关联");
+    let latestReply = null,
+      complete = false,
+      reason = "CODEX_REPLY_SCAN_LIMIT",
+      cursor;
+    const cursors = new Set(),
+      turns = new Set();
+    for (let count = 0; count < 3; count++) {
+      const page = await this.rpc("thread/turns/list", {
+        threadId: id,
+        limit: 1,
+        sortDirection: "desc",
+        itemsView: "full",
+        ...(cursor ? { cursor } : {}),
+      });
+      if (!page || !Array.isArray(page.data) || page.data.length > 1) fail("CODEX_PROTOCOL_ERROR", "Codex回复分页无效");
+      const next = page.nextCursor;
+      if (next != null && next !== "" && (typeof next !== "string" || next.length > 2048 || /[\p{Cc}]/u.test(next)))
+        fail("CODEX_PROTOCOL_ERROR", "Codex回复分页游标无效");
+      if (!page.data.length && next) fail("CODEX_PROTOCOL_ERROR", "Codex回复分页没有推进");
+      const turn = page.data[0];
+      if (turn) {
+        if (!validId(turn.id) || !Array.isArray(turn.items)) fail("CODEX_PROTOCOL_ERROR", "Codex回复轮次无效");
+        if (turns.has(turn.id)) fail("CODEX_PAGINATION_LOOP", "Codex回复分页重复了轮次");
+        turns.add(turn.id);
+        if (turn.itemsView !== "full") {
+          reason = "CODEX_REPLY_NOT_FULL";
+          break;
+        }
+        for (let i = turn.items.length - 1; i >= 0; i--) {
+          const item = turn.items[i];
+          if (item?.type !== "agentMessage") continue;
+          if (typeof item.text !== "string") fail("CODEX_PROTOCOL_ERROR", "Codex助手消息格式无效");
+          if (!item.text.trim()) continue;
+          if (!validId(item.id)) fail("CODEX_PROTOCOL_ERROR", "Codex助手消息缺少原生编号");
+          let text = "",
+            chars = 0,
+            truncated = false;
+          for (const char of item.text) {
+            if (chars++ >= maxChars) {
+              truncated = true;
+              break;
+            }
+            text += char;
+          }
+          const at = epoch(turn.completedAt);
+          latestReply = {
+            text,
+            at,
+            id: item.id,
+            phase: ["commentary", "partial_answer", "final_answer"].includes(item.phase) ? item.phase : null,
+            truncated,
+            timeSource: at === null ? "unknown" : "turn-completed",
+          };
+          complete = true;
+          reason = undefined;
+          break;
+        }
+      }
+      if (latestReply) break;
+      if (!next) {
+        complete = true;
+        reason = "CODEX_REPLY_ABSENT";
+        break;
+      }
+      if (cursors.has(next)) fail("CODEX_PAGINATION_LOOP", "Codex回复分页游标重复");
+      cursors.add(next);
+      cursor = next;
+    }
+    // Recheck scope after reading content: a concurrent project move must not return an out-of-scope body.
+    const current = await this.readWork(id, { projectId: selectedProject });
+    return {
+      nativeId: current.nativeId,
+      projectId: current.projectId,
+      title: current.title,
+      state: current.state,
+      nativeState: current.nativeState,
+      runtimeStateTrusted: current.runtimeStateTrusted,
+      statusSource: current.statusSource,
+      updatedAt: current.updatedAt,
+      observedAt: now(),
+      complete,
+      latestReply,
+      ...(reason ? { reason } : {}),
+    };
+  }
+
   assertWrite() {
     if (!this.writeEnabled) fail("CODEX_WRITE_DISABLED", "此Codex连接器仅可读取；原生任务写操作未启用");
   }

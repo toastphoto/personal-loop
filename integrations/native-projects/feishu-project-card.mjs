@@ -1,5 +1,5 @@
 const PROVIDERS = { codex: "Codex", multica: "Multica", dsh: "DeepSeek" };
-const MODES = { manual: "仅查看", active: "推进中", paused: "已暂停" };
+const MODES = { manual: "仅查看", active: "已启用", paused: "已暂停" };
 const EXECUTION = {
   "managed-read-only": "可执行独立只读任务 不接管原聊天",
   native: "已连接原生控制 仍需明确目标后启用",
@@ -61,6 +61,111 @@ const panel = (title, elements) => ({
 const mode = (p) => MODES[p.mode] ?? "状态待核对";
 const capability = (p) => EXECUTION[p.execution] ?? EXECUTION["read-only"];
 
+const ACTIVITY_STATES = {
+  running: "执行中",
+  inProgress: "执行中",
+  queued: "排队中",
+  pending: "排队中",
+  claimed: "已接单",
+  preparing: "准备中",
+  waiting: "等待处理",
+  idle: "当前空闲",
+  completed: "本轮已结束",
+  failed: "本轮失败",
+  cancelled: "本轮已取消",
+  interrupted: "本轮已中断",
+  cancelling: "正在取消",
+  unknown: "待核对",
+};
+const validNativeId = (value) =>
+  typeof value === "string" && value.trim() && value.length <= 256 && !/[\p{Cc}]/u.test(value);
+const activityTime = (value) =>
+  typeof value === "string" && value.length <= 60 && Number.isFinite(Date.parse(value)) ? value : null;
+function activityWork(value) {
+  if (!value || typeof value !== "object" || !validNativeId(value.nativeId)) return null;
+  return {
+    nativeId: value.nativeId,
+    title: short(
+      value.title && value.title !== value.nativeId ? value.title : `未命名会话 · ${value.nativeId.slice(-6)}`,
+      140,
+    ),
+    state: Object.hasOwn(ACTIVITY_STATES, value.state) ? value.state : "unknown",
+    nativeState: typeof value.nativeState === "string" ? short(value.nativeState, 60) : "unknown",
+    updatedAt: activityTime(value.updatedAt),
+    membership: ["native-project", "cwd-unassigned"].includes(value.membership) ? value.membership : "unknown",
+  };
+}
+function activityView(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const works = [],
+    seen = new Set();
+  for (const raw of Array.isArray(value.works) ? value.works : []) {
+    const work = activityWork(raw);
+    if (!work || seen.has(work.nativeId)) continue;
+    seen.add(work.nativeId);
+    works.push(work);
+    if (works.length === 3) break;
+  }
+  let selected = activityWork(value.selected);
+  if (selected) {
+    let latestReply = null;
+    const reply = value.selected.latestReply;
+    if (reply && typeof reply.text === "string" && reply.text.trim()) {
+      let text = "",
+        count = 0,
+        clipped = false;
+      for (const char of reply.text.replace(
+        /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f\u202a-\u202e\u2066-\u2069]/g,
+        " ",
+      )) {
+        if (count++ >= 1600) {
+          clipped = true;
+          break;
+        }
+        text += char;
+      }
+      latestReply = {
+        text,
+        at: activityTime(reply.at),
+        phase: ["final", "final_answer", "progress", "commentary", "partial_answer"].includes(reply.phase)
+          ? reply.phase
+          : null,
+        truncated: reply.truncated === true || clipped,
+        timeSource: ["turn-completed", "session-event", "message-created", "unknown"].includes(reply.timeSource)
+          ? reply.timeSource
+          : "unknown",
+      };
+    }
+    selected = { ...selected, latestReply };
+  }
+  return {
+    status: ["available", "empty", "unavailable", "stale", "loading"].includes(value.status)
+      ? value.status
+      : "unavailable",
+    observedAt: activityTime(value.observedAt),
+    complete: value.complete === true,
+    selection: ["latest-updated", "trusted-active", "order-only", "explicit", "selected", "only-work"].includes(
+      value.selection,
+    )
+      ? value.selection
+      : null,
+    works,
+    selected,
+    ...(typeof value.note === "string" ? { note: short(value.note, 300) } : {}),
+  };
+}
+function activityDate(value) {
+  return new Intl.DateTimeFormat("zh-CN", {
+    timeZone: "Asia/Shanghai",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hourCycle: "h23",
+  }).format(new Date(value));
+}
 function normalize(view) {
   if (!["project-directory", "project-status"].includes(view?.kind)) throw fail("PROJECT_CARD_VIEW_INVALID");
   const source = view.kind === "project-status" ? [view.project] : view.projects;
@@ -77,6 +182,7 @@ function normalize(view) {
       provider: p.provider,
       mode: p.mode,
       execution: p.execution,
+      ...(p.activity ? { activity: activityView(p.activity) } : {}),
       ...(typeof p.objective === "string" && p.objective ? { objective: p.objective } : {}),
       ...(Number.isSafeInteger(p.maxSteps) && p.maxSteps > 0 ? { maxSteps: p.maxSteps } : {}),
       controlRevision: p.controlRevision ?? p.revision,
@@ -119,7 +225,7 @@ function summary(v, interactive) {
   return block(
     [
       md(`**${v.complete ? "" : "已列出 "}${v.projects.length} 个项目**`, "heading-3"),
-      md(`默认仅查看 · 推进中 ${active} · 已暂停 ${paused}`),
+      md(`默认仅查看 · 已启用 ${active} · 已暂停 ${paused}`),
       muted(interactive ? "选择项目查看不会启用自动推进" : "点来源和项目名称展开 查看不会启用自动推进"),
       ...warnings(v).map((warning) => muted(escape(warning))),
       ...(!v.complete && !warnings(v).length ? [muted("目录尚未完整可用 请稍后刷新")] : []),
@@ -299,6 +405,62 @@ function projectControls(p, context) {
     );
   return buttons.length ? row(buttons.map((b) => column([b]))) : null;
 }
+function activitySection(p, context) {
+  const a = p.activity;
+  if (!a) return null;
+  const elements = [];
+  if (a.status === "loading") elements.push(md("正在读取原生任务与最近回复"));
+  else if (a.status === "unavailable") elements.push(md("暂时无法读取原生进度 请稍后刷新核对"));
+  else if (a.status === "empty") elements.push(md("这次未读到可关联的Issue或会话 不代表项目没有进展"));
+  else {
+    if (a.status === "stale") elements.push(muted("这是缓存的动态 请刷新核对最新状态"));
+    if (a.selected) {
+      const selected = a.selected;
+      elements.push(md(`**${escape(selected.title, 140)}**`), md(`原生执行状态 ${ACTIVITY_STATES[selected.state]}`));
+      if (a.selection === "latest-updated") elements.push(muted("按更新时间选择的任务"));
+      if (a.selection === "trusted-active") elements.push(muted("优先显示已核实正在执行的任务"));
+      if (selected.membership === "cwd-unassigned") elements.push(muted("目录关联会话 原生项目归属尚未设置"));
+      const reply = selected.latestReply;
+      if (reply) {
+        const label = ["final", "final_answer"].includes(reply.phase)
+          ? "最近最终回复"
+          : ["progress", "commentary", "partial_answer"].includes(reply.phase)
+            ? "最近进展"
+            : "最近Agent回复";
+        elements.push(
+          md(`**${label}**`),
+          md("> " + goalMarkdown(reply.text).replace(/\r\n?/g, "\n").split("\n").join("\n> ")),
+        );
+        if (reply.truncated) elements.push(muted("回复较长 此处已截断"));
+        if (reply.at)
+          elements.push(
+            muted(
+              `${reply.timeSource === "turn-completed" ? "本轮结束时间" : "回复记录时间"} ${activityDate(reply.at)}`,
+            ),
+          );
+        else elements.push(muted("回复时间待核对"));
+      } else elements.push(muted("尚未读到可见回复 当前读取结果不足以判断任务进展"));
+    } else elements.push(md("尚未选定可核对的任务 请刷新后查看"));
+  }
+  if (a.observedAt)
+    elements.push(muted(`${a.status === "stale" ? "上次读取时间" : "读取时间"} ${activityDate(a.observedAt)}`));
+  else elements.push(muted("读取时间待核对"));
+  if (!a.complete) elements.push(muted("本次读取不完整 已显示能确认的部分"));
+  if (a.note) elements.push(muted(escape(a.note, 300)));
+  if (context.interactive !== false) {
+    for (const [i, work] of a.works.entries())
+      elements.push(
+        button(context, `任务 ${i + 1} · ${plain(work.title, 65)}`, "activity-work", {
+          alias: p.alias,
+          workId: work.nativeId,
+        }),
+      );
+    elements.push(button(context, "刷新Agent回复", "activity-refresh", { alias: p.alias }));
+  }
+  const section = panel("原生任务与Agent回复", elements);
+  section.expanded = true;
+  return section;
+}
 function detail(v, navigation, context) {
   const p = v.projects.find((p) => p.alias === navigation.alias);
   if (!p)
@@ -312,7 +474,7 @@ function detail(v, navigation, context) {
   const draft = p.draft?.objective
     ? [
         md(`**目标草稿 · 尚未启动**\n${escape(p.draft.objective, 500)}`),
-        ...(Number.isSafeInteger(p.draft.maxSteps) ? [muted(`草稿步数上限 ${p.draft.maxSteps}`)] : []),
+        ...(Number.isSafeInteger(p.draft.maxSteps) ? [muted(`草稿自动运行上限 ${p.draft.maxSteps}`)] : []),
       ]
     : [];
   return rootCard("项目详情", PROVIDERS[p.provider], [
@@ -327,8 +489,9 @@ function detail(v, navigation, context) {
     ),
     block([
       md(p.objective ? `**当前目标**\n${escape(p.objective)}` : "尚未设置自动推进目标"),
-      ...(p.maxSteps ? [muted(`步数上限 ${p.maxSteps}`)] : []),
+      ...(p.maxSteps ? [muted(`自动运行上限 ${p.maxSteps}`)] : []),
       ...draft,
+      ...(p.activity ? [activitySection(p, context)] : []),
     ]),
     ...(controls ? [controls] : []),
     commandHelp(p),
@@ -352,7 +515,7 @@ function goalForm(v, navigation, context) {
       [
         md("**保存草稿不会启动**", "heading-3"),
         muted("当前项目模式和正在执行的目标保持不变"),
-        ...(p.draft?.objective && !validDraft ? [muted("旧草稿内容或步数超出表单范围 未截断预填 请重新填写")] : []),
+        ...(p.draft?.objective && !validDraft ? [muted("旧草稿内容或轮数超出表单范围 未截断预填 请重新填写")] : []),
       ],
       true,
     ),
@@ -378,12 +541,12 @@ function goalForm(v, navigation, context) {
         {
           tag: "select_static",
           name: "max_steps",
-          placeholder: text("最多推进几步"),
+          placeholder: text("最多自动运行几轮"),
           required: true,
           width: "fill",
           initial_option: String(validDraft ? p.draft.maxSteps : 3),
           options: choices.map((n) => ({
-            text: text(`${n} 步${[1, 3, 5, 10].includes(n) ? "" : "（当前）"}`),
+            text: text(`${n} 轮${[1, 3, 5, 10].includes(n) ? "" : "（当前）"}`),
             value: String(n),
           })),
         },
@@ -410,7 +573,7 @@ function confirmGoal(v, navigation, context, resume) {
       block(
         [
           md("**暂时不能确认启动**"),
-          muted(!permitted ? "项目控制未就绪 请返回项目刷新状态" : "请先保存完整目标和有效步数 目标最多1000字"),
+          muted(!permitted ? "项目控制未就绪 请返回项目刷新状态" : "请先保存完整目标和有效轮数 目标最多1000字"),
         ],
         true,
       ),
@@ -427,15 +590,15 @@ function confirmGoal(v, navigation, context, resume) {
   confirm.confirm = {
     title: text(resume ? "确认恢复原目标" : "确认启动这个目标"),
     text: text(
-      `${goalPlain(goal.objective)}\n\n最多 ${goal.maxSteps} 步${resume ? " · 不会重置已使用步数" : ""}\n${capability(p)}`,
+      `${goalPlain(goal.objective)}\n\n最多 ${goal.maxSteps} 轮${resume ? " · 不会重置已使用轮数" : ""}\n${capability(p)}`,
     ),
   };
   return rootCard(resume ? "恢复前确认" : "启动前确认", plain(p.name, 80), [
     block([md(resume ? "**继续原目标**" : "**启动这个目标**", "heading-3"), muted(escape(capability(p)))], true),
     block([
       md(goalMarkdown(goal.objective)),
-      md(`最多 ${goal.maxSteps} 步`),
-      ...(resume ? [muted("恢复不会重置已使用步数 不采用另存的新草稿")] : [muted("确认后才开始自动推进")]),
+      md(`最多 ${goal.maxSteps} 轮`),
+      ...(resume ? [muted("恢复不会重置已使用轮数 不采用另存的新草稿")] : [muted("确认后才开始自动推进")]),
     ]),
     row([column([confirm]), column([button(context, "返回项目", "detail", { alias: p.alias })])]),
   ]);

@@ -11,7 +11,7 @@
 - 父目录归当前用户所有、严格0700；socket为0600，没有TCP监听
 - 没有任意文件、shell、HTTP或Remote endpoint代理；已有socket路径拒绝覆盖
 - 默认请求最大16KiB、响应2MiB、读取3秒、最多8客户端及每客户端4个并发读取
-- 只使用现有服务的 `workspaceRegistry.list()`、`sessionQuery.listSessions(signal)`、`agents.get(id)`，不读会话正文
+- 默认元数据模式只使用现有服务的 `workspaceRegistry.list()`、`sessionQuery.listSessions(signal)`、`agents.get(id)`，不返回会话正文；0.1.1 的显式回复预览见文末
 - 轻量API不能可靠提供会话标题和最后活动时间时返回null，不扫描日志补齐
 - running来自当前Host；未加载会话返回null和not_loaded，不能据此宣称全机空闲
 - 元数据仍是私人数据，不提交公开仓库或原样发群
@@ -69,7 +69,7 @@ npm pack --dry-run --ignore-scripts --json
 open -a '/Applications/DeepSeek Harness.app'
 ```
 
-Desktop默认无HMR，按需要重启处理；安装成功不等于已激活。验收应核socket权限、四个只读方法、项目计数与App一致、Host PID对应，确认没有模型启动和私人正文输出。
+Desktop默认无HMR，按需要重启处理；安装成功不等于已激活。验收应核socket权限、四个元数据方法、可选的有界回复方法、项目计数与App一致及Host PID对应；确认没有模型启动，不把私人正文打印进诊断日志。
 
 ## 移除与恢复
 
@@ -89,3 +89,9 @@ Desktop默认无HMR，按需要重启处理；安装成功不等于已激活。�
 - [Workspace公开服务](https://github.com/deepseek-ai/deepseek-harness/blob/master/packages/workspace/workspace/README.zh.md)
 
 本插件按0.2.1-rc.3安装包的bundle声明、CLI `manageDesktopProfile: true` 和服务接口实现。GitHub master会变化；真实安装和App项目读取仍需独立验收。本轮测试是实际UDS加受控假Host服务，不是用户Desktop端到端通过。
+
+## Bounded visible reply preview
+
+Version 0.1.1 adds `session/reply` only when `config.allowReplyPreview` is explicitly true. Requests require both `workspaceId` and `sessionId`; membership is checked before and after the read. The existing public session query locates the latest assistant/message and reads that single event. Only text blocks are returned, capped at 2000 Unicode characters; reasoning and tool blocks are excluded. Metadata methods remain body-free.
+
+The client separately requires `allowConversationPreview:true` and normally clips the reply to 1600 characters. Missing titles, timestamps and live execution status remain unknown. Enable this only for the owner's requested project-detail view. A profile patch replaces the entire plugin config, so preserve the existing socket and bounds when adding the flag. Normal Desktop restart is needed to load an updated package; do not open a second shared-storage Host.

@@ -20,3 +20,7 @@
 - 2026-11-05: The owner requested actionable project cards and natural project questions. Save goals as drafts; start/resume require explicit confirmation. Native controls remain capability-gated. Preserve the existing receiver and use one additional consumer on its event bus.
 - Restore the previously preferred native source folds after user feedback. Full project lists and cached navigation are the default; live checks belong at refresh/execution boundaries. Reassess only with user feedback or platform limits.
 - Natural language produces bounded queries/proposals, not unrestricted automatic execution. Ambiguity is resolved in cards. Keep actor/group/message/revision proof and do not infer a context from an undelivered or retried old card.
+
+- On explicit owner request, allow bounded visible Agent reply reads for the selected native project only; keep metadata/MCP defaults and native identity guards. Display unknown/stored states honestly and do not treat a quoted completion claim as business acceptance.
+- Keep scheduling and reporting separate. The original `needed` policy is not a fixed reporting interval; no recurring summary was inferred from a question about how reporting works.
+- Preserve malformed original receipts privately, produce a valid attention request, isolate the affected goal and avoid duplicate work/usage. Automatic receipt repair remains unimplemented.

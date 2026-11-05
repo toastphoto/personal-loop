@@ -495,3 +495,232 @@ test("readWork rejects disabled legacy mapping, another native project, missing 
     await assert.rejects(connector.readWork("t1", { projectId: "p1" }), { code: "CODEX_PROJECT_MISMATCH" });
   }
 });
+
+const previewTurn = (items = [], extra = {}) => ({
+  id: "turn1",
+  status: "completed",
+  itemsView: "full",
+  completedAt: 20,
+  items,
+  ...extra,
+});
+const replyItem = (text, extra = {}) => ({ type: "agentMessage", id: "reply1", phase: "final_answer", text, ...extra });
+const previewOptions = { mode: "isolated-readonly-api", allowConversationPreview: true };
+
+test("conversation preview is opt-in and rejects invalid limits before any native read", async () => {
+  const disabled = fakeConnector(() => {
+    throw Error("must not read");
+  });
+  await assert.rejects(disabled.connector.readConversation("t1", { projectId: "p1" }), {
+    code: "CODEX_PREVIEW_DISABLED",
+  });
+  assert.equal(disabled.calls.length, 0);
+  const enabled = fakeConnector(() => {
+    throw Error("must not read");
+  }, previewOptions);
+  for (const maxChars of [0, -1, 1.5, Infinity, 100000])
+    await assert.rejects(enabled.connector.readConversation("t1", { projectId: "p1", maxChars }), {
+      code: "CODEX_INVALID_INPUT",
+    });
+  assert.equal(enabled.calls.length, 0);
+});
+
+test("selected project identity is checked before reply reads, including legacy exact-root association", async () => {
+  for (const extra of [
+    { projectId: "p2" },
+    { projectId: null, cwd: "/tmp/approved/child" },
+    { projectId: undefined },
+  ]) {
+    const f = fakeConnector(
+      (method) =>
+        method === "project/list"
+          ? { data: [{ id: "p1", name: "Project", roots: [{ path: "/tmp/approved" }] }], nextCursor: null }
+          : { thread: thread("notLoaded", extra) },
+      { ...previewOptions, includeUnassignedByRoot: true },
+    );
+    await assert.rejects(f.connector.readConversation("t1", { projectId: "p1" }), { code: "CODEX_PROJECT_MISMATCH" });
+    assert.equal(
+      f.calls.some((c) => c.method === "thread/turns/list"),
+      false,
+    );
+  }
+  const legacy = fakeConnector(
+    (method) =>
+      method === "project/list"
+        ? { data: [{ id: "p1", name: "Project", roots: [{ path: "/tmp/approved" }] }], nextCursor: null }
+        : method === "thread/read"
+          ? { thread: thread("notLoaded", { projectId: null, cwd: "/tmp/approved" }) }
+          : { data: [previewTurn([replyItem("legacy answer")])], nextCursor: null },
+    { ...previewOptions, includeUnassignedByRoot: true },
+  );
+  const result = await legacy.connector.readConversation("t1", { projectId: "p1" });
+  assert.equal(result.projectId, "p1");
+  assert.equal(result.latestReply.text, "legacy answer");
+  assert.equal(result.runtimeStateTrusted, false);
+});
+
+test("bounded preview selects only the newest assistant text without leaking reasoning or tool bodies", async () => {
+  const f = fakeConnector(
+    (method) =>
+      method === "thread/read"
+        ? { thread: thread("active") }
+        : {
+            data: [
+              previewTurn([
+                { type: "reasoning", id: "r", content: ["PRIVATE_THINKING"] },
+                { type: "commandExecution", id: "cmd", aggregatedOutput: "PRIVATE_TOOL" },
+                replyItem("early", { id: "reply0", phase: "commentary" }),
+                replyItem("latest update", { phase: "partial_answer" }),
+                { type: "mcpToolCall", id: "tool", result: "PRIVATE_RAW" },
+              ]),
+            ],
+            nextCursor: "older",
+          },
+    previewOptions,
+  );
+  const r = await f.connector.readConversation("t1", { projectId: "p1" });
+  assert.equal(r.latestReply.text, "latest update");
+  assert.equal(r.latestReply.phase, "partial_answer");
+  assert.equal(r.latestReply.id, "reply1");
+  assert.equal(r.latestReply.at, "1970-01-01T00:00:20.000Z");
+  assert.equal(r.state, "unknown");
+  assert.equal(r.statusSource, "stored");
+  assert.equal(r.runtimeStateTrusted, false);
+  assert.equal(r.complete, true);
+  assert.ok(!JSON.stringify(r).includes("PRIVATE"));
+  assert.deepEqual(
+    f.calls.filter((c) => c.method === "thread/turns/list").map((c) => c.params),
+    [{ threadId: "t1", limit: 1, sortDirection: "desc", itemsView: "full" }],
+  );
+  assert.ok(f.calls.every((c) => ["thread/read", "thread/turns/list"].includes(c.method)));
+  const metadata = await f.connector.readWork("t1", { projectId: "p1" });
+  assert.equal(metadata.latestReply, undefined);
+  assert.ok(!JSON.stringify(metadata).includes("latest update"));
+});
+
+test("preview clips Unicode text explicitly and never invents an unavailable reply timestamp", async () => {
+  const f = fakeConnector(
+    (method) =>
+      method === "thread/read"
+        ? { thread: thread() }
+        : {
+            data: [previewTurn([replyItem("🙂回复后续内容", { phase: null })], { completedAt: null, startedAt: 1 })],
+            nextCursor: null,
+          },
+    previewOptions,
+  );
+  const r = await f.connector.readConversation("t1", { projectId: "p1", maxChars: 3 });
+  assert.equal(r.latestReply.text, "🙂回复");
+  assert.equal(r.latestReply.truncated, true);
+  assert.equal(r.latestReply.at, null);
+  assert.equal(r.latestReply.phase, null);
+});
+
+test("empty latest turns scan at most three turns, and absence differs from a bounded incomplete scan", async () => {
+  const f = fakeConnector(
+    (method, params) =>
+      method === "thread/read"
+        ? { thread: thread() }
+        : {
+            data: [previewTurn(params.cursor ? [replyItem("prior final")] : [], { id: params.cursor ? "old" : "new" })],
+            nextCursor: params.cursor ? null : "older",
+          },
+    previewOptions,
+  );
+  assert.equal((await f.connector.readConversation("t1", { projectId: "p1" })).latestReply.text, "prior final");
+  assert.equal(f.calls.filter((c) => c.method === "thread/turns/list").length, 2);
+  const absent = fakeConnector(
+    (method) => (method === "thread/read" ? { thread: thread() } : { data: [], nextCursor: null }),
+    previewOptions,
+  );
+  const a = await absent.connector.readConversation("t1", { projectId: "p1" });
+  assert.equal(a.latestReply, null);
+  assert.equal(a.complete, true);
+  assert.equal(a.reason, "CODEX_REPLY_ABSENT");
+  let pages = 0;
+  const limited = fakeConnector(
+    (method) =>
+      method === "thread/read"
+        ? { thread: thread() }
+        : {
+            data: [previewTurn([], { id: "turn" + ++pages })],
+            nextCursor: "cursor" + pages,
+          },
+    previewOptions,
+  );
+  const l = await limited.connector.readConversation("t1", { projectId: "p1" });
+  assert.equal(l.latestReply, null);
+  assert.equal(l.complete, false);
+  assert.equal(l.reason, "CODEX_REPLY_SCAN_LIMIT");
+  assert.equal(pages, 3);
+});
+
+test("partial or malformed turn pages cannot claim complete reply evidence", async () => {
+  const partial = fakeConnector(
+    (method) =>
+      method === "thread/read"
+        ? { thread: thread() }
+        : {
+            data: [previewTurn([replyItem("incomplete")], { itemsView: "summary" })],
+            nextCursor: null,
+          },
+    previewOptions,
+  );
+  const p = await partial.connector.readConversation("t1", { projectId: "p1" });
+  assert.equal(p.complete, false);
+  assert.equal(p.latestReply, null);
+  assert.equal(p.reason, "CODEX_REPLY_NOT_FULL");
+  for (const response of [
+    { data: [previewTurn(), previewTurn()] },
+    { data: [], nextCursor: "not-progressing" },
+    { data: [{ id: "x", itemsView: "full" }] },
+  ]) {
+    const f = fakeConnector((method) => (method === "thread/read" ? { thread: thread() } : response), previewOptions);
+    await assert.rejects(f.connector.readConversation("t1", { projectId: "p1" }), { code: "CODEX_PROTOCOL_ERROR" });
+  }
+});
+
+test("a project move during the reply read prevents returning the newly out-of-scope body", async () => {
+  let read = 0;
+  const f = fakeConnector(
+    (method) =>
+      method === "thread/read"
+        ? { thread: thread("idle", { projectId: ++read === 1 ? "p1" : "p2" }) }
+        : { data: [previewTurn([replyItem("DO_NOT_RETURN")])], nextCursor: null },
+    previewOptions,
+  );
+  await assert.rejects(f.connector.readConversation("t1", { projectId: "p1" }), { code: "CODEX_PROJECT_MISMATCH" });
+});
+
+test("readonly RPC grants only explicit bounded turn pages and retains full-history and write denials", async () => {
+  const valid = { threadId: "t1", limit: 1, sortDirection: "desc", itemsView: "full" };
+  for (const optIn of [false, true]) {
+    const calls = [];
+    const p = child((q, c) => {
+      calls.push(q);
+      if (q.id) result(c, q.id, {});
+    });
+    const rpc = new CodexRpcProxy({ mode: "isolated-readonly-api", allowConversationPreview: optIn, spawn: () => p });
+    await rpc.connect();
+    if (!optIn) await assert.rejects(rpc.request("thread/turns/list", valid), { code: "CODEX_CONTROL_UNAVAILABLE" });
+    else {
+      await rpc.request("thread/turns/list", valid);
+      await rpc.request("thread/turns/list", { ...valid, cursor: "opaque-page" });
+      for (const invalid of [
+        { ...valid, limit: 2 },
+        { ...valid, sortDirection: "asc" },
+        { ...valid, itemsView: "none" },
+        { ...valid, cursor: 42 },
+        { ...valid, includeReasoning: true },
+        { ...valid, threadId: "" },
+      ])
+        await assert.rejects(rpc.request("thread/turns/list", invalid), { code: "CODEX_PREVIEW_READ_DENIED" });
+      assert.equal(calls.filter((c) => c.method === "thread/turns/list").length, 2);
+    }
+    await assert.rejects(rpc.request("thread/read", { threadId: "t1", includeTurns: true }), {
+      code: "CODEX_HISTORY_READ_DENIED",
+    });
+    await assert.rejects(rpc.request("turn/start", { threadId: "t1" }), { code: "CODEX_CONTROL_UNAVAILABLE" });
+    await rpc.close();
+  }
+});

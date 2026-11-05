@@ -3,7 +3,7 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { lstat } from "node:fs/promises";
 
-const READ_METHODS = new Set(["workspace/list", "session/list", "session/read", "session/status"]);
+const READ_METHODS = new Set(["workspace/list", "session/list", "session/read", "session/status", "session/reply"]);
 const REMOTE_ERRORS = new Set([
   "INVALID_JSON",
   "INVALID_REQUEST",
@@ -18,6 +18,10 @@ const REMOTE_ERRORS = new Set([
   "CLIENT_LIMIT",
   "MESSAGE_TOO_LARGE",
   "RESPONSE_TOO_LARGE",
+  "REPLY_PREVIEW_DISABLED",
+  "REPLY_PREVIEW_UNSUPPORTED",
+  "SESSION_WORKSPACE_MISMATCH",
+  "INVALID_NATIVE_REPLY",
 ]);
 const object = (value) => value !== null && typeof value === "object" && !Array.isArray(value);
 const validId = (value) =>
@@ -64,7 +68,15 @@ export class DshBridgeConnector {
   #maxResponse;
   #pending = new Set();
   #closed = false;
-  constructor({ bridgeSocket, host = "local", timeoutMs = 5000, maxResponseBytes = 2097152 } = {}) {
+  #allowConversationPreview;
+  constructor({
+    bridgeSocket,
+    host = "local",
+    timeoutMs = 5000,
+    maxResponseBytes = 2097152,
+    allowConversationPreview = false,
+  } = {}) {
+    this.#allowConversationPreview = allowConversationPreview === true;
     if (
       typeof process.getuid !== "function" ||
       !validId(host) ||
@@ -99,12 +111,19 @@ export class DshBridgeConnector {
   async #request(method, params = {}) {
     if (this.#closed) throw fail("DSH_BRIDGE_CLOSED");
     if (!READ_METHODS.has(method)) throw fail("DSH_BRIDGE_METHOD_NOT_ALLOWED");
-    const fields = method === "workspace/list" ? [] : method === "session/list" ? ["workspaceId"] : ["sessionId"];
+    const fields =
+      method === "workspace/list"
+        ? []
+        : method === "session/list"
+          ? ["workspaceId"]
+          : method === "session/reply"
+            ? ["workspaceId", "sessionId"]
+            : ["sessionId"];
     if (
       !object(params) ||
       Object.keys(params).some((key) => !fields.includes(key)) ||
       Object.values(params).some((value) => !validId(value)) ||
-      (["session/read", "session/status"].includes(method) && !validId(params.sessionId))
+      (["session/read", "session/status", "session/reply"].includes(method) && !validId(params.sessionId))
     )
       throw fail("DSH_BRIDGE_INVALID_INPUT");
     const id = randomUUID();
@@ -304,6 +323,70 @@ export class DshBridgeConnector {
   }
   async readStatus(nativeId) {
     return this.#readMember(nativeId, "session/status");
+  }
+  async readConversation(nativeId, { projectId, maxChars = 1600 } = {}) {
+    if (!this.#allowConversationPreview) throw fail("DSH_BRIDGE_PREVIEW_DISABLED");
+    if (!validId(nativeId) || !validId(projectId) || !integer(maxChars, 1, 2000))
+      throw fail("DSH_BRIDGE_INVALID_INPUT");
+    const socketBefore = await this.#identity();
+    const directory = await this.#projects();
+    if (directory.membership.get(nativeId) !== projectId) throw fail("DSH_BRIDGE_PROJECT_MISMATCH");
+    let result;
+    try {
+      result = await this.#request("session/reply", { workspaceId: projectId, sessionId: nativeId });
+    } catch (error) {
+      if (["DSH_BRIDGE_METHOD_NOT_ALLOWED", "DSH_BRIDGE_REPLY_PREVIEW_UNSUPPORTED"].includes(error.code))
+        throw fail("DSH_BRIDGE_PREVIEW_UNSUPPORTED");
+      throw error;
+    }
+    sameHost(directory.result, result);
+    if (result.sessionId !== nativeId || !Object.hasOwn(result, "latestReply")) throw fail("DSH_BRIDGE_INVALID_REPLY");
+    const metadata = this.#work(result, projectId);
+    let latestReply = null;
+    if (result.latestReply !== null) {
+      const reply = result.latestReply;
+      if (
+        !object(reply) ||
+        typeof reply.text !== "string" ||
+        !reply.text.trim() ||
+        !validId(reply.id) ||
+        !integer(reply.seq, 0, Number.MAX_SAFE_INTEGER) ||
+        typeof reply.truncated !== "boolean" ||
+        (reply.at !== null && (typeof reply.at !== "string" || !Number.isFinite(Date.parse(reply.at))))
+      )
+        throw fail("DSH_BRIDGE_INVALID_REPLY");
+      const chars = Array.from(reply.text);
+      if (chars.length > 2000) throw fail("DSH_BRIDGE_INVALID_REPLY");
+      latestReply = {
+        text: chars.slice(0, maxChars).join(""),
+        at: reply.at,
+        id: reply.id,
+        seq: reply.seq,
+        phase: null,
+        truncated: reply.truncated || chars.length > maxChars,
+        timeSource: reply.at === null ? "unknown" : "session-event",
+      };
+    }
+    const after = await this.#projects();
+    sameHost(result, after.result);
+    if (after.membership.get(nativeId) !== projectId) throw fail("DSH_BRIDGE_PROJECT_MISMATCH");
+    const socketAfter = await this.#identity();
+    if (Object.keys(socketBefore).some((key) => socketBefore[key] !== socketAfter[key]))
+      throw fail("DSH_BRIDGE_SOCKET_CHANGED");
+    return {
+      nativeId: metadata.nativeId,
+      projectId: metadata.projectId,
+      title: typeof result.title === "string" ? result.title : "",
+      state: metadata.state,
+      nativeState: metadata.nativeState,
+      runtimeStateTrusted: metadata.agentAvailable,
+      statusSource: metadata.agentAvailable ? "native-runtime" : "stored",
+      updatedAt: metadata.updatedAt,
+      observedAt: result.observedAt,
+      complete: directory.result.complete && result.complete && after.result.complete,
+      latestReply,
+      ...(["REPLY_ABSENT", "REPLY_NO_TEXT"].includes(result.reason) ? { reason: result.reason } : {}),
+    };
   }
   async continueWork() {
     throw fail("DSH_WRITE_DISABLED");

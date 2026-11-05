@@ -29,6 +29,8 @@ function harness(t, handler, options = {}) {
       async close() {},
       async request(method, input) {
         calls.push({ method, input });
+        if (method === "thread/turns/list" && !["notLoaded", "summary", "full"].includes(input.itemsView))
+          throw Object.assign(new Error("unsupported TurnItemsView"), { code: "MANAGED_TEST_INVALID_ITEMS_VIEW" });
         if (handler) {
           const r = await handler(method, input, callbacks);
           if (r !== undefined) return r;
@@ -561,4 +563,60 @@ test("regressed or absent counters are omitted individually, never clamped or gu
   assert.deepEqual(result.turnUsageMissing, ["input", "cached"]);
   assert.equal(result.turnUsageReasons.input, "counter-regressed");
   assert.equal(result.turnUsageReasons.cached, "current-missing");
+});
+
+test("owned refresh uses the native notLoaded view and ignores completion of another active turn", async (t) => {
+  let latest = { id: "another-turn", status: "completed" };
+  const h = harness(t, (method) => (method === "thread/turns/list" ? { data: [latest] } : undefined));
+  await h.executor.createOwnedSession(params);
+  await h.executor.continueOwned({
+    threadId: "owned1",
+    requestId: "read-native-view",
+    text: "inspect",
+    beforeMutation: guard,
+  });
+  const first = await h.executor.readOwned("owned1");
+  assert.equal(first.activeTurnId, "turn1");
+  assert.equal(first.state, "running");
+  latest = { id: "turn1", status: "completed" };
+  const second = await h.executor.readOwned("owned1");
+  assert.equal(second.activeTurnId, null);
+  assert.equal(second.lastCompletion.turnId, "turn1");
+  assert.equal(second.lastCompletion.status, "completed");
+  for (const call of h.calls.filter((c) => c.method === "thread/turns/list"))
+    assert.deepEqual(call.input, { threadId: "owned1", itemsView: "notLoaded", limit: 1, sortDirection: "desc" });
+});
+
+test("native notLoaded cancellation preflight still rejects another active turn and moved project", async (t) => {
+  for (const mismatch of ["turn", "project"]) {
+    let changed = false;
+    const h = harness(t, (method) => {
+      if (method === "thread/read")
+        return {
+          thread: {
+            id: "owned1",
+            projectId: changed && mismatch === "project" ? "other" : "p1",
+            cwd: "/tmp/company",
+            status: { type: "active" },
+          },
+        };
+      if (method === "thread/turns/list")
+        return { data: [{ id: changed && mismatch === "turn" ? "other-turn" : "turn1", status: "inProgress" }] };
+    });
+    await h.executor.createOwnedSession(params);
+    await h.executor.continueOwned({
+      threadId: "owned1",
+      requestId: "cancel-native-view",
+      text: "inspect",
+      beforeMutation: guard,
+    });
+    changed = true;
+    await assert.rejects(h.executor.cancelOwned({ threadId: "owned1", turnId: "turn1", beforeMutation: guard }), {
+      code: mismatch === "turn" ? "MANAGED_TURN_MISMATCH" : "MANAGED_IDENTITY_MISMATCH",
+    });
+    assert.equal(
+      h.calls.some((c) => c.method === "turn/interrupt"),
+      false,
+    );
+  }
 });
