@@ -13,3 +13,6 @@
 - Native tokenUsage.last is one model request. Preserve raw evidence and calculate whole-turn totals from a persisted baseline.
 
 - A successful `py_compile` only proves Python syntax. It did not catch a relay hook referencing `re` without importing it; independent review found the missing global import. Validate extracted pure functions using the candidate deployment script's real namespace, rather than supplying extra test globals that hide missing imports, and then test the actual command classification paths.
+
+- A correct 39-row text inventory was difficult to use on the owner's phone. Start with source groups, fold per-project details, and show identifiers only for disambiguation. User-visible success includes reading and navigation, not just message delivery.
+- Same-name and truncated-name project titles need stable disambiguation even in the static folded view; unique callback IDs alone do not make the UI distinguishable.

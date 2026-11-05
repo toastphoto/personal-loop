@@ -9,6 +9,7 @@ import { parseLoopCommand, handleLoopCommand } from "./feishu-commands.mjs";
 import { failure, safeError } from "./catalog.mjs";
 import { NativeLoopRuntime } from "./loop-runtime.mjs";
 import { startLoopHub } from "./hub-host.mjs";
+import { renderProjectCard } from "./feishu-project-card.mjs";
 
 export function commandText(event) {
   if (typeof event?.content !== "string") return "";
@@ -61,14 +62,31 @@ export function runProgram(program, args, { input = "", timeoutMs = 30000 } = {}
     child.stdin.end(input);
   });
 }
+// Persist the final display payload with the command result, before any delivery attempt.
+export function projectReply(result, config) {
+  if (
+    config.projectCards?.enabled !== true ||
+    result.ok !== true ||
+    !["project-directory", "project-status"].includes(result.view?.kind)
+  )
+    return result.text;
+  // Native folding works without callbacks. Do not publish unverified server-side buttons.
+  return { type: "interactive", card: renderProjectCard(result.view, undefined, { interactive: false }) };
+}
+
 export async function larkReply(config, item, execute = runProgram) {
   if (!acceptsCommand(item.event, config) || item.id !== item.event.message_id) throw failure("REPLY_SCOPE_MISMATCH");
-  if (
-    typeof item.response !== "string" ||
-    Buffer.byteLength(item.response) > 24000 ||
-    !/^[A-Za-z0-9_-]{1,50}$/.test(item.deliveryKey)
-  )
-    throw failure("INVALID_REPLY");
+  const card = item.response?.type === "interactive" ? item.response.card : null;
+  let input;
+  if (typeof item.response === "string") {
+    if (Buffer.byteLength(item.response) > 24000) throw failure("INVALID_REPLY");
+    input = item.response;
+  } else {
+    if (!card || card.schema !== "2.0" || !Array.isArray(card.body?.elements)) throw failure("INVALID_REPLY");
+    input = JSON.stringify(card);
+    if (Buffer.byteLength(input) > 28000) throw failure("INVALID_REPLY");
+  }
+  if (!/^[A-Za-z0-9_-]{1,50}$/.test(item.deliveryKey)) throw failure("INVALID_REPLY");
   const result = await execute(
     config.larkCommand ?? "lark-cli",
     [
@@ -82,10 +100,9 @@ export async function larkReply(config, item, execute = runProgram) {
       item.deliveryKey,
       "--as",
       "bot",
-      "--text",
-      "-",
+      ...(card ? ["--msg-type", "interactive", "--content", "-"] : ["--text", "-"]),
     ],
-    { input: item.response, timeoutMs: 30000 },
+    { input, timeoutMs: 30000 },
   );
   if (result.exitCode !== 0) throw failure("REPLY_UNCONFIRMED");
   let body;
@@ -164,7 +181,7 @@ export class FeishuLoopRelay {
             syncRules: this.syncRules,
             answerCard: this.answerCard,
           });
-        this.queue.saveResult(item.id, result, result.text);
+        this.queue.saveResult(item.id, result, projectReply(result, this.config));
       } catch (error) {
         this.queue.markFailure(item.id, "handling", safeError(error), { retryAfterMs: this.config.retryMs ?? 15000 });
       }

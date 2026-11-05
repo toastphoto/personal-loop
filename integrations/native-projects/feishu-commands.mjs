@@ -126,6 +126,62 @@ function executionLabel(project) {
   return "";
 }
 
+// Structured views contain display data only. The renderer owns markup escaping.
+const viewText = (value, max) =>
+  [...(typeof value === "string" ? value : "").replace(/[\p{Cc}\u2028\u2029]/gu, " ")].slice(0, max).join("");
+
+function projectDisplayView(project, control, { available, providerStatus } = {}) {
+  const caps = project.capabilities ?? {};
+  const execution =
+    available === false || project.stored === true || providerStatus === "unavailable"
+      ? "unavailable"
+      : caps.startOwned === true && caps.continuationMode === "managed-read-only"
+        ? "managed-read-only"
+        : caps.continue === true || caps.startOwned === true
+          ? "native"
+          : caps.read === true
+            ? "read-only"
+            : "unavailable";
+  const objective = viewText(control?.objective, 500);
+  return {
+    alias: projectAlias(project),
+    name: viewText(project.name, 140),
+    provider: project.provider,
+    mode: Object.hasOwn(MODES, control?.mode) ? control.mode : "manual",
+    revision: Number.isSafeInteger(control?.revision) && control.revision >= 0 ? control.revision : 0,
+    execution,
+    ...(objective.trim() ? { objective } : {}),
+    ...(Number.isSafeInteger(control?.maxSteps) && control.maxSteps >= 1 && control.maxSteps <= 100
+      ? { maxSteps: control.maxSteps }
+      : {}),
+  };
+}
+
+export function projectDirectoryView(overview, controls) {
+  const current = Array.isArray(overview?.projects) ? overview.projects : [];
+  const existing = new Set(current.map((p) => p.key));
+  const stored = storedProjects(controls).filter((p) => !existing.has(p.key));
+  const providers = (Array.isArray(overview?.providers) ? overview.providers : [])
+    .filter((entry) => Object.hasOwn(PROVIDERS, entry?.provider))
+    .map((entry) => ({
+      provider: entry.provider,
+      status: entry.status === "connected" ? "connected" : "unavailable",
+      complete: entry.status === "connected" && entry.complete === true,
+    }));
+  const statuses = new Map(providers.map((entry) => [entry.provider, entry.status]));
+  const aliases = new Set();
+  const projects = [...current, ...stored].map((project) => {
+    const row = projectDisplayView(project, controls?.get?.(project.key), {
+      available: existing.has(project.key),
+      providerStatus: statuses.get(project.provider),
+    });
+    if (aliases.has(row.alias)) throw failure("PROJECT_TARGET_AMBIGUOUS");
+    aliases.add(row.alias);
+    return row;
+  });
+  return { kind: "project-directory", complete: overview?.complete === true, providers, projects };
+}
+
 export function formatProjects(overview, controls) {
   const current = Array.isArray(overview?.projects) ? overview.projects : [];
   const existing = new Set(current.map((p) => p.key));
@@ -265,6 +321,7 @@ export async function handleLoopCommand(
           changed: false,
           complete: overview.complete === true,
           text: formatProjects(overview, controls),
+          view: projectDirectoryView(overview, controls),
         };
       project = findProject(command.target, [...storedProjects(controls), ...(overview.projects ?? [])]);
       if (!project && ["pause", "status"].includes(action)) {
@@ -287,6 +344,13 @@ export async function handleLoopCommand(
         mode: before.mode,
         revision: before.revision,
         text: statusText(project, before),
+        view: {
+          kind: "project-status",
+          project: projectDisplayView(project, before, {
+            available: (overview?.projects ?? []).some((entry) => entry.key === project.key),
+            providerStatus: overview?.providers?.find((entry) => entry.provider === project.provider)?.status,
+          }),
+        },
       };
     if (action === "enable") {
       if (typeof command.objective !== "string" || !command.objective.trim() || command.objective.length > 5000)

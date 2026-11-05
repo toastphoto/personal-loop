@@ -89,6 +89,16 @@ Names must match exactly; ambiguous names require provider qualification or the 
 
 `plugins/feishu-group-text/` implements the existing hub channel protocol with plain text, one-based choices and edits to the original notification. It does not create another event listener or send interactive cards. A stable per-hub `deliveryNamespace` is required for cross-hub idempotency. Group answers use the existing hub's decision mechanism; a pause choice removes that project's rule before answering.
 
+## Mobile project cards
+
+Set `projectCards: { "enabled": true }` in the private Feishu relay configuration to reply to `/loop 项目` and `/loop 状态` with Card 2.0. The directory starts with a short summary and three closed source panels; each project expands separately. Default manual mode is explained once, active/paused projects are labelled, and only duplicate titles receive a short stable suffix. Project details and exact command examples are inside the folds.
+
+The live presentation uses native folding and has no callback buttons or dropdowns. Opening a panel never changes project mode. A pure navigation renderer exists for later callback acceptance, but it is not connected or enabled. Server-side navigation needs the application's `card.action.trigger` callback setting and a real owner event before it can be advertised as working. Do not start another same-app WebSocket or write callback update tokens into the legacy shared queue.
+
+Structured views contain only display fields. The relay saves the complete card before delivery; retries keep the same payload and idempotency key, without repeating project actions. Existing saved text replies remain valid. Card size and element counts are bounded; any omitted entries are explicitly disclosed. All current entries must be checked against the actual rendered directory at deployment time.
+
+The initial mobile layout was accepted by the official CardKit create-entity API using a synthetic 39-project card, without sending it. Reply dry-run and automated tests are separate from real mobile rendering acceptance. The owner confirmed the earlier plain-text group round trip; the new card still needs a real post-deployment query on the phone.
+
 ## Owned Codex execution
 
 `ManagedCodexExecutor` creates and registers a new thread within a verified native project. It never takes ownership of an arbitrary desktop chat. Fresh threads follow the official `thread/start → turn/start` sequence; a restarted empty thread is not silently recreated. Existing owned threads preserve strict project/directory identity.

@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { RelayQueue } from "./relay-queue.mjs";
 import { LoopControls } from "./controls.mjs";
-import { FeishuLoopRelay, commandText, acceptsCommand, larkReply } from "./feishu-relay.mjs";
+import { FeishuLoopRelay, commandText, acceptsCommand, larkReply, projectReply } from "./feishu-relay.mjs";
 
 const config = {
   chatId: "oc_group",
@@ -208,4 +208,114 @@ test("verified display-name mentions and already-compacted text keep the command
     commandText(event("om_1", "@Example BotOther /loop 项目", { mentions: [{ name: "Example Bot" }] })),
     "@Example BotOther /loop 项目",
   );
+});
+
+// A saved card must retry identically without rerunning a query or changing project control.
+test("a native project card is fixed before delivery and uses interactive stdin", async () => {
+  const result = {
+    ok: true,
+    text: "legacy",
+    view: {
+      kind: "project-directory",
+      complete: true,
+      providers: [{ provider: "codex", status: "connected", complete: true }],
+      projects: [
+        {
+          alias: "C-1234567890",
+          name: "Mobile project",
+          provider: "codex",
+          mode: "manual",
+          execution: "read-only",
+          revision: 0,
+        },
+      ],
+    },
+  };
+  const response = projectReply(result, { projectCards: { enabled: true } });
+  assert.equal(response.type, "interactive");
+  assert.equal(response.card.schema, "2.0");
+  assert.equal(JSON.stringify(response).includes('"callback"'), false);
+  assert.equal(projectReply(result, {}), "legacy");
+  assert.equal(projectReply({ ok: false, text: "error" }, { projectCards: { enabled: true } }), "error");
+  const calls = [];
+  const item = { id: "om_source", deliveryKey: "plr_card", event: event("om_source", "/loop 项目"), response };
+  for (let n = 0; n < 2; n++)
+    await larkReply(config, item, async (program, args, options) => {
+      calls.push({ args, input: options.input });
+      return {
+        exitCode: 0,
+        stdout: JSON.stringify({ ok: true, data: { message_id: "om_card", chat_id: "oc_group" } }),
+      };
+    });
+  assert.deepEqual(calls[0], calls[1]);
+  assert.deepEqual(calls[0].args.slice(-6), ["--as", "bot", "--msg-type", "interactive", "--content", "-"]);
+  assert.deepEqual(JSON.parse(calls[0].input), response.card);
+});
+test("card publication rejects malformed, oversized and cross-group responses", async () => {
+  const item = { id: "om_source", deliveryKey: "plr_card", event: event("om_source", "/loop 项目") };
+  let writes = 0;
+  const execute = async () => {
+    writes++;
+    return { exitCode: 0, stdout: JSON.stringify({ ok: true, data: { message_id: "om_card", chat_id: "oc_other" } }) };
+  };
+  for (const response of [
+    { type: "interactive", card: { schema: "1.0" } },
+    { type: "interactive", card: { schema: "2.0", body: { elements: [] }, extra: "x".repeat(30000) } },
+    { type: "other", card: {} },
+  ])
+    await assert.rejects(larkReply(config, { ...item, response }, execute), { code: "INVALID_REPLY" });
+  assert.equal(writes, 0);
+  const response = { type: "interactive", card: { schema: "2.0", body: { elements: [] } } };
+  await assert.rejects(larkReply(config, { ...item, response }, execute), { code: "REPLY_UNCONFIRMED" });
+  assert.equal(writes, 1);
+});
+test("project-card retries preserve the saved view and never activate a project", async (t) => {
+  const directory = mkdtempSync(path.join(tmpdir(), "loop-card-retry-"));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const queuePath = path.join(directory, "events.ndjson");
+  writeFileSync(queuePath, "");
+  const queue = new RelayQueue(path.join(directory, "queue.db"));
+  t.after(() => queue.close());
+  const controls = new LoopControls(path.join(directory, "modes.json"));
+  let reads = 0;
+  const p = {
+    key: "codex:local:p",
+    provider: "codex",
+    host: "local",
+    nativeId: "p",
+    name: "First name",
+    capabilities: { read: true, continue: false },
+  };
+  const catalog = {
+    refresh: async () => {
+      reads++;
+      return { projects: [p], providers: [], complete: true };
+    },
+  };
+  const responses = [];
+  let fails = true;
+  const relay = new FeishuLoopRelay(
+    { ...config, queuePath, retryMs: 0, projectCards: { enabled: true } },
+    {
+      queue,
+      controls,
+      catalog,
+      reply: async (item) => {
+        responses.push(item.response);
+        if (fails) throw new Error("offline");
+        return "om_card";
+      },
+    },
+  );
+  await relay.tick();
+  appendFileSync(queuePath, JSON.stringify(event("om_card_query", "/loop 项目")) + "\n");
+  await relay.tick();
+  assert.equal(queue.get("om_card_query").response.type, "interactive");
+  p.name = "Changed after saved response";
+  fails = false;
+  await relay.tick();
+  assert.deepEqual(responses[0], responses[1]);
+  assert.equal(reads, 1);
+  assert.equal(controls.get(p.key).mode, "manual");
+  assert.equal(queue.get("om_card_query").state, "replied");
 });

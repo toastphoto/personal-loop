@@ -6,6 +6,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { LoopControls } from "./controls.mjs";
+import * as commandViews from "./feishu-commands.mjs";
 import { projectKey } from "./catalog.mjs";
 import { parseLoopCommand, projectAlias, formatProjects, handleLoopCommand } from "./feishu-commands.mjs";
 
@@ -527,4 +528,139 @@ test("catalogue-time changes to another project do not block the selected projec
   assert.equal(result.ok, true);
   assert.equal(ctx.controls.get(a.key).mode, "active");
   assert.equal(ctx.controls.get(b.key).mode, "paused");
+});
+
+test("project directory view minimizes native data and leaves markup escaping to the renderer", () => {
+  const project = {
+    ...makeProject("codex", "PRIVATE_NATIVE_ID", "<原生标题>\n" + "名".repeat(150)),
+    roots: ["/private/internal/root"],
+    credentials: { token: "PRIVATE_CREDENTIAL" },
+    preview: "PRIVATE_CHAT_BODY",
+    nativeState: { details: "PRIVATE_NATIVE_STATE" },
+  };
+  const controls = {
+    list: () => [],
+    get: () => ({ mode: "active", revision: 7, objective: "目标\n<保留原字>", maxSteps: 3, actor: "PRIVATE_ACTOR" }),
+  };
+  const view = commandViews.projectDirectoryView(
+    {
+      complete: true,
+      projects: [project],
+      providers: [
+        {
+          provider: "codex",
+          status: "connected",
+          complete: true,
+          error: "PRIVATE_ERROR",
+          endpoint: "PRIVATE_ENDPOINT",
+        },
+      ],
+    },
+    controls,
+  );
+  assert.deepEqual(Object.keys(view).sort(), ["complete", "kind", "projects", "providers"]);
+  assert.equal(view.kind, "project-directory");
+  assert.equal(view.complete, true);
+  assert.deepEqual(view.providers, [{ provider: "codex", status: "connected", complete: true }]);
+  const row = view.projects[0];
+  assert.deepEqual(Object.keys(row).sort(), [
+    "alias",
+    "execution",
+    "maxSteps",
+    "mode",
+    "name",
+    "objective",
+    "provider",
+    "revision",
+  ]);
+  assert.equal(row.execution, "native");
+  assert.equal(row.revision, 7);
+  assert.equal(row.mode, "active");
+  assert.ok(row.name.startsWith("<原生标题>"));
+  assert.ok([...row.name].length <= 140);
+  assert.ok(!/[\p{Cc}\u2028\u2029]/u.test(row.name));
+  assert.equal(row.objective, "目标 <保留原字>");
+  const serialized = JSON.stringify(view);
+  for (const privateValue of [
+    "PRIVATE_NATIVE_ID",
+    "/private/internal/root",
+    "PRIVATE_CREDENTIAL",
+    "PRIVATE_CHAT_BODY",
+    "PRIVATE_NATIVE_STATE",
+    "PRIVATE_ACTOR",
+    "PRIVATE_ERROR",
+    "PRIVATE_ENDPOINT",
+    "projectKey",
+    "nativeId",
+    "roots",
+    "credentials",
+  ])
+    assert.ok(!serialized.includes(privateValue), privateValue);
+});
+
+test("directory aliases stay unique for same-named projects across providers and hosts", () => {
+  const projects = [
+    makeProject("codex", "one"),
+    makeProject("multica", "one"),
+    { ...makeProject("codex", "one"), host: "other", key: projectKey("codex", "other", "one") },
+  ];
+  const view = commandViews.projectDirectoryView({ complete: true, projects, providers: [] });
+  assert.equal(new Set(view.projects.map((x) => x.alias)).size, 3);
+  assert.ok(view.projects.every((x) => x.name === "同名项目" && x.mode === "manual" && x.revision === 0));
+});
+
+test("directory execution modes distinguish managed read-only, native, read-only, and unavailable", () => {
+  const projects = [
+    {
+      ...makeProject("codex", "managed"),
+      capabilities: { read: true, continue: false, startOwned: true, continuationMode: "managed-read-only" },
+    },
+    makeProject("codex", "native"),
+    makeProject("dsh", "read", "只读项目", false),
+    { ...makeProject("multica", "unavailable"), capabilities: { read: false, continue: false } },
+  ];
+  assert.deepEqual(
+    commandViews.projectDirectoryView({ projects, providers: [], complete: true }).projects.map((x) => x.execution),
+    ["managed-read-only", "native", "read-only", "unavailable"],
+  );
+});
+
+test("offline registered projects remain visible as unavailable and can still be paused", async (t) => {
+  const ctx = setup(t);
+  ctx.controls.set(a.key, "active", { actor: "owner", objective: "原目标", maxSteps: 3, projectName: "原生离线项目" });
+  ctx.catalog.refresh = async () => ({
+    complete: false,
+    projects: [],
+    providers: [{ provider: "codex", status: "unavailable", complete: false, errorCode: "PRIVATE_FAILURE" }],
+  });
+  const result = await handleLoopCommand({ action: "projects" }, ctx);
+  assert.equal(result.ok, true);
+  assert.equal(result.view.complete, false);
+  assert.equal(result.view.projects[0].alias, projectAlias(a));
+  assert.equal(result.view.projects[0].execution, "unavailable");
+  assert.equal(result.view.projects[0].mode, "active");
+  const paused = await handleLoopCommand({ action: "pause", target: projectAlias(a) }, ctx);
+  assert.equal(paused.ok, true);
+  assert.equal(ctx.controls.get(a.key).mode, "paused");
+  const status = await handleLoopCommand({ action: "status", target: projectAlias(a) }, ctx);
+  assert.equal(status.ok, true);
+  assert.equal(status.view.kind, "project-status");
+  assert.equal(status.view.project.mode, "paused");
+  assert.equal(status.view.project.execution, "unavailable");
+});
+
+test("projects and status add matching views without changing original text or control state", async (t) => {
+  const ctx = setup(t, [a]);
+  const overview = await ctx.catalog.refresh();
+  for (const command of [{ action: "projects" }, { action: "status" }]) {
+    const result = await handleLoopCommand(command, ctx);
+    assert.equal(result.text, formatProjects(overview, ctx.controls));
+    assert.deepEqual(result.view, commandViews.projectDirectoryView(overview, ctx.controls));
+    assert.equal(result.changed, false);
+  }
+  const status = await handleLoopCommand({ action: "status", target: projectAlias(a) }, ctx);
+  assert.equal(status.view.kind, "project-status");
+  assert.deepEqual(status.view.project, commandViews.projectDirectoryView(overview, ctx.controls).projects[0]);
+  assert.equal(status.projectKey, a.key);
+  assert.equal(ctx.controls.list().length, 0);
 });

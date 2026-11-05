@@ -14,3 +14,5 @@
 - 2026-11-05: The user explicitly approved the normal DSH Desktop restart and live Feishu deployment. The reviewed Host plugin is installed; Feishu services reached healthy readiness after automatic rollback of two failed attempts and the user's normal system-permission response. Do not reinterpret the earlier approval rejection as a continuing lack of user authorization.
 - Keep every discovered project manual after installation. Three-provider catalogue access and healthy services do not authorize starting arbitrary goals or prove real group message delivery. Reassess activation only for a concrete selected objective and its acceptance evidence.
 - Preserve readiness failures and rollback evidence. Respect macOS volume authorization; do not bypass it. Real group command/response acceptance remains a distinct next check.
+
+- Use native Card 2.0 folding for the mobile project directory now. Hide technical identifiers until needed and distinguish duplicate names. Native expansion is view-only; callbacks are a separate deployment/acceptance step. Reassess pagination/search once the existing application's callback route is verified.
