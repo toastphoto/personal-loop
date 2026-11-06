@@ -389,7 +389,13 @@ export async function handleLoopCommand(
       requestId,
       expectedRevision: before.revision,
       ...(!project.stored || project.nameTrusted === true ? { projectName: project.name } : {}),
-      ...(action === "enable" ? { objective: command.objective.trim(), maxSteps: command.maxSteps ?? 3 } : {}),
+      ...(action === "enable"
+        ? {
+            objective: command.objective.trim(),
+            maxSteps: command.maxSteps ?? 3,
+            ...(command.expectedThreadId && { expectedThreadId: command.expectedThreadId }),
+          }
+        : {}),
     });
     const current = controls.get(project.key);
     if (current.revision !== next.revision || current.mode !== next.mode) {

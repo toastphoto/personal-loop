@@ -173,6 +173,7 @@ export async function runManagedWorker(
         throw failure("BOUND_ROUTE_INVALID");
       const bound = bindings && Object.hasOwn(bindings, projectKey);
       const binding = bound ? bindings[projectKey] : null;
+      if (goal.expectedThreadId && binding?.threadId !== goal.expectedThreadId) throw failure("BOUND_ROUTE_INVALID");
       if (
         bound &&
         (!coordinated ||

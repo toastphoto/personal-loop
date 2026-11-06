@@ -106,7 +106,12 @@ export function coordinatorStage({ history, context, goal, subject }) {
         context.events.some((e) => e.type === "card.answered" && e.id === "card:" + a.card),
     );
     if (answers.length !== 1) return null;
-    return { role: "worker", plan: prior.plan ?? plan, chosen: answers[0].options[answers[0].choice] };
+    return {
+      role: "worker",
+      plan: prior.plan ?? plan,
+      chosen: answers[0].options[answers[0].choice],
+      ...(prior.turnId && { chosenQuestion: ask.title }),
+    };
   }
   if (
     prior.action === "dispatch" &&

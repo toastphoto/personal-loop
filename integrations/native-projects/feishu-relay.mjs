@@ -139,7 +139,7 @@ export class FeishuLoopRelay {
     return true;
   }
   async acceptGoal(item, goal) {
-    const { projectKey, name, objective } = goal;
+    const { projectKey, name, objective, threadId, chatTitle } = goal;
     const before = this.controls.get(projectKey);
     const prior = this.controls.read().requests?.[item.requestId]?.result;
     const reply = (text) => ({ ok: false, action: "natural-goal", changed: false, text });
@@ -148,13 +148,25 @@ export class FeishuLoopRelay {
     if (before.mode === "paused") return reply("这个项目已暂停。要继续时，请在项目卡里确认恢复或设置新目标。");
     if (before.mode === "active" && !prior)
       return reply("这个项目已有目标在推进。可在项目卡查看进展或暂停，再设置新目标。");
-    if (!this.canCoordinate(projectKey)) return reply("这个项目的协调入口还未就绪，这次没有启动。");
+    if (!this.canCoordinate(projectKey, threadId)) return reply("这个项目的协调入口还未就绪，这次没有启动。");
     if (!this.cards?.enabled?.() || !this.syncRules) return reply("群里的决策按钮还未就绪，这次没有启动。");
-    const authorized = () =>
-      directGoalRequest(item.event, readRouting(this.config.naturalRoutingFile), commandText(item.event))
-        ?.projectKey === projectKey;
+    const authorized = () => {
+      const current = directGoalRequest(
+        item.event,
+        readRouting(this.config.naturalRoutingFile),
+        commandText(item.event),
+      );
+      return current?.projectKey === projectKey && current.threadId === threadId && current.chatTitle === chatTitle;
+    };
     const result = await handleLoopCommand(
-      { action: "enable", target: projectKey, objective, maxSteps: 3, expectedRevision: before.revision },
+      {
+        action: "enable",
+        target: projectKey,
+        objective,
+        maxSteps: 3,
+        expectedRevision: before.revision,
+        ...(threadId && { expectedThreadId: threadId }),
+      },
       {
         catalog: {
           refresh: async () => {
@@ -187,6 +199,19 @@ export class FeishuLoopRelay {
               )
             )
               throw failure("DIRECT_GOAL_SCOPE_CHANGED");
+            if (threadId) {
+              const backend = this.catalog.connectors?.[provider];
+              const listed =
+                matches[0].capabilities?.queueBound && backend && (await backend.listWork(matches[0].nativeId));
+              const byTitle = listed?.items?.filter((row) => row.title === chatTitle);
+              if (
+                listed?.complete !== true ||
+                byTitle?.length !== 1 ||
+                byTitle[0].nativeId !== threadId ||
+                byTitle[0].projectId !== matches[0].nativeId
+              )
+                throw failure("DIRECT_GOAL_SCOPE_CHANGED");
+            }
             return directory;
           },
         },
@@ -195,7 +220,8 @@ export class FeishuLoopRelay {
         requestId: item.requestId,
         readiness: async (...args) => {
           const ready = await this.readiness(...args);
-          if (!authorized() || !this.cards.enabled() || !this.canCoordinate(projectKey)) return { ready: false };
+          if (!authorized() || !this.cards.enabled() || !this.canCoordinate(projectKey, threadId))
+            return { ready: false };
           return ready;
         },
         syncRules: this.syncRules,
@@ -351,7 +377,10 @@ async function main() {
     cards,
     ...(runtime
       ? {
-          canCoordinate: (key) =>
+          canCoordinate: (key, threadId) =>
+            (!threadId ||
+              (native.managedCodex?.boundChats?.[key]?.threadId === threadId &&
+                readConfig(config.nativeConfigFile).managedCodex?.boundChats?.[key]?.threadId === threadId)) &&
             Array.isArray(native.managedCodex?.coordinatorProjectKeys) &&
             native.managedCodex.coordinatorProjectKeys.includes(key) &&
             !!runtime.layout().decisionChannel(config.profile, config.chatId),

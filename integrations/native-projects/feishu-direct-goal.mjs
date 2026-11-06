@@ -9,6 +9,19 @@ const notAnAssignment = [
   /(?:暂停|恢复|启用|启动)(?:这个|该|全部|所有)项目|(?:等我|等下次)(?:确认|同意|通知|说了)(?:以后|后)?再(?:做|开始|执行|启动)/u,
 ];
 
+function currentChat(entry, event) {
+  const chat = entry.boundChat;
+  if (
+    typeof chat?.title !== "string" ||
+    !chat.title.trim() ||
+    chat.title.length > 160 ||
+    !/^[\da-f]{8}(?:-[\da-f]{4}){3}-[\da-f]{12}$/iu.test(chat.threadId ?? "") ||
+    !(Date.parse(chat.enabledAt) <= Number(event.create_time))
+  )
+    return null;
+  return chat;
+}
+
 export function directGoalRequest(event, routing, text) {
   if (
     routing?.enabled !== true ||
@@ -28,8 +41,8 @@ export function directGoalRequest(event, routing, text) {
     text.length > 1100
   )
     return null;
-  const line = text.trim().replace(/^(?:请|麻烦你?|劳烦你?)\s*/u, "");
-  const targets = routing.directGoalProjects.filter((entry) => {
+  const line = text.trim().replace(/^(?:请你?|麻烦你?|劳烦你?)\s*/u, "");
+  const eligible = routing.directGoalProjects.filter((entry) => {
     if (
       !entry ||
       typeof entry.projectKey !== "string" ||
@@ -39,34 +52,88 @@ export function directGoalRequest(event, routing, text) {
       !(Date.parse(entry.enabledAt) <= Number(event.create_time))
     )
       return false;
-    return line.includes(entry.name);
+    return true;
   });
-  if (targets.length !== 1) return null;
-  const { name, projectKey } = targets[0];
-  // Isolate the exact named target before interpreting its objective; a quote around the project name is valid.
-  const head = line.replace(/^(?:请你|我想让|帮我给|帮我为|帮我把|帮|给|为|让|把)\s*/u, "");
-  const target = [name, "「" + name + "」", "《" + name + "》", "“" + name + "”"].find((n) => head.startsWith(n));
-  if (
-    !target ||
-    routing.projectNames.some(
-      (n) => typeof n === "string" && n.length > name.length && n.includes(name) && head.startsWith(n),
+  const continuation = /^(?:帮我|替我|请你|请)?(?:接着|继续|接回|接手|沿用)\s*/u.exec(line);
+  let entry, tail, boundChat;
+  if (continuation) {
+    const addressed = line.slice(continuation[0].length);
+    const matches = eligible.flatMap((p) => {
+      const c = currentChat(p, event);
+      if (!c) return [];
+      const title = [c.title, "「" + c.title + "」", "《" + c.title + "》", "“" + c.title + "”"].find((t) =>
+        addressed.startsWith(t),
+      );
+      if (!title) return [];
+      const rest = addressed.slice(title.length);
+      const boundary = /^\s*(?:(?:这|那)条)?(?:原|主)?(?:对话|聊天|会话)\s*[，,:：。]?\s*|^\s*[，,:：]\s*/u.exec(rest);
+      return boundary ? [{ entry: p, tail: rest.slice(boundary[0].length) }] : [];
+    });
+    if (matches.length !== 1) return null;
+    ({ entry, tail } = matches[0]);
+    boundChat = entry.boundChat;
+  } else {
+    const targets = eligible.filter((p) => line.includes(p.name));
+    if (targets.length !== 1) return null;
+    entry = targets[0];
+    const { name } = entry;
+    // Only the exact approved target can precede the assignment, optionally in title quotes.
+    const head = line.replace(/^(?:请你|我想让|帮我给|帮我为|帮我把|帮|给|为|让|把)\s*/u, "");
+    const target = [name, "「" + name + "」", "《" + name + "》", "“" + name + "”"].find((n) => head.startsWith(n));
+    if (
+      !target ||
+      routing.projectNames.some(
+        (n) => typeof n === "string" && n.length > name.length && n.includes(name) && head.startsWith(n),
+      )
     )
-  )
-    return null;
-  let tail = head
-    .slice(target.length)
-    .trim()
-    .replace(/^[，,:：]\s*/u, "");
+      return null;
+    tail = head
+      .slice(target.length)
+      .trim()
+      .replace(/^[，,:：]\s*/u, "");
+  }
+  const { name, projectKey } = entry;
   const declared = /^(?:的)?(?:我(?:们)?的)?(?:本次|这次)?目标(?:是|为|[：:])\s*/u.exec(tail);
   if (declared) tail = tail.slice(declared[0].length).trim();
   const objective = tail.replace(/^(?:请你|请|麻烦你?|帮我|替我)\s*/u, "").trim();
+  // A project-prefixed request can also name the destination chat. Never ignore a conflicting or unclear destination.
+  const destinationMentions = [
+    ...objective.matchAll(
+      /(?:接着|接回|接手|沿用|继续|切到|转到|交给|改用)\s*([^。！？，,；;]{1,190}?)(?:(?:这|那)条)?(?:原|主)?(?:对话|聊天|会话)/gu,
+    ),
+  ];
+  const quotedChats = [
+    ...objective.matchAll(
+      /(「[^」]{1,160}」|《[^》]{1,160}》|“[^”]{1,160}”)\s*(?:(?:这|那)(?:条|个))?(?:原|主)?(?:对话|聊天|会话)/gu,
+    ),
+  ];
+  if (destinationMentions.length || quotedChats.length) {
+    const chat = currentChat(entry, event);
+    const allowedTitles = chat && [
+      chat.title,
+      "「" + chat.title + "」",
+      "《" + chat.title + "》",
+      "“" + chat.title + "”",
+    ];
+    if (!allowedTitles || [...destinationMentions, ...quotedChats].some((m) => !allowedTitles.includes(m[1].trim())))
+      return null;
+    boundChat = chat;
+  }
   // An explicitly stated goal can describe the intended outcome in the owner's own words.
   const vagueOrDeferred =
     /^(?:随便|随意|随缘|再说|待定|未定|不知道|不确定|先不|暂不|不要|先别|取消|暂停|恢复|启用|启动|据说|转发|转述|他说|她说|听说|如果|怎么|看看[。！!]?\s*$|试试[。！!]?\s*$|\/)/u;
   if (
     objective.length > 1000 ||
     notAnAssignment.some((r) => r.test(objective)) ||
-    (declared ? vagueOrDeferred.test(objective) : !workVerb.test(objective))
+    (declared
+      ? vagueOrDeferred.test(objective)
+      : !(
+          workVerb.test(objective) ||
+          (boundChat &&
+            /^把[^。！？?]{2,350}(?:理清楚|梳理清楚|列清楚|梳理出来|整理出来|列出来|说清楚|讲清楚)(?:[。，；,.!！]|$)/u.test(
+              objective,
+            ))
+        ))
   )
     return null;
   const detail = objective
@@ -78,5 +145,10 @@ export function directGoalRequest(event, routing, text) {
     routing.projectNames?.some((n) => typeof n === "string" && n.length >= 2 && n !== name && objective.includes(n))
   )
     return null;
-  return { projectKey, name, objective };
+  return {
+    projectKey,
+    name,
+    objective,
+    ...(boundChat && { threadId: boundChat.threadId, chatTitle: boundChat.title }),
+  };
 }

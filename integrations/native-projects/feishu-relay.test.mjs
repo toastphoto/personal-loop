@@ -498,15 +498,47 @@ test("a named owner goal starts once, preserving pauses, opt-in scope and newer 
   await relay.tick();
   assert.equal(queue.get("om_old").response, "proposal");
   assert.equal(dispatch, 1);
+  const namedChat = {
+    threadId: "25555555-5555-4555-8555-555555555555",
+    title: "主工作聊天",
+    enabledAt: setting.enabledAt,
+  };
+  const namedRoute = { ...route, directGoalProjects: [{ ...setting, boundChat: namedChat }] };
+  writeFileSync(routing, JSON.stringify(namedRoute));
+  p.capabilities = { queueBound: true, continuationMode: "bound-chat" };
+  let chatRows = [
+    { title: namedChat.title, nativeId: namedChat.threadId, projectId: p.nativeId },
+    { title: namedChat.title, nativeId: "other", projectId: p.nativeId },
+  ];
+  relay.catalog.connectors = { codex: { listWork: async () => ({ complete: true, items: chatRows }) } };
+  const namedGoal = "把应用导航每个入口的第一件事理清楚";
+  const originalMessage = { content: "@Bot 接着「" + namedChat.title + "」这条原对话，" + namedGoal };
+  send("om_ambig_chat", originalMessage);
+  await relay.tick();
+  assert.equal(dispatch, 1);
+  chatRows = chatRows.slice(0, 1);
+  send("om_named_chat", originalMessage);
+  await relay.tick();
+  assert.equal(dispatch, 2);
+  assert.equal(controls.get(p.key).expectedThreadId, namedChat.threadId);
+  assert.equal(controls.get(p.key).objective, namedGoal);
+  // Renaming/remapping the authorized title can never fall back to the project's previous owned executor.
+  controls.set(p.key, "manual", { actor: "owner" });
+  relay.canCoordinate = (key, id) => key === p.key && (id === undefined || id === "different");
+  send("om_rebound", originalMessage);
+  await relay.tick();
+  assert.equal(dispatch, 2);
+  p.capabilities = { startOwned: true, continuationMode: "managed-read-only" };
+  writeFileSync(routing, JSON.stringify(route));
   duringReady = () => controls.set(p.key, "paused", { actor: "owner" });
   send("om_race");
   await relay.tick();
   assert.equal(controls.get(p.key).mode, "paused");
-  assert.equal(dispatch, 1);
+  assert.equal(dispatch, 2);
   duringReady = () => writeFileSync(routing, JSON.stringify({ ...route, directGoalProjects: [] }));
   controls.set(p.key, "manual", { actor: "owner" });
   send("om_revoked");
   await relay.tick();
   assert.equal(controls.get(p.key).mode, "manual");
-  assert.equal(dispatch, 1);
+  assert.equal(dispatch, 2);
 });

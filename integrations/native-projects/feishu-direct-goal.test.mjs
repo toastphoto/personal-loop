@@ -90,3 +90,61 @@ test("the authenticated mention and message creation time must be in the authori
     assert.equal(parse("示例工作台，整理第一次试用清单", event, { ...routing, ...opts }), null);
   }
 });
+
+test("an exact fresh bound chat can receive an actual instruction without being confused with quoted or ambiguous material", () => {
+  const chat = {
+    title: "设计示例培训",
+    threadId: "22222222-2222-4222-8222-222222222222",
+    enabledAt: "2026-09-01T00:00:00Z",
+  };
+  const r = { ...routing, directGoalProjects: [{ ...allowed, boundChat: chat }] };
+  const task =
+    "把完整 App 的导航和每个入口进来能做的第一件事理清楚。需要我拍板时给我选项和推荐理由，我点完接着做，别再开新对话。";
+  const cmd = "接着「设计示例培训」这条原对话，" + task;
+  assert.deepEqual(parse(cmd, event, r), {
+    projectKey: allowed.projectKey,
+    name: allowed.name,
+    objective: task,
+    chatTitle: chat.title,
+    threadId: chat.threadId,
+  });
+  assert.equal(parse(cmd, { ...event, create_time: "1767302400000" }, r), null);
+  assert.equal(
+    parse(cmd, event, {
+      ...r,
+      directGoalProjects: [
+        ...r.directGoalProjects,
+        {
+          ...allowed,
+          name: "第二项目",
+          projectKey: "codex:local:b",
+          boundChat: { ...chat, threadId: "33333333-3333-4333-8333-333333333333" },
+        },
+      ],
+    }),
+    null,
+  );
+  for (const s of [
+    "接着「设计示例」这条原对话，" + task,
+    "接着「设计示例培训」这条原对话，进展如何",
+    "请解释一下：" + cmd,
+    "“" + cmd + "”",
+    "接着「设计示例培训」这条原对话，" + task + "只是转述",
+    "接着「设计示例培训」这条原对话，先别执行",
+    "接着「设计示例培训」这条原对话，把另一个工作台的资料理清楚",
+  ])
+    assert.equal(parse(s, event, r), null, s);
+});
+
+test("an explicit trailing conversation reference must agree with the selected project's current binding", () => {
+  const title = "设计示例培训",
+    threadId = "22222222-2222-4222-8222-222222222222",
+    chat = { title, threadId, enabledAt: allowed.enabledAt };
+  const cfg = { ...routing, directGoalProjects: [{ ...allowed, boundChat: chat }] };
+  const ask = (target) =>
+    "示例工作台，帮我梳理导航，接着「" + target + "」这条原对话做。需要我拍板时给选项和推荐理由。";
+  assert.equal(parse(ask(title), event, cfg)?.threadId, threadId);
+  assert.equal(parse(ask("另外一个"), event, cfg), null);
+  assert.equal(parse("示例工作台，整理导航，在「另外一个」这条原对话做。", event, cfg), null);
+  assert.equal(parse(ask(title), event, routing), null);
+});

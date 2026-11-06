@@ -37,6 +37,8 @@ export function routeProjectMessage(event, routing = {}) {
   if (directGoalRequest(event, routing, text)) return "loop";
   const terms = [
     "项目",
+    "原对话",
+    "主对话",
     "目标",
     "暂停",
     "恢复",
@@ -52,7 +54,10 @@ export function routeProjectMessage(event, routing = {}) {
     "能做什么",
     "会做什么",
   ];
-  const names = Array.isArray(routing.projectNames) ? routing.projectNames : [];
+  const names = [
+    ...(Array.isArray(routing.projectNames) ? routing.projectNames : []),
+    ...(Array.isArray(routing.directGoalProjects) ? routing.directGoalProjects.map((p) => p?.boundChat?.title) : []),
+  ];
   return terms.some((t) => text.includes(t)) ||
     names.some((n) => typeof n === "string" && n.length >= 2 && text.includes(n)) ||
     /\b[CMD]-[a-f0-9]{10}\b/i.test(text)

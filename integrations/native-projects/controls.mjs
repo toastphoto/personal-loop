@@ -32,7 +32,11 @@ export class LoopControls {
     if (goal.deadline && Date.parse(goal.deadline) <= Date.now()) throw failure("LOOP_DEADLINE_REACHED");
     return goal;
   }
-  set(key, mode, { actor, expectedRevision, objective, maxSteps, deadline, requestId, projectName } = {}) {
+  set(
+    key,
+    mode,
+    { actor, expectedRevision, objective, maxSteps, deadline, requestId, projectName, expectedThreadId } = {},
+  ) {
     if (!["manual", "active", "paused"].includes(mode) || typeof key !== "string" || !key || !actor)
       throw failure("INVALID_MODE_CHANGE");
     mkdirSync(path.dirname(this.file), { recursive: true, mode: 0o700 });
@@ -55,7 +59,17 @@ export class LoopControls {
         if (typeof requestId !== "string" || !/^[A-Za-z0-9_.:-]{1,512}$/.test(requestId))
           throw failure("INVALID_CONTROL_REQUEST");
         requestHash = createHash("sha256")
-          .update(JSON.stringify([key, mode, actor, objective ?? null, maxSteps ?? null, deadline ?? null]))
+          .update(
+            JSON.stringify([
+              key,
+              mode,
+              actor,
+              objective ?? null,
+              maxSteps ?? null,
+              deadline ?? null,
+              ...(expectedThreadId ? [expectedThreadId] : []),
+            ]),
+          )
           .digest("hex");
         const previous = data.requests?.[requestId];
         if (previous) {
@@ -77,6 +91,8 @@ export class LoopControls {
       if (typeof projectName === "string" && projectName.trim()) next.projectName = projectName.slice(0, 500);
       if (objective !== undefined) {
         next.objective = objective;
+        if (expectedThreadId) next.expectedThreadId = expectedThreadId;
+        else delete next.expectedThreadId;
         if (mode === "active") next.goalRevision = next.revision;
       }
       if (mode === "active" && requestId !== undefined) {
