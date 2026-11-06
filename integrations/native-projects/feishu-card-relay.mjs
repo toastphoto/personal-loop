@@ -43,8 +43,8 @@ export async function patchProjectCard(config, response, execute) {
   return response.messageId;
 }
 export class FeishuCardRelay {
-  constructor(config, { queue, controller, execute }) {
-    Object.assign(this, { config, queue, controller, execute });
+  constructor(config, { queue, controller, execute, answerDecisionClick }) {
+    Object.assign(this, { config, queue, controller, execute, answerDecisionClick });
   }
   async tick() {
     const ingest = this.queue.ingest(this.config.queuePath, {
@@ -58,6 +58,41 @@ export class FeishuCardRelay {
       }
       try {
         const data = JSON.parse(item.event.content);
+        let action;
+        try {
+          action = JSON.parse(data.actionValue);
+        } catch {
+          /* Navigation and form callbacks may have no value. */
+        }
+        if (action && Object.hasOwn(action, "personalLoopDecision")) {
+          if (
+            !this.answerDecisionClick ||
+            action.personalLoopDecision !== 1 ||
+            data.host !== "im_message" ||
+            data.actionTag !== "button" ||
+            !/^om_[A-Za-z0-9_-]{1,160}$/.test(data.cardMessageId ?? "") ||
+            !Number.isSafeInteger(action.card) ||
+            action.card < 1 ||
+            !Number.isSafeInteger(action.version) ||
+            action.version < 1 ||
+            !Number.isSafeInteger(action.choice) ||
+            action.choice < 0
+          )
+            throw failure("CARD_ACTION_INVALID");
+          const result = await this.answerDecisionClick({
+            cardId: action.card,
+            choice: action.choice,
+            version: action.version,
+            actor: item.event.sender_id,
+            messageId: data.cardMessageId,
+            requestId: item.requestId,
+            profile: this.config.profile,
+            chatId: this.config.chatId,
+          });
+          if (!result?.ok) this.queue.discard(item.id, result?.code ?? "CARD_ACTION_INVALID");
+          else this.queue.saveResult(item.id, { ok: true }, { type: "hub-decision" });
+          continue;
+        }
         const response = await this.controller.handle({
           ...data,
           actor: item.event.sender_id,
@@ -82,6 +117,11 @@ export class FeishuCardRelay {
     for (const item of this.queue.pendingReplies({ limit: 10 })) {
       if (!acceptsCardEvent(item.event, this.config)) {
         this.queue.discard(item.id, "SCOPE_REVOKED");
+        continue;
+      }
+      // The hub owns decision card revisions and delivers the chosen option and final result.
+      if (item.response?.type === "hub-decision") {
+        this.queue.markReply(item.id, "handled-by-hub");
         continue;
       }
       if (!this.controller.current(item.response)) {

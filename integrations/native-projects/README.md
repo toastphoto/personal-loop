@@ -87,7 +87,7 @@ Names must match exactly; ambiguous names require provider qualification or the 
 
 `feishu-relay.mjs <private-config>` is the live entry. Private config includes `nativeConfigFile`, `queuePath`, `databaseFile`, `statusFile`, `profile`, `chatId`, and `allowedSenderIds`. Prepare with `--once --no-reply` only before activation; do not use it to bypass deployment approval or replay existing history. Successful configuration does not prove real message delivery.
 
-`plugins/feishu-group-text/` implements the existing hub channel protocol with plain text, one-based choices and edits to the original notification. It does not create another event listener or send interactive cards. A stable per-hub `deliveryNamespace` is required for cross-hub idempotency. Group answers use the existing hub's decision mechanism; a pause choice removes that project's rule before answering.
+The group channel uses the existing relay and a stable per-hub `deliveryNamespace`. Text notifications and one-based `/loop 回答` commands remain supported. To send new decision questions as Card 2.0 buttons, enable `interactiveAsks` on the matching private channel and set `interactiveAsksFromId` to the first new card number at rollout. Older messages retain their original format. The existing callback subscriber routes owner clicks through the channel's answer API with the delivered message ID. The hub updates that message and wakes the selected project when the answer is recorded. A pause choice first removes the project's rule.
 
 ## Mobile project cards and owner interaction
 

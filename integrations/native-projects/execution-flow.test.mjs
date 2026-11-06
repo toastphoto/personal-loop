@@ -2,6 +2,7 @@
 // noisy completions, failed attempts replaying stale output, and timers waking a paused project. Only native execution/metadata is substituted.
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { once } from "node:events";
 import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } from "node:fs";
 import path from "node:path";
 import { setup } from "../../tests/helpers.ts";
@@ -17,7 +18,7 @@ const emptyRules = () => ({
   timezone: "Asia/Shanghai",
   sources: { native: { name: "Fixture projects" } },
   agents: {},
-  channels: { fixture: { name: "Local delivery queue only" } },
+  channels: { fixture: { name: "Local delivery queue only", answerers: ["fixture-owner"] } },
   rules: [],
 });
 writeFileSync(rulesFile, JSON.stringify(emptyRules()), { mode: 0o600 });
@@ -46,7 +47,7 @@ function fixture(t, name, replies) {
     capabilities: { continue: true },
   };
   const configFile = path.join(directory, "native.json"),
-    hubFile = path.join(directory, "hub.json");
+    hubFile = path.join(home, name + "-hub.json");
   const config = {
     version: 1,
     providers: {},
@@ -207,6 +208,7 @@ function fixture(t, name, replies) {
     return { job, result, parsed: parsed.result };
   }
   return {
+    hubFile,
     runtime,
     controls,
     projectKey,
@@ -226,6 +228,62 @@ function fixture(t, name, replies) {
 
 test("selected native goals use upstream events, receipts, timers and answers without an extra scheduler", async (t) => {
   t.after(() => hub.db.close());
+  await t.test(
+    "a mobile choice uses the delivered Feishu message and wakes precisely the chosen native branch",
+    async (t) => {
+      const f = fixture(t, "mobile-decision", [
+        () =>
+          receipt("Choose the acceptance scope", {
+            ask: [{ title: "Which scope?", text: "Select one", options: ["Navigation", "Contracts"] }],
+          }),
+        (context) => {
+          assert.equal(context.events[0].type, "card.answered");
+          assert.equal(context.answers[0].options[context.answers[0].choice], "Contracts");
+          return "Contract checklist completed";
+        },
+      ]);
+      const { serve } = await import("../../host/http.ts");
+      const server = serve(0);
+      await once(server, "listening");
+      t.after(() => new Promise((resolve) => server.close(resolve)));
+      const settings = JSON.parse(readFileSync(f.hubFile, "utf8"));
+      settings.url = "http://127.0.0.1:" + server.address().port;
+      settings.channels = {
+        fixture: {
+          use: "feishu-group-text",
+          interactiveAsks: true,
+          interactiveAsksFromId: 1,
+          profile: "test",
+          chatId: "oc_t",
+          key: hub.addKey("channel", "fixture"),
+        },
+      };
+      writeFileSync(f.hubFile, JSON.stringify(settings));
+      await f.enable();
+      await f.executeNext();
+      const ask = f.nextCard();
+      hub.delivered("fixture", ask.id, ask.version, "om_question");
+      assert.equal(await f.executeNext(), null);
+      const click = {
+        cardId: ask.id,
+        version: ask.version,
+        choice: 1,
+        actor: "fixture-owner",
+        profile: "test",
+        chatId: "oc_t",
+        messageId: "om_question",
+        requestId: "click-1",
+      };
+      assert.equal((await f.runtime.answerDecisionClick({ ...click, messageId: "om_other" })).ok, false);
+      assert.equal((await f.runtime.answerDecisionClick(click)).changed, true);
+      assert.equal((await f.runtime.answerDecisionClick(click)).changed, false);
+      f.advance(1);
+      await f.executeNext();
+      assert.equal(f.executions.length, 2);
+      assert.equal(f.executions[0].threadId, f.executions[1].threadId);
+      assert.equal(await f.executeNext(), null);
+    },
+  );
   await t.test("manual does nothing, and plain completion neither notifies nor fills remaining budget", async (t) => {
     const f = fixture(t, "ordinary", [() => "The requested work is complete"]);
     assert.equal(f.controls.get(f.projectKey).mode, "manual");

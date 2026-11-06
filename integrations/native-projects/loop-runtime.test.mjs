@@ -4,6 +4,9 @@ import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { createServer } from "node:http";
+import { DatabaseSync } from "node:sqlite";
+import { digest } from "../../kernel/credentials.ts";
 import { NativeLoopRuntime } from "./loop-runtime.mjs";
 import { LoopControls, subjectFor } from "./controls.mjs";
 import { parseRules } from "../../protocol/rules.ts";
@@ -500,4 +503,211 @@ test("a root mapping changed after readiness cannot retarget the selected projec
   await assert.rejects(f.sync(f.set("active")), { code: "LOOP_READINESS_REQUIRED" });
   assert.equal(f.events.length, 0);
   assert.deepEqual(f.readRules(), f.rules);
+});
+
+async function decisionClickFixture(t, options = {}) {
+  const f = fixture(t);
+  await f.runtime.readiness(f.project);
+  const control = f.set("active");
+  await f.sync(control);
+  const sent = [];
+  const server = createServer(async (req, res) => {
+    const pieces = [];
+    for await (const chunk of req) pieces.push(chunk);
+    sent.push({
+      url: req.url,
+      token: req.headers.authorization,
+      body: JSON.parse(Buffer.concat(pieces).toString()),
+      mode: f.controls.get(f.key).mode,
+    });
+    options.onAnswer?.(f);
+    if (options.fail) res.writeHead(503).end("{}");
+    else res.writeHead(200).end(JSON.stringify({ changed: true, state: "decided" }));
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((r) => server.close(r)));
+  const hc = JSON.parse(readFileSync(f.hubFile, "utf8"));
+  hc.url = "http://127.0.0.1:" + server.address().port;
+  hc.channels = {
+    group: {
+      key: "fixture-channel-key",
+      use: "feishu-group-text",
+      profile: "bot",
+      chatId: "group-one",
+      interactiveAsks: true,
+      interactiveAsksFromId: 7,
+    },
+  };
+  writeFileSync(f.hubFile, JSON.stringify(hc));
+  const db = new DatabaseSync(path.join(f.dir, "hub.db"));
+  t.after(() => db.close());
+  db.exec("CREATE TABLE projections(collection TEXT,key TEXT,data TEXT,PRIMARY KEY(collection,key))");
+  const put = (c, k, d) =>
+    db.prepare("INSERT OR REPLACE INTO projections VALUES(?,?,?)").run(c, String(k), JSON.stringify(d));
+  const raw = f.readRules();
+  raw.channels = { group: { name: "group", answerers: ["owner"] } };
+  f.saveRules(raw);
+  const tgt = f.runtime.desired(f.key, control, f.runtime.layout());
+  const card = {
+    ...decision(f),
+    run_id: 12,
+    agent: tgt.agentId,
+    grp: tgt.ruleName,
+    source: "native",
+    lane: "lane",
+    options: JSON.stringify(options.options ?? ["first", "second"]),
+  };
+  put("keys", "channel:group", { kind: "channel", name: "group", hash: digest(hc.channels.group.key) });
+  put("cards", 7, card);
+  put("runs", 12, {
+    id: 12,
+    rule: tgt.ruleName,
+    agent: tgt.agentId,
+    grp: tgt.ruleName,
+    lane: "lane",
+    rules_version: 4,
+  });
+  put("config", 4, { value: raw, version: 4 });
+  put("config", "rules", { value: raw, version: 4 });
+  const delivery = { card_id: 7, channel: "group", version: 1, ref: "om_message" };
+  put("deliveries", "7:group", delivery);
+  const click = (extra = {}) =>
+    f.runtime.answerDecisionClick({
+      cardId: 7,
+      version: 1,
+      choice: 1,
+      actor: "owner",
+      messageId: "om_message",
+      requestId: "feishu-event-1",
+      profile: "bot",
+      chatId: "group-one",
+      ...extra,
+    });
+  return { ...f, put, card, click, delivery, sent, raw, hc, db };
+}
+
+test("a real group-button answer uses only the channel key, zero-based index and delivered message ID", async (t) => {
+  const f = await decisionClickFixture(t);
+  const answer = await f.click();
+  assert.equal(answer.ok, true);
+  assert.deepEqual(f.sent, [
+    {
+      url: "/v1/cards/7/answer",
+      token: "Bearer fixture-channel-key",
+      body: { choice: 1, by: "owner", ref: "om_message" },
+      mode: "active",
+    },
+  ]);
+  assert.equal(f.answers.length, 0);
+  f.put("cards", 7, { ...f.card, state: "done", choice: 1, version: 3 });
+  f.put("deliveries", "7:group", { ...f.delivery, version: 3 });
+  assert.equal((await f.click()).changed, false);
+  assert.equal(f.sent.length, 1);
+});
+
+test("wrong group/profile/actor/ref/version and out-of-range inputs cannot pause or dispatch", async (t) => {
+  const f = await decisionClickFixture(t, { options: ["first", "先暂停此目标"] });
+  for (const extra of [
+    { profile: "foreign" },
+    { chatId: "foreign" },
+    { actor: "foreign" },
+    { messageId: "om_wrong" },
+    { version: 2 },
+    { choice: 2 },
+    { choice: -1 },
+  ]) {
+    assert.equal((await f.click(extra)).ok, false);
+    assert.equal(f.controls.get(f.key).mode, "active");
+  }
+  f.put("keys", "channel:group", { name: "group", kind: "channel", hash: digest("rotated") });
+  assert.equal((await f.click()).ok, false);
+  assert.equal(f.controls.get(f.key).mode, "active");
+  assert.equal(f.sent.length, 0);
+});
+
+test("a card from a previous activation cannot wake or pause a replacement goal", async (t) => {
+  const f = await decisionClickFixture(t, { options: ["ordinary", "先暂停此目标"] });
+  f.set("manual");
+  f.controls.set(f.key, "active", { actor: "fixture", objective: "replacement", maxSteps: 3 });
+  for (const choice of [0, 1]) assert.equal((await f.click({ choice })).ok, false);
+  assert.equal(f.controls.get(f.key).mode, "active");
+  assert.equal(f.sent.length, 0);
+});
+
+test("pause removes routing before channel answer and replay after a transient error stays paused", async (t) => {
+  const opts = { options: ["first", "先暂停此目标"], fail: true };
+  const f = await decisionClickFixture(t, opts);
+  await assert.rejects(f.click());
+  assert.equal(f.controls.get(f.key).mode, "paused");
+  assert.equal(
+    f.readRules().rules.some((r) => r.name === f.card.rule),
+    false,
+  );
+  const pausedRevision = f.controls.get(f.key).revision;
+  // The live rules projection has now incorporated the removal.
+  f.put("config", "rules", { version: 5, value: f.readRules() });
+  opts.fail = false;
+  assert.equal((await f.click()).ok, true);
+  assert.equal(f.controls.get(f.key).revision, pausedRevision);
+  assert.equal(
+    f.sent.every((x) => x.mode === "paused"),
+    true,
+  );
+});
+
+test("missing delivery acknowledgement is retriable without committing a choice", async (t) => {
+  const f = await decisionClickFixture(t);
+  f.put("deliveries", "7:group", { ...f.delivery, version: 0, ref: null });
+  await assert.rejects(f.click());
+  assert.equal(f.sent.length, 0);
+});
+
+test("group opt-in and explicit answerers are required even for a valid group message", async (t) => {
+  const f = await decisionClickFixture(t);
+  const channel = f.hc.channels.group;
+  channel.interactiveAsks = false;
+  writeFileSync(f.hubFile, JSON.stringify(f.hc));
+  assert.equal((await f.click()).ok, false);
+  channel.interactiveAsks = true;
+  writeFileSync(f.hubFile, JSON.stringify(f.hc));
+  const raw = structuredClone(f.raw);
+  delete raw.channels.group.answerers;
+  f.put("config", "rules", { version: 5, value: raw });
+  assert.equal((await f.click()).ok, false);
+  assert.equal(f.sent.length, 0);
+});
+
+test("a changed loaded agent cannot take the answer and a second controller cannot replace the goal mid-answer", async (t) => {
+  let blocked = false;
+  const f = await decisionClickFixture(t, {
+    onAnswer(g) {
+      assert.throws(() => g.set("active"), { code: "CONTROL_UPDATE_BUSY" });
+      blocked = true;
+    },
+  });
+  const swapped = structuredClone(f.raw);
+  swapped.agents[f.card.agent].command = [f.configFile, f.otherKey];
+  f.put("config", "rules", { version: 5, value: swapped });
+  await assert.rejects(f.click());
+  assert.equal(f.sent.length, 0);
+  f.put("config", "rules", { version: 6, value: f.raw });
+  assert.equal((await f.click()).ok, true);
+  assert.equal(blocked, true);
+});
+
+test("group decision opt-in starts at its explicit inclusive card ID and expired work cannot wake", async (t) => {
+  const f = await decisionClickFixture(t);
+  const channel = f.hc.channels.group;
+  for (const cutoff of [8, 0, null, "7"]) {
+    channel.interactiveAsksFromId = cutoff;
+    writeFileSync(f.hubFile, JSON.stringify(f.hc));
+    assert.equal((await f.click()).ok, false);
+  }
+  channel.interactiveAsksFromId = 7;
+  writeFileSync(f.hubFile, JSON.stringify(f.hc));
+  const state = f.controls.read();
+  state.projects[f.key].deadline = "2020-01-01T00:00:00Z";
+  writeFileSync(f.controls.file, JSON.stringify(state));
+  assert.equal((await f.click()).code, "LOOP_CARD_GOAL_INACTIVE");
+  assert.equal(f.sent.length, 0);
 });

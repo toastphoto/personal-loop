@@ -34,3 +34,5 @@
 - Upstream retries reuse a run ID but increment attempt. Deduplicating by run alone replayed failed results and usage without retrying. Separate attempt identity, require a verified failed predecessor, and count each real attempt against budget.
 - Cached replay needs the same goal and control revision as well as an idempotency key. Recheck after asynchronous catalogue work; do not suppress results of newly completed work merely because the owner paused afterward.
 - Do not label the nightly suite passed when deep checks pass but performance budgets fail. Keep measured failures, isolate resource-sensitive checks and compare baseline without loosening thresholds.
+
+- Test project controls and decision buttons separately. Confirm the question uses a button on its delivered message, the authorized click creates one answer event, and that event wakes the intended native goal.

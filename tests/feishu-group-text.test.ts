@@ -39,6 +39,7 @@ import('node:fs').then(async fs => {
   if(mode==='not-ok'){ console.log(JSON.stringify({ok:false,error:{message:'PRIVATE_ERROR'}})); return; }
   if(mode==='missing-id'){ console.log(JSON.stringify({ok:true,data:{}})); return; }
   const args=process.argv.slice(2), chatIndex=args.indexOf('--chat-id');
+  if(mode==='empty-patch-ack' && args.includes('patch')){ console.log(JSON.stringify({ok:true,data:{}})); return; }
   const chatId=chatIndex<0?'oc_group':args[chatIndex+1];
   console.log(JSON.stringify({ok:true,data:{message_id: mode==='mismatch'?'om_other':'om_saved',chat_id:mode==='chat-mismatch'?'oc_wrong':chatId}}));
 });
@@ -206,6 +207,9 @@ test("required route configuration is rejected before reading cards", async (t) 
     { deliveryNamespace: "" },
     { deliveryNamespace: undefined },
     { lark: "relative/script" },
+    { interactiveAsks: "true" },
+    { interactiveAsksFromId: 0 },
+    { interactiveAsksFromId: Number.MAX_SAFE_INTEGER + 1 },
   ]) {
     const f = fixture(t, [base]);
     f.context.options = { ...f.context.options, ...patch };
@@ -248,4 +252,86 @@ test("a foreign group in send or edit acknowledgement is rejected", async (t) =>
     assert.equal(f.delivered.length, 0);
     assert.equal(f.failed.length, 1);
   }
+});
+
+test("opt-in decision sends identify each option, keep the full label and omit capability links", async (t) => {
+  const prefix = "请检查同一个工作台首页的视觉方案".repeat(9);
+  const options = [prefix + "甲", prefix + "乙", "只看现状"];
+  const f = fixture(t, [{ ...base, title: "<at>全体</at>", text: base.link!, options }]);
+  Object.assign(f.context.options, { interactiveAsks: true, interactiveAsksFromId: base.id });
+  await channel(f.context);
+  const [{ args, input }] = f.calls();
+  assert.ok(args.includes("+messages-send") && args.includes("--content") && args.includes("interactive"));
+  assert.match(args.at(-1), /^pl-card-[a-f0-9]{20}-42$/);
+  assert.doesNotMatch(input, /private-capability|<at>|\/loop 回答|markdown/);
+  const card = JSON.parse(input);
+  assert.equal(card.schema, "2.0");
+  assert.equal(card.config.update_multi, true);
+  assert.equal(card.config.enable_forward, false);
+  for (const label of options) assert.ok(input.includes(label));
+  const buttons = card.body.elements.filter((element: { tag: string }) => element.tag === "button");
+  assert.deepEqual(
+    buttons.map((b: any) => b.behaviors),
+    options.map((_, choice) => [
+      { type: "callback", value: { personalLoopDecision: 1, card: 42, choice, version: 1 } },
+    ]),
+  );
+  assert.equal(new Set(buttons.map((b: any) => b.text.content)).size, 3);
+  assert.ok(buttons.every((b: any) => b.text.content.length <= 100 && b.text.tag === "plain_text"));
+  assert.match(buttons[1].text.content, /建议/);
+});
+
+test("decided, done and closed decision cards patch the original and remove the choices", async (t) => {
+  const f = fixture(
+    t,
+    [
+      { ...base, ref: "om_saved", version: 2, state: "decided", choice: 1 },
+      { ...base, ref: "om_saved", version: 3, state: "done", choice: 1, result: "已按选择完成核对" },
+      { ...base, ref: "om_saved", version: 4, state: "closed", result: "已取消此项" },
+    ],
+    "empty-patch-ack",
+  );
+  f.context.options.interactiveAsks = true;
+  await channel(f.context);
+  const calls = f.calls();
+  assert.equal(calls.length, 3);
+  for (const { args, input } of calls) {
+    assert.deepEqual(args, [
+      "--profile",
+      "my-profile",
+      "im",
+      "messages",
+      "patch",
+      "--message-id",
+      "om_saved",
+      "--as",
+      "bot",
+      "--data",
+      "-",
+    ]);
+    const card = JSON.parse(JSON.parse(input).content);
+    assert.equal(card.schema, "2.0");
+    assert.doesNotMatch(input, /personalLoopDecision|private-capability|"button"/);
+  }
+  assert.match(calls[0].input, /等待处理/);
+  assert.match(calls[0].input, /你的选择：暂停/);
+  assert.match(calls[1].input, /已按选择完成核对/);
+  assert.match(calls[2].input, /已取消此项/);
+  assert.deepEqual(f.delivered, [
+    [42, 2, "om_saved"],
+    [42, 3, "om_saved"],
+    [42, 4, "om_saved"],
+  ]);
+});
+
+test("cutover keeps earlier unsent questions, earlier edits and every notice on text", async (t) => {
+  const f = fixture(t, [
+    base,
+    { ...base, ref: "om_saved", state: "decided", version: 2 },
+    { ...base, id: 44, kind: "notice", options: [] },
+  ]);
+  Object.assign(f.context.options, { interactiveAsks: true, interactiveAsksFromId: 43 });
+  await channel(f.context);
+  assert.ok(f.calls().every((call) => call.args.includes("--text")));
+  assert.equal(f.delivered.length, 3);
 });

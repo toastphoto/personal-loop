@@ -244,7 +244,12 @@ async function main() {
           config.projectActivity?.enabled === true ? new ProjectActivity(catalog, config.projectActivity) : undefined,
         transportReady: () => subscriber.status().ready,
       });
-      callbackRelay = new FeishuCardRelay(c, { queue: callbackQueue, controller: cards, execute: runProgram });
+      callbackRelay = new FeishuCardRelay(c, {
+        queue: callbackQueue,
+        controller: cards,
+        execute: runProgram,
+        answerDecisionClick: runtime ? (args) => runtime.answerDecisionClick(args) : undefined,
+      });
     } catch (error) {
       await subscriber?.stop();
       callbackQueue?.close();

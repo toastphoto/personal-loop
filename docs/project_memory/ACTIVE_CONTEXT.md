@@ -2,6 +2,10 @@
 
 Updated: 2026-11-06. Branch: `codex/native-project-loop`; fork `toastphoto/personal-loop`, draft PR #1. Recheck Git, deployed code and service state before continuing.
 
+The owner-group channel now delivers new questions as interactive cards. The existing subscriber validates the original delivered message, channel, authorized person, card version and originating project before submitting the choice. An isolated HTTP hub test followed the selected branch in the same native session. Feishu accepted sample open and completed cards. The live directory and a selected project card were read back after deployment. The full suite passed 937 tests with 2 skipped. Verify a real phone start, decision click and resumed run separately.
+
+On 2026-11-06 one owner-authorized, read-only Codex task completed on the live hub. The project control handler started the first turn. Its `later` receipt scheduled the second turn, which the due event started in the same native session. Both turns read the source files. The final notice was delivered once and read back from the intended Feishu group. At closeout the project was manual, its rule was removed, and it had zero active turns and pending timers. Mobile start, failure recovery, human-answer continuation, sustained operation and native writes still need separate live checks.
+
 The integration keeps Codex, Multica and DSH native identities and upstream autoloop scheduling. All projects default to manual; enable and resume are explicit, pause persists, and cancelling an active task is separate. Execution currently supports loop-owned read-only Codex work, not takeover of existing manual chats or accepted Multica/DSH writes.
 
 Live catalogue snapshot: 27 Codex projects, 9 Multica projects, 4 DSH workspaces; all 40 manual at deployment. Counts and modes are volatile. The DSH read-only Host plugin is installed. One earlier bounded owned Codex read-only task completed with verified project/root binding; this is not source-project business acceptance.

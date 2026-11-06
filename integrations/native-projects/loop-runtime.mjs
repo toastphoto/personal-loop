@@ -3,6 +3,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { readFileSync, writeFileSync, renameSync, unlinkSync, lstatSync, existsSync, chmodSync } from "node:fs";
 import path from "node:path";
 import { hubClient as connectHub } from "../../protocol/client.ts";
+import { digest } from "../../kernel/credentials.ts";
 import { parseRules } from "../../protocol/rules.ts";
 import { typeMatches } from "../../kernel/rules.ts";
 import { subjectFor } from "./controls.mjs";
@@ -64,7 +65,25 @@ export class NativeLoopRuntime {
     const source = this.injectedHub ?? connectHub(privateHub.url, privateHub.source.key);
     if (typeof owner.state !== "function" || typeof source.event !== "function")
       throw failure("LOOP_HUB_CONFIG_INVALID");
-    return { ...h, owner, source, sourceName: privateHub.source.name, database: h.rulesFile + ".native-loop.db" };
+    return {
+      ...h,
+      owner,
+      source,
+      sourceName: privateHub.source.name,
+      database: h.rulesFile + ".native-loop.db",
+      decisionChannel(profile, chatId, cardId) {
+        const groups = Object.entries(privateHub.channels ?? {}).filter(
+          ([, c]) =>
+            c.use === "feishu-group-text" && c.interactiveAsks === true && c.profile === profile && c.chatId === chatId,
+        );
+        if (groups.length !== 1) return null;
+        const [name, c] = groups[0];
+        const fromId = c.interactiveAsksFromId === undefined ? 1 : c.interactiveAsksFromId;
+        if (!Number.isSafeInteger(fromId) || fromId < 1 || cardId < fromId) return null;
+        if (typeof c.key !== "string" || !c.key || c.key === privateHub.owner) return null;
+        return { name, keyHash: digest(c.key), client: connectHub(privateHub.url, c.key) };
+      },
+    };
   }
   validate(raw) {
     parseRules(JSON.stringify(raw), Date.now(), "Asia/Shanghai");
@@ -318,6 +337,169 @@ export class NativeLoopRuntime {
         mode: this.controls.get(projectKey).mode,
         text: "回答是否已保存尚未确认，请先核实原卡片状态，不要重做业务。",
       };
+    }
+  }
+  // Only local hub projections expose both the delivered ref and the originating run's frozen rules.
+  inspectDecisionClick(layout, channel, click) {
+    const deny = (code) => ({ ok: false, code, text: "此操作与当前项目、卡片或群权限不符，请查看最新卡片。" });
+    const file = path.join(path.dirname(layout.configFile), "hub.db");
+    if (!regular(file)) throw failure("LOOP_HUB_UNAVAILABLE");
+    const db = new DatabaseSync(file, { readOnly: true });
+    try {
+      db.exec("PRAGMA query_only=ON; BEGIN");
+      const row = db.prepare("SELECT data FROM projections WHERE collection=? AND key=?");
+      const get = (collection, key) => JSON.parse(row.get(collection, String(key))?.data ?? "null");
+      const current = get("config", "rules")?.value;
+      const answerers = current?.channels?.[channel.name]?.answerers;
+      if (
+        get("keys", "channel:" + channel.name)?.hash !== channel.keyHash ||
+        !Array.isArray(answerers) ||
+        !answerers.includes(click.actor)
+      )
+        return deny("LOOP_CARD_CHANNEL_DENIED");
+      const card = get("cards", click.cardId);
+      if (card?.kind !== "ask" || card.source !== layout.sourceName || card.grp !== card.rule)
+        return deny("LOOP_CARD_SCOPE_INVALID");
+      const options = JSON.parse(card.options);
+      if (!Array.isArray(options) || !options.every((x) => typeof x === "string") || click.choice >= options.length)
+        return deny("LOOP_CARD_INPUT_INVALID");
+      const delivery = get("deliveries", click.cardId + ":" + channel.name);
+      if (
+        click.version > card.version ||
+        (delivery?.ref && delivery.ref !== click.messageId) ||
+        (!delivery?.ref && delivery?.given_up)
+      )
+        return deny("LOOP_CARD_REF_MISMATCH");
+      if (!delivery?.ref || (delivery.version < click.version && card.version === click.version))
+        throw failure("LOOP_CARD_DELIVERY_PENDING");
+      if (["decided", "closed", "done"].includes(card.state))
+        return { ok: true, changed: false, code: "LOOP_CARD_ALREADY_HANDLED", text: "这张决策卡已处理。" };
+      if (card.state !== "open" || card.version !== click.version || delivery.version !== click.version)
+        return deny("LOOP_CARD_STALE");
+      const origin = get("runs", card.run_id);
+      if (
+        !origin ||
+        origin.rule !== card.rule ||
+        origin.grp !== card.grp ||
+        origin.agent !== card.agent ||
+        origin.lane !== card.lane
+      )
+        return deny("LOOP_CARD_SCOPE_INVALID");
+      const frozen = get("config", origin.rules_version)?.value;
+      const author = frozen?.agents?.[card.agent];
+      const key = author?.command?.[1];
+      if (
+        typeof key !== "string" ||
+        author.command[0] !== this.configFile ||
+        author.use !== "native-managed" ||
+        author.access !== "read" ||
+        author.worker !== layout.workerName
+      )
+        return deny("LOOP_CARD_SCOPE_INVALID");
+      const control = this.controls.get(key);
+      const pause = ["已核实，保持暂停", "先暂停此目标"].includes(options[click.choice]);
+      const pauseId = click.requestId + ":pause";
+      const savedPause = pause && control.mode === "paused" && this.controls.read().requests?.[pauseId]?.result;
+      const ownPause =
+        savedPause?.revision === control.revision && savedPause.projectKey === key && savedPause.mode === "paused";
+      if (
+        (control.mode !== "active" && !ownPause) ||
+        (!pause && control.deadline && Date.parse(control.deadline) <= Date.now())
+      )
+        return deny("LOOP_CARD_GOAL_INACTIVE");
+      const target = this.desired(key, { revision: control.revision - (ownPause ? 1 : 0) }, layout);
+      if (
+        card.agent !== target.agentId ||
+        card.rule !== target.ruleName ||
+        author.name !== target.agent.name ||
+        !frozen.rules.some((r) => r.name === card.rule && r.to === card.agent)
+      )
+        return deny("LOOP_CARD_GOAL_CHANGED");
+      const line = current.rules.find((r) => r.name === card.rule);
+      const loaded = current.agents?.[target.agentId];
+      const ready =
+        control.mode === "active"
+          ? line?.to === target.agentId &&
+            line.cwd === layout.controlCwd &&
+            line.group === card.grp &&
+            line.when?.source === layout.sourceName &&
+            loaded?.name === target.agent.name &&
+            loaded.use === author.use &&
+            loaded.worker === author.worker &&
+            loaded.access === author.access &&
+            JSON.stringify(loaded.command) === JSON.stringify(target.agent.command)
+          : !line;
+      return { control, pause, pauseId, ready };
+    } finally {
+      db.close();
+    }
+  }
+  async answerDecisionClick(click) {
+    if (
+      !click ||
+      !Number.isSafeInteger(click.cardId) ||
+      click.cardId < 1 ||
+      !Number.isSafeInteger(click.version) ||
+      click.version < 1 ||
+      !Number.isSafeInteger(click.choice) ||
+      click.choice < 0 ||
+      ![click.profile, click.chatId, click.actor].every(
+        (s) => typeof s === "string" && s.length > 0 && s.length <= 500,
+      ) ||
+      !/^om_[A-Za-z0-9_-]{1,160}$/.test(click.messageId ?? "") ||
+      !/^[A-Za-z0-9_.:-]{1,500}$/.test(click.requestId ?? "")
+    )
+      return { ok: false, code: "LOOP_CARD_INPUT_INVALID", text: "卡片操作参数不完整。" };
+    const layout = this.layout(),
+      channel = layout.decisionChannel(click.profile, click.chatId, click.cardId);
+    if (!channel) return { ok: false, code: "LOOP_CARD_CHANNEL_DENIED", text: "这个群尚未开启决策按钮。" };
+    const read = () => this.inspectDecisionClick(layout, channel, click);
+    let checked = read();
+    if (checked.ok !== undefined) return checked;
+    if (checked.pause) {
+      const { control, pauseId } = checked;
+      if (control.mode === "active" && !checked.ready) throw failure("RULE_SYNC_UNCONFIRMED");
+      const paused =
+        control.mode === "paused"
+          ? control
+          : this.controls.set(control.projectKey, "paused", {
+              actor: click.actor,
+              expectedRevision: control.revision,
+              requestId: pauseId,
+            });
+      await this.sync({ projectKey: control.projectKey, control: paused, action: "pause", requestId: click.requestId });
+    }
+    // Serialize with LoopControls.set until the hub commits the answer for the verified generation.
+    const lockFile = this.controls.file + ".lock.db";
+    if (!regular(lockFile)) throw failure("LOOP_CONTROL_UNAVAILABLE");
+    const lock = new DatabaseSync(lockFile);
+    try {
+      lock.exec("PRAGMA busy_timeout=1000; BEGIN IMMEDIATE");
+      checked = read();
+      if (checked.ok !== undefined) return checked;
+      if (!checked.ready) throw failure("RULE_SYNC_UNCONFIRMED");
+      this.guard(checked.control.projectKey, checked.control);
+      const applied = await channel.client.answer(click.cardId, {
+        choice: click.choice,
+        by: click.actor,
+        ref: click.messageId,
+      });
+      if (typeof applied?.changed !== "boolean" || !["decided", "closed", "done"].includes(applied.state))
+        throw failure("LOOP_CARD_ANSWER_UNCONFIRMED");
+      return {
+        ok: true,
+        changed: applied.changed,
+        code: "LOOP_CARD_ANSWERED",
+        text: checked.pause ? "已记录选择，项目已暂停。" : "已记录选择。",
+      };
+    } catch (error) {
+      if (error.code === "LOOP_DEADLINE_REACHED")
+        return { ok: false, code: "LOOP_CARD_GOAL_INACTIVE", text: "这个目标已经到期。" };
+      if ([400, 401, 403, 404].includes(error.status))
+        return { ok: false, code: "LOOP_CARD_ANSWER_DENIED", text: "中台未接受本次卡片操作。" };
+      throw error;
+    } finally {
+      lock.close();
     }
   }
   async sync({ projectKey, control, action, requestId = control?.originRequestId }) {
