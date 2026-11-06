@@ -107,7 +107,14 @@ function readUsage(raw) {
 }
 
 // Only the process result may authorize a downstream model action. A deadline, partial output, or second turn fails closed.
-export async function runEphemeralCoordinator({ command, prompt, timeoutMs = 600000, signal, beforeStart }) {
+export async function runEphemeralCoordinator({
+  command,
+  prompt,
+  timeoutMs = 600000,
+  signal,
+  beforeStart,
+  classificationOnly = false,
+}) {
   if (
     !path.isAbsolute(command ?? "") ||
     typeof prompt !== "string" ||
@@ -127,7 +134,9 @@ export async function runEphemeralCoordinator({ command, prompt, timeoutMs = 600
     if (beforeStart) await beforeStart();
     checkAbort();
     return await new Promise((resolve, reject) => {
-      const child = spawn(command, args, {
+      const cliArgs =
+        classificationOnly === true ? ["exec", "-c", 'model_reasoning_effort="low"', ...args.slice(1)] : args;
+      const child = spawn(command, cliArgs, {
         cwd: dir,
         shell: false,
         detached: process.platform !== "win32",

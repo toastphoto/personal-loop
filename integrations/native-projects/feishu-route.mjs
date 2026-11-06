@@ -3,6 +3,7 @@ import { fileURLToPath } from "node:url";
 import path from "node:path";
 import { directGoalRequest } from "./feishu-direct-goal.mjs";
 import { asksForChatPicker } from "./feishu-intent.mjs";
+import { eligibleSemanticRoute, readSemanticRoute } from "./semantic-route-store.mjs";
 export function commandText(event) {
   if (typeof event?.content !== "string") return "";
   let value = event.content.trim();
@@ -63,7 +64,9 @@ export function routeProjectMessage(event, routing = {}) {
     names.some((n) => typeof n === "string" && n.length >= 2 && text.includes(n)) ||
     /\b[CMD]-[a-f0-9]{10}\b/i.test(text)
     ? "loop"
-    : "legacy";
+    : eligibleSemanticRoute(event, routing)
+      ? "semantic"
+      : "legacy";
 }
 export function readRouting(file, strict = false) {
   try {
@@ -114,11 +117,19 @@ export function readRouting(file, strict = false) {
     return {};
   }
 }
+// The legacy dispatcher never interprets a delayed message as a new ordinary message when authorization changes.
+export function dispatcherRoute(event, routing, settling = false) {
+  const route = routeProjectMessage(event, routing);
+  if (route === "semantic") return readSemanticRoute(event, routing);
+  return settling && route === "legacy" ? "loop" : route;
+}
 if (process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1])) {
   try {
     const cfg = readRouting(process.argv[2], true);
     const event = JSON.parse(readFileSync(0, "utf8"));
-    process.stdout.write(routeProjectMessage(event, cfg));
+    if (process.argv.length > 4 || (process.argv[3] !== undefined && process.argv[3] !== "--settle-pending"))
+      throw new Error("Invalid classifier mode");
+    process.stdout.write(dispatcherRoute(event, cfg, process.argv[3] === "--settle-pending"));
   } catch {
     process.exitCode = 1;
   }

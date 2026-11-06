@@ -4,7 +4,7 @@ import { mkdirSync, chmodSync, lstatSync, existsSync } from "node:fs";
 import path from "node:path";
 import { failure } from "./catalog.mjs";
 import { projectAlias, projectDirectoryView, handleLoopCommand } from "./feishu-commands.mjs";
-import { renderProjectCard } from "./feishu-project-card.mjs";
+import { renderProjectCard, replyDigest } from "./feishu-project-card.mjs";
 import { interpretProjectRequest } from "./feishu-intent.mjs";
 const canonical = (v) =>
   v && typeof v === "object"
@@ -184,8 +184,34 @@ export class CardSessions {
 }
 
 export class ProjectCardController {
-  constructor(config, { store, catalog, controls, runtime, activity, bindings, transportReady = () => true } = {}) {
-    Object.assign(this, { config, store, catalog, controls, runtime, activity, bindings, transportReady });
+  constructor(
+    config,
+    {
+      store,
+      catalog,
+      controls,
+      runtime,
+      activity,
+      bindings,
+      semanticQuery,
+      portfolio,
+      answerChat,
+      transportReady = () => true,
+    } = {},
+  ) {
+    Object.assign(this, {
+      config,
+      store,
+      catalog,
+      controls,
+      runtime,
+      activity,
+      bindings,
+      semanticQuery,
+      portfolio,
+      answerChat,
+      transportReady,
+    });
     this.scope = digest([config.profile ?? "", config.chatId, [...config.allowedSenderIds].sort()]);
   }
   enabled() {
@@ -431,16 +457,110 @@ export class ProjectCardController {
       snapshot,
     );
   }
-  async natural(item, text) {
-    const { view, overview } = await this.overview();
+  async natural(item, text, semantic) {
+    // Bursting conversations can share directory metadata; answers still query current work and decisions.
+    if (semantic && (!this.conversationDirectory || this.conversationDirectory.expires < Date.now())) {
+      const pending = { expires: Date.now() + 5000, snapshot: this.overview() };
+      this.conversationDirectory = pending;
+      pending.snapshot.catch(() => {
+        if (this.conversationDirectory === pending) this.conversationDirectory = null;
+      });
+    }
+    const { view, overview } = await (semantic ? this.conversationDirectory.snapshot : this.overview());
     const actor = item.event.sender_id,
       chat = item.event.chat_id;
-    const intent = interpretProjectRequest(text, { view, contextAlias: this.store.context(actor, chat) });
+    if (chat !== this.config.chatId || !this.config.allowedSenderIds.includes(actor))
+      throw failure("CARD_SCOPE_MISMATCH");
+    const contextAlias = semantic ? semantic.contextAlias : this.store.context(actor, chat);
+    let intent = interpretProjectRequest(text, { view, contextAlias });
+    if (semantic && (semantic.deferred || ["help", "clarify"].includes(intent.kind))) {
+      const options = {
+        view,
+        contextAlias,
+        history: semantic.history ?? [],
+        signal: semantic.signal,
+        beforeStart: semantic.guard,
+      };
+      const understood = await this.semanticQuery(text, options);
+      semantic.guard();
+      if (understood.kind === "external") {
+        if (semantic.deferred) return { ok: true, action: "external", delegateLegacy: true };
+        if (intent.kind === "help")
+          return {
+            ok: true,
+            action: "natural",
+            text: "这件事是想先聊做法，还是交给某个项目执行？我可以先帮你理清下一步。",
+          };
+      } else if (understood.kind === "unavailable") {
+        return { ok: true, action: "semantic-unavailable", text: understood.text };
+      } else if (understood.kind === "clarify") {
+        return {
+          ok: true,
+          action: "natural-clarification",
+          text:
+            understood.text +
+            (understood.candidates?.length
+              ? "\n" +
+                understood.candidates
+                  .map(
+                    (p) => p.name + "（" + { codex: "Codex", multica: "Multica", dsh: "DeepSeek" }[p.provider] + "）",
+                  )
+                  .join("、")
+              : ""),
+        };
+      } else if (understood.kind === "chat") {
+        const aliases = understood.aliases ?? [];
+        const evidence = await Promise.all(
+          aliases.map(async (alias) => {
+            const projectKey = this.targets(overview)[alias];
+            if (!projectKey) return { alias, text: "当前无法核实这个项目的状态。" };
+            const [fact, record] = await Promise.all([
+              this.portfolio({ overview, focus: "recent", projectKey }),
+              this.activity?.read(projectKey).catch(() => null),
+            ]);
+            const reply = record?.selected?.latestReply;
+            const brief =
+              reply && replyDigest(record.selected.resultSummary || reply.text, !!record.selected.resultSummary);
+            return {
+              alias,
+              text: [fact.text, brief && `已读取的${record.status === "stale" ? "历史缓存" : "项目记录"}：${brief}`]
+                .filter(Boolean)
+                .join("\n"),
+            };
+          }),
+        );
+        semantic.guard();
+        const response = await this.answerChat(text, { ...options, aliases, evidence });
+        semantic.guard();
+        return {
+          ...response,
+          contextAliases: aliases,
+          ...(aliases.length === 1 && { contextAlias: aliases[0] }),
+          contextTopic:
+            aliases.length > 1
+              ? "compare:" + digest([...aliases].sort()).slice(0, 20)
+              : aliases.length
+                ? "project"
+                : (semantic.contextTopic ?? "chat"),
+        };
+      } else if (
+        understood.kind === "query" &&
+        ["portfolio", "pick-chat", "projects", "status"].includes(understood.action)
+      ) {
+        intent = understood;
+      } else
+        return { ok: true, action: "natural-clarification", text: "你想看看哪些工作在进行，还是聊聊下一步怎么安排？" };
+    }
+    if (intent.action === "portfolio") {
+      const result = await this.portfolio({ overview, focus: intent.filter, provider: intent.provider });
+      return { ...result, contextTopic: "portfolio" };
+    }
     if (intent.action === "pick-chat") {
       const eligible = overview.projects.filter((p) => this.bindings?.available(p.key));
-      const existing = this.store.context(actor, chat);
+      const existing = intent.alias ?? contextAlias;
       const selected =
-        eligible.find((p) => projectAlias(p) === existing) ?? (eligible.length === 1 ? eligible[0] : null);
+        eligible.find((p) => projectAlias(p) === existing) ??
+        (!intent.alias && eligible.length === 1 ? eligible[0] : null);
       const response = await this.create(
         item,
         selected ? { screen: "chat-picker", alias: projectAlias(selected) } : { screen: "home" },
@@ -479,7 +599,13 @@ export class ProjectCardController {
       intent.objective ? { objective: intent.objective, maxSteps: 3, revision: 0 } : undefined,
       overview,
     );
-    return { ok: true, action: "natural", text: "请在项目卡片中查看或确认", response };
+    return {
+      ok: true,
+      action: "natural",
+      text: "请在项目卡片中查看或确认",
+      response,
+      ...(intent.alias && { contextAlias: intent.alias, contextTopic: "project" }),
+    };
   }
   decodeEvent(e) {
     if (

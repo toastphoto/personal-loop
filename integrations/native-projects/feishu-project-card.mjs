@@ -479,7 +479,7 @@ function structuredReply(source) {
   }
 }
 // Use only the selected reply (or its verified delivered summary). Keep the source available in a fold.
-function replyDigest(source, delivered = false) {
+export function replyDigest(source, delivered = false) {
   const lines = source.replace(/```[\s\S]*?(?:```|$)/g, "\n").split(/\r?\n/);
   const clean = (v) =>
     v

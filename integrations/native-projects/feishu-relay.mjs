@@ -18,6 +18,11 @@ import { CardEventSubscriber } from "./callback-consumer.mjs";
 import { FeishuCardRelay } from "./feishu-card-relay.mjs";
 import { ProjectActivity } from "./project-activity.mjs";
 import { renderProjectCard } from "./feishu-project-card.mjs";
+import { eligibleSemanticRoute, readSemanticRoute, finishSemanticRoute } from "./semantic-route-store.mjs";
+import { interpretSemanticQuery, answerSemanticChat } from "./semantic-query.mjs";
+import { projectPortfolioStatus } from "./portfolio-status.mjs";
+import { conversationContext } from "./conversation-context.mjs";
+import { BoundProgressNotices } from "./bound-progress-notices.mjs";
 
 export function acceptsCommand(event, config) {
   return (
@@ -27,7 +32,9 @@ export function acceptsCommand(event, config) {
     event.message_type === "text" &&
     typeof event.message_id === "string" &&
     /^om_[A-Za-z0-9_-]{1,160}$/.test(event.message_id) &&
-    routeProjectMessage(event, config.naturalRoutingFile ? readRouting(config.naturalRoutingFile) : {}) === "loop"
+    ["loop", "semantic"].includes(
+      routeProjectMessage(event, config.naturalRoutingFile ? readRouting(config.naturalRoutingFile) : {}),
+    )
   );
 }
 export function runProgram(program, args, { input = "", timeoutMs = 30000 } = {}) {
@@ -107,7 +114,19 @@ export async function larkReply(config, item, execute = runProgram) {
 export class FeishuLoopRelay {
   constructor(
     config,
-    { queue, catalog, controls, reply, readiness, syncRules, answerCard, cards, canCoordinate } = {},
+    {
+      queue,
+      catalog,
+      controls,
+      reply,
+      readiness,
+      syncRules,
+      answerCard,
+      cards,
+      canCoordinate,
+      nativeConfig,
+      configFile,
+    } = {},
   ) {
     if (
       !config?.chatId ||
@@ -125,6 +144,10 @@ export class FeishuLoopRelay {
     this.syncRules = syncRules;
     this.answerCard = answerCard;
     this.cards = cards;
+    this.nativeConfig = nativeConfig;
+    this.configFile = configFile;
+    this.naturalJobs = new Map();
+    this.naturalAbort = new AbortController();
     this.canCoordinate = canCoordinate ?? (() => false);
     this.stopping = false;
     this.editedCommandsIgnored = 0;
@@ -234,14 +257,75 @@ export class FeishuLoopRelay {
       result.text = `收到，我先看「${name}」的进展，再按目标往下做。需要你决定时，我会在这里给选项和建议。`;
     return result;
   }
+  // Read-only conversations can finish independently, including two questions about the same project.
+  // Project control mutations still pass through the guarded command path.
+  async handleConversation(item, routing, route) {
+    const fresh = () => readRouting(this.config.naturalRoutingFile);
+    const guard = () => {
+      const current = fresh();
+      if (
+        this.stopping ||
+        !eligibleSemanticRoute(item.event, current) ||
+        routeProjectMessage(item.event, current) !== route ||
+        current.semanticQueries.enabledAt !== routing.semanticQueries.enabledAt ||
+        current.semanticQueries.decisionDir !== routing.semanticQueries.decisionDir
+      )
+        throw failure("SEMANTIC_SCOPE_CHANGED");
+      return current;
+    };
+    const deferred = route === "semantic";
+    try {
+      guard();
+      if (deferred && readSemanticRoute(item.event, routing) === "legacy") {
+        this.queue.discard(item.id, "LEGACY_ROUTE_CONFIRMED");
+        return;
+      }
+      const history = conversationContext(item, this.config, this.queue, {
+        nativeConfig: this.nativeConfig,
+        configFile: this.configFile,
+        controls: this.controls,
+        cardStore: this.cards.store,
+      });
+      let result = await this.cards.natural(item, commandText(item.event), {
+        ...history,
+        deferred,
+        guard,
+        signal: this.naturalAbort.signal,
+      });
+      const current = guard();
+      if (deferred) {
+        const prior = readSemanticRoute(item.event, current);
+        const owner = prior === "pending" ? (result.delegateLegacy ? "legacy" : "loop") : prior;
+        finishSemanticRoute(item.event, current, owner);
+        if (owner === "legacy") {
+          this.queue.discard(item.id, "LEGACY_ROUTE_CONFIRMED");
+          return;
+        }
+        if (result.delegateLegacy)
+          result = { ok: true, action: "natural-clarification", text: "要先看看项目进展，还是想安排具体工作？" };
+      }
+      const { response, ...saved } = result;
+      this.queue.saveResult(item.id, saved, response ?? projectReply(result, this.config));
+    } catch (error) {
+      if (!this.stopping) {
+        if (error.code === "SEMANTIC_SCOPE_CHANGED") this.queue.discard(item.id, "SCOPE_REVOKED");
+        else
+          this.queue.markFailure(item.id, "handling", safeError(error), { retryAfterMs: this.config.retryMs ?? 15000 });
+      }
+    }
+  }
+  drainNatural() {
+    return Promise.allSettled([...this.naturalJobs.values()]);
+  }
   async tick({ sendReplies = true } = {}) {
     this.batch = new Map();
     const ingest = this.queue.ingest(this.config.queuePath, {
       initialOffset: "tail",
       filter: (event) => this.filter(event),
     });
-    for (const item of this.queue.pending({ limit: 10 })) {
+    for (const item of this.queue.pending({ limit: 100 })) {
       if (this.stopping) break;
+      if (this.naturalJobs.has(item.id)) continue;
       if (!acceptsCommand(item.event, this.config)) {
         this.queue.discard(item.id, "SCOPE_REVOKED");
         continue;
@@ -266,12 +350,19 @@ export class FeishuLoopRelay {
           };
         }
         if (!result && !command && this.config.naturalRoutingFile) {
-          const goal = directGoalRequest(
-            item.event,
-            readRouting(this.config.naturalRoutingFile),
-            commandText(item.event),
-          );
+          const routing = readRouting(this.config.naturalRoutingFile);
+          const goal = directGoalRequest(item.event, routing, commandText(item.event));
           if (goal) result = await this.acceptGoal(item, goal);
+          else if (eligibleSemanticRoute(item.event, routing)) {
+            // Keep the item pending until its own result is durable. A fresh tick can service buttons immediately.
+            if (this.cards?.semanticQuery && this.naturalJobs.size < 3) {
+              const job = this.handleConversation(item, routing, routeProjectMessage(item.event, routing)).finally(() =>
+                this.naturalJobs.delete(item.id),
+              );
+              this.naturalJobs.set(item.id, job);
+            }
+            continue;
+          }
         }
         if (!result && !command && this.cards) result = await this.cards.natural(item, commandText(item.event));
         if (!result)
@@ -350,6 +441,9 @@ async function main() {
         catalog,
         controls,
         runtime,
+        semanticQuery: (q, opts) => interpretSemanticQuery(q, { ...opts, command: native.managedCodex.command }),
+        answerChat: (q, opts) => answerSemanticChat(q, { ...opts, command: native.managedCodex.command }),
+        portfolio: (opts) => projectPortfolioStatus({ ...opts, nativeConfig: native, controls, catalog }),
         activity:
           config.projectActivity?.enabled === true
             ? new ProjectActivity(catalog, { ...config.projectActivity, boundChats: native.managedCodex?.boundChats })
@@ -373,6 +467,8 @@ async function main() {
     }
   }
   const relay = new FeishuLoopRelay(config, {
+    nativeConfig: native,
+    configFile: file,
     queue,
     catalog,
     controls,
@@ -394,6 +490,10 @@ async function main() {
   });
   const once = process.argv.includes("--once");
   const noReply = process.argv.includes("--no-reply");
+  const notices =
+    runtime && !once && !noReply && config.proactiveNotices?.enabled
+      ? new BoundProgressNotices({ configFile: file, config, nativeConfig: native, runtime })
+      : null;
   const statusFile = config.statusFile;
   const record = (value) => {
     if (!statusFile) return;
@@ -412,6 +512,7 @@ async function main() {
   try {
     do {
       try {
+        notices?.pulse();
         const callbackState = callbackRelay ? await callbackRelay.tick() : undefined;
         record({
           status: "ready",
@@ -439,6 +540,10 @@ async function main() {
       });
     } while (!relay.stopping);
   } finally {
+    relay.stopping = true;
+    relay.naturalAbort.abort();
+    await notices?.stop();
+    await relay.drainNatural();
     await subscriber?.stop();
     callbackQueue?.close();
     cardStore?.close();
