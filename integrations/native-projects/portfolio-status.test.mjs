@@ -2,7 +2,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import path from "node:path";
-import { mkdtempSync, rmSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { DatabaseSync } from "node:sqlite";
 import { subjectFor } from "./controls.mjs";
@@ -161,4 +162,73 @@ test("a slow native provider cannot hold up an otherwise sound hub answer", asyn
   const r = await projectPortfolioStatus({ ...f, timeoutMs: 10 });
   assert.match(r.text, /没有正在处理或排队/);
   assert.match(r.text, /部分原生状态/);
+});
+
+test("a current bound handoff stays visible while the hub is idle, without claiming the original chat is running", async (t) => {
+  const id = "12345678-1234-1234-1234-123456789012",
+    root = "/tmp/project",
+    hk = "bound-check-native-run:33",
+    at = iso(now + 60000);
+  const ctrl = {
+    projectKey: a.key,
+    projectName: a.name,
+    mode: "active",
+    goalRevision: 5,
+    revision: 5,
+    objective: "核对工作台",
+    goalStartEvent: "activation",
+    expectedThreadId: id,
+  };
+  const f = fixture(t, {
+    controls: [ctrl],
+    records: [
+      ["events", 1, { key: "activation", subject: subjectFor(a.key), received_at: iso(now - 5000) }],
+      ["timers", 2, { rule: rule(a), key: hk, event_id: null, created_at: iso(now - 1000), at }],
+    ],
+  });
+  const md = {
+    enabled: true,
+    stateDir: path.dirname(f.nativeConfig.loopHub.configFile),
+    boundChats: { [a.key]: { root, threadId: id, projectId: a.nativeId } },
+    projectRoots: { [a.key]: root },
+    coordinatorProjectKeys: [a.key],
+  };
+  f.nativeConfig.managedCodex = md;
+  const hash = (x) => createHash("sha256").update(JSON.stringify(x)).digest("hex");
+  const dir = path.join(md.stateDir, hash(a.key)),
+    goalId = hash([a.key, a.nativeId, root, ctrl.objective, 5]);
+  mkdirSync(dir);
+  const db = new DatabaseSync(path.join(dir, "worker.db"));
+  t.after(() => db.close());
+  db.exec(
+    "create table bound_routes(goal_id text primary key,binding text); create table requests(goal_id text,state text,result text)",
+  );
+  db.prepare("insert into bound_routes values(?,?)").run(goalId, JSON.stringify([id, a.nativeId, root]));
+  const receipt = {
+    role: "worker",
+    action: "await-bound",
+    threadId: id,
+    transportStatus: "queued",
+    handoff: { threadId: id, requestId: "native-run:33", text: "NEVER_SHOW", submittedAt: now - 1000 },
+    timer: { key: hk, at },
+  };
+  const put = (state, meta) =>
+    db.prepare("insert into requests values(?,?,?)").run(goalId, state, JSON.stringify({ coordinator: meta }));
+  const report = async () => (await projectPortfolioStatus(f)).text;
+  put("waiting-for-bound-chat", receipt);
+  const text = await report();
+  assert.match(text, /已交给原对话[^\n]*活动工作台/);
+  assert.doesNotMatch(text, /没有正在处理或排队|大肥鱼正在处理|NEVER_SHOW|12345678/);
+  ctrl.mode = "paused";
+  assert.doesNotMatch(await report(), /已交给原对话/);
+  ctrl.mode = "active";
+  ctrl.goalRevision = 6;
+  assert.doesNotMatch(await report(), /已交给原对话/);
+  ctrl.goalRevision = 5;
+  put("waiting-for-bound-chat", { ...receipt, transportStatus: "interrupted" });
+  assert.match(await report(), /交接状态待核实[^\n]*活动工作台/);
+  put("waiting-for-bound-chat", { ...receipt, timer: { ...receipt.timer, key: "other" } });
+  assert.doesNotMatch(await report(), /已交给原对话|交接状态待核实/);
+  put("completed", { role: "bound-observe", action: "deliver" });
+  assert.doesNotMatch(await report(), /已交给原对话|交接状态待核实/);
 });

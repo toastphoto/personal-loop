@@ -1,5 +1,6 @@
 // Read-only evidence for a portfolio question. Never choose a worker or read conversation bodies here.
 import path from "node:path";
+import { createHash } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 import { subjectFor } from "./controls.mjs";
 import { redact } from "./project-activity.mjs";
@@ -39,7 +40,7 @@ const timeLabel = (value) =>
 
 function mappedProjects(overview, controls, provider, projectKey) {
   const projects = new Map();
-  const insert = (key, name, source, mode, startId) => {
+  const insert = (key, name, source, mode, control) => {
     if (
       !Object.hasOwn(providers, source) ||
       typeof key !== "string" ||
@@ -55,24 +56,90 @@ function mappedProjects(overview, controls, provider, projectKey) {
       source,
       name: current?.name || field(name) || providers[source] + "项目",
       mode: mode ?? current?.mode ?? "manual",
-      startId,
+      startId: control?.goalStartEvent,
+      control,
     });
   };
   for (const p of overview.projects ?? []) insert(p.key, p.name, p.provider);
-  for (const c of controls.list())
-    insert(c.projectKey, c.projectName, c.projectKey?.split(":")[0], c.mode, c.goalStartEvent);
+  for (const c of controls.list()) insert(c.projectKey, c.projectName, c.projectKey?.split(":")[0], c.mode, c);
   const counts = new Map();
   for (const p of projects.values()) counts.set(p.name, (counts.get(p.name) ?? 0) + 1);
   for (const p of projects.values()) p.label = counts.get(p.name) > 1 ? providers[p.source] + " · " + p.name : p.name;
   return projects;
 }
 
+// A finished dispatch can leave a handoff on the original chat. Only its exact pending review is current evidence.
+function boundHandoff(nativeConfig, project, timer, now) {
+  const m = nativeConfig.managedCodex,
+    c = project.control,
+    b = m?.boundChats?.[project.key];
+  if (
+    !b ||
+    !m.enabled ||
+    !m.coordinatorProjectKeys?.includes(project.key) ||
+    b.root !== m.projectRoots?.[project.key] ||
+    project.key !== "codex:local:" + encodeURIComponent(b.projectId) ||
+    !path.isAbsolute(b.root ?? "") ||
+    !path.isAbsolute(m.stateDir ?? "") ||
+    !b.threadId ||
+    !c?.goalStartEvent ||
+    !Number.isSafeInteger(c.goalRevision) ||
+    c.goalRevision < 1 ||
+    !c.objective ||
+    (c.deadline && !(asDate(c.deadline) > now)) ||
+    (c.expectedThreadId && c.expectedThreadId !== b.threadId)
+  )
+    return null;
+  const hash = (value) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
+  const goalId = hash([project.key, b.projectId, b.root, c.objective, c.goalRevision]);
+  let db;
+  try {
+    db = new DatabaseSync(path.join(m.stateDir, hash(project.key), "worker.db"), { readOnly: true });
+    db.exec("PRAGMA query_only=ON; BEGIN");
+    const pin = db.prepare("SELECT binding FROM bound_routes WHERE goal_id=?").get(goalId);
+    if (pin?.binding !== JSON.stringify([b.threadId, b.projectId, b.root])) return null;
+    const row = db
+      .prepare(
+        `SELECT state,
+      json_extract(result,'$.coordinator.action') action,
+      json_extract(result,'$.coordinator.threadId') thread,
+      json_extract(result,'$.coordinator.handoff.threadId') target,
+      json_extract(result,'$.coordinator.handoff.requestId') request,
+      json_extract(result,'$.coordinator.handoff.submittedAt') submitted,
+      json_extract(result,'$.coordinator.timer.key') timer,
+      json_extract(result,'$.coordinator.timer.at') due,
+      json_extract(result,'$.coordinator.transportStatus') transport
+      FROM requests WHERE goal_id=? ORDER BY rowid DESC LIMIT 1`,
+      )
+      .get(goalId);
+    if (
+      row?.state !== "waiting-for-bound-chat" ||
+      row.action !== "await-bound" ||
+      row.thread !== b.threadId ||
+      row.target !== b.threadId ||
+      timer.key !== "bound-check-" + row.request ||
+      timer.key !== row.timer ||
+      asDate(row.due) !== asDate(timer.due) ||
+      !Number.isFinite(row.submitted) ||
+      row.submitted > now ||
+      now - row.submitted >= 86400000
+    )
+      return null;
+    return ["queued", "in-thread"].includes(row.transport) ? "handedOff" : "handoffUnknown";
+  } catch {
+    return "handoffUnknown";
+  } finally {
+    db?.close();
+  }
+}
 function hubStatus(nativeConfig, projects, now, focus) {
   const rules = new Map([...projects.values()].map((p) => ["native-project:" + subjectFor(p.key), p.label]));
   const groups = {
     running: new Set(),
     queued: new Set(),
     unknown: new Set(),
+    handedOff: new Set(),
+    handoffUnknown: new Set(),
     decisions: new Set(),
     review: new Map(),
     recent: new Map(),
@@ -110,7 +177,8 @@ function hubStatus(nativeConfig, projects, now, focus) {
               : "unknown";
       groups[group].add(rules.get(row.rule));
     }
-    if (["waiting", "decisions", "review", "overview"].includes(focus)) {
+    const showHandoffs = ["running", "queued", "overview"].includes(focus);
+    if (showHandoffs || ["waiting", "decisions", "review"].includes(focus)) {
       const current = new Map(
         [...projects.values()]
           .filter((p) => p.mode === "active")
@@ -129,21 +197,26 @@ function hubStatus(nativeConfig, projects, now, focus) {
         const p = current.get(row.rule);
         return p && (!p.startId || asDate(row.created) >= starts.get(subjectFor(p.key) + ":" + p.startId));
       };
-      for (const row of select(
-        "cards",
-        "json_extract(data,'$.created_at') AS created",
-        "json_extract(data,'$.state')='open' AND json_extract(data,'$.kind')='ask'",
-      ))
-        if (currentGoal(row)) groups.decisions.add(rules.get(row.rule));
+      if (["waiting", "decisions", "overview"].includes(focus))
+        for (const row of select(
+          "cards",
+          "json_extract(data,'$.created_at') AS created",
+          "json_extract(data,'$.state')='open' AND json_extract(data,'$.kind')='ask'",
+        ))
+          if (currentGoal(row)) groups.decisions.add(rules.get(row.rule));
       for (const row of select(
         "timers",
-        "json_extract(data,'$.at') AS due,json_extract(data,'$.created_at') AS created",
+        "json_extract(data,'$.key') AS key,json_extract(data,'$.at') AS due,json_extract(data,'$.created_at') AS created",
         "json_extract(data,'$.event_id') IS NULL",
       )) {
         const name = rules.get(row.rule),
           due = asDate(row.due);
-        if (currentGoal(row) && Number.isFinite(due) && (!groups.review.has(name) || due < groups.review.get(name)))
-          groups.review.set(name, due);
+        if (!currentGoal(row) || !Number.isFinite(due)) continue;
+        if (showHandoffs && /^bound-check-native-run:[1-9][0-9]*(?::attempt:[1-9][0-9]*)?$/u.test(row.key)) {
+          const state = boundHandoff(nativeConfig, current.get(row.rule), row, now);
+          if (state) groups[state].add(name);
+        }
+        if (!groups.review.has(name) || due < groups.review.get(name)) groups.review.set(name, due);
       }
     }
     // Ask for the latest completion per known rule rather than materializing historical run records.
@@ -338,6 +411,8 @@ export async function projectPortfolioStatus({
     if (focus !== "queued") show("大肥鱼正在处理", hub.running);
     show("大肥鱼排队中", hub.queued);
     show("执行状态待核实", hub.unknown);
+    show("已交给原对话，等待回复", hub.handedOff);
+    show("原对话交接状态待核实", hub.handoffUnknown);
     if (!lines.length)
       lines.push(focus === "queued" ? "大肥鱼当前没有排队的项目。" : "大肥鱼当前没有正在处理或排队的项目。");
     if (focus === "overview") {
