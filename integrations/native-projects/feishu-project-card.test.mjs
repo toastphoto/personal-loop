@@ -530,3 +530,40 @@ test("unknown, empty, stale and failed activity do not imply that the Agent has 
   assert.equal(tagged(card, "button").length, 0);
   budget(card);
 });
+
+test("the mobile detail separates the previous goal from an active goal and puts available actions before history", () => {
+  const objective = "核对试用条件。" + "私有的执行细节。".repeat(50);
+  const make = (extra) => {
+    const p = controlledProject({ objective, maxSteps: 3, activity: activity(), ...extra });
+    return renderProjectCard(view([p]), { screen: "detail", alias: p.alias }, mutationContext);
+  };
+  const visible = (o) => {
+    if (o?.tag === "collapsible_panel" && !o.expanded) return o.header.title.content;
+    if (Array.isArray(o)) return o.map(visible).join(" ");
+    if (o && typeof o === "object")
+      return Object.entries(o)
+        .filter(([k]) => !["behaviors", "confirm"].includes(k))
+        .map(([, v]) => visible(v))
+        .join(" ");
+    return typeof o === "string" ? o : "";
+  };
+  for (const extra of [{ mode: "manual" }, { mode: "active", canPause: true }, { mode: "paused", canResume: true }]) {
+    const card = make(extra);
+    const first = visible(card);
+    assert.ok(!first.includes("私有的执行细节"));
+    assert.ok(JSON.stringify(card).includes("私有的执行细节"));
+    if (extra.mode === "manual") {
+      assert.ok(!first.includes("当前目标"));
+      assert.ok(first.includes("设置目标"));
+      assert.ok(first.indexOf("设置目标") < first.indexOf("目标详情"));
+    } else assert.ok(first.includes("核对试用条件"));
+  }
+  const d = make({
+    mode: "manual",
+    draft: { objective: "准备员工试用清单。草稿中详细的验收和分配要求", maxSteps: 3, revision: 1 },
+    canStart: true,
+  });
+  assert.ok(visible(d).includes("草稿"));
+  assert.ok(visible(d).includes("准备员工试用清单"));
+  assert.ok(!visible(d).includes("草稿中详细的验收和分配要求"));
+});

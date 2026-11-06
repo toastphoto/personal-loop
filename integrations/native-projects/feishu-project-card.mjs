@@ -85,10 +85,7 @@ function activityWork(value) {
   if (!value || typeof value !== "object" || !validNativeId(value.nativeId)) return null;
   return {
     nativeId: value.nativeId,
-    title: short(
-      value.title && value.title !== value.nativeId ? value.title : `未命名会话 · ${value.nativeId.slice(-6)}`,
-      140,
-    ),
+    title: typeof value.title === "string" && value.title !== value.nativeId ? short(value.title, 140) : "",
     state: Object.hasOwn(ACTIVITY_STATES, value.state) ? value.state : "unknown",
     nativeState: typeof value.nativeState === "string" ? short(value.nativeState, 60) : "unknown",
     updatedAt: activityTime(value.updatedAt),
@@ -136,7 +133,9 @@ function activityView(value) {
           : "unknown",
       };
     }
-    selected = { ...selected, latestReply };
+    const resultSummary =
+      typeof value.selected.resultSummary === "string" ? value.selected.resultSummary.slice(0, 1600) : "";
+    selected = { ...selected, latestReply, resultSummary };
   }
   return {
     status: ["available", "empty", "unavailable", "stale", "loading"].includes(value.status)
@@ -405,61 +404,154 @@ function projectControls(p, context) {
     );
   return buttons.length ? row(buttons.map((b) => column([b]))) : null;
 }
+// Use only the selected reply (or its verified delivered summary). Keep the source available in a fold.
+function replyDigest(source, delivered = false) {
+  const lines = source.replace(/```[\s\S]*?(?:```|$)/g, "\n").split(/\r?\n/);
+  const clean = (v) =>
+    v
+      .replace(/^\s*(?:#{1,6}\s+|>\s*|[-*]\s+|\d+[.)、]\s*)/u, "")
+      .replace(/\*\*|__/g, "")
+      .trim();
+  const technical = (v) =>
+    /(?:https?:\/\/|(?:^|[\s(`])(?:\.\.?\/|\/|~\/)|\b[a-z][\w.-]+\/[\w.-]+|\b[\w.-]+\.(?:md|json|ndjson|ya?ml|py|m?js|ts|sql|sh)\b|[a-f\d]{24,}|[{}]|`)/iu.test(
+      v,
+    );
+  const handoff = !delivered && /^项目简报[：:]\s*(.+)$/u.exec(lines.find((line) => line.trim())?.trim() ?? "")?.[1];
+  if (handoff && !technical(handoff) && !/[|｜]/u.test(handoff)) return short(handoff, 118);
+  const prose = lines.flatMap((line) => {
+    if (/[|｜]/u.test(line) || /^(?:下表|证据简称|证据来源|文件与行号|以下是|以下为)/u.test(clean(line))) return [];
+    return (clean(line).match(/[^。！？!?]+[。！？!?]?/gu) ?? [])
+      .map((s) => s.trim())
+      .filter((v) => v.length > 3 && !technical(v) && !/[:：]$/.test(v));
+  });
+  if (delivered && prose.length > 0 && prose.length <= 2 && prose.join("").length <= 118) return prose.join("");
+  // For an evidence table, use the status cells only when the writer explicitly labeled that column.
+  let statusCol = -1;
+  const statuses = [];
+  for (const line of lines) {
+    if (!line.trim().startsWith("|")) {
+      statusCol = -1;
+      continue;
+    }
+    const cells = line
+      .trim()
+      .replace(/^\||\|$/g, "")
+      .split("|")
+      .map(clean);
+    const header = cells.findIndex((c) => /^(已确定|当前情况|当前状态|进展|结论|现状)$/.test(c));
+    if (header >= 0) {
+      statusCol = header;
+      continue;
+    }
+    if (statusCol >= 0 && cells[statusCol] && /[\p{L}]/u.test(cells[statusCol]) && !technical(cells[statusCol])) {
+      statuses.push(cells[statusCol]);
+    }
+  }
+  const status = /^(?:当前|目前|现阶段|现在|还在|仍在|仍需)/u;
+  const decision =
+    /(?:待(?:你|您|定|选|选择|决定|确认)|需要(?:你|您|决定)|请(?:你|您)?选择|尚待|尚需|接下来|下一步|建议先)/u;
+  const first = prose.find((v) => status.test(v)) ?? statuses[0] ?? prose[0];
+  if (!first) return "";
+  const next =
+    !decision.test(first) &&
+    [...prose, ...statuses.flatMap((v) => v.split(/[；;]/u))].find(
+      (v) => decision.test(v) && !first.includes(v) && !technical(v),
+    );
+  const finish = (v) => (/[。！？.!?…]$/.test(v) ? v : v + "。");
+  const digest = (finish(first) + (next ? finish(next) : ""))
+    .replaceAll("视觉气质", "设计风格")
+    .replaceAll("放量门槛", "扩大使用的条件");
+  return short(digest, 118);
+}
+
+function workName(work, noun, selected, index) {
+  const title = work.title.trim();
+  if (
+    title &&
+    !/^(?:未命名(?:会话|任务|记录)?|untitled(?: (?:chat|thread|session))?)(?:\s*[·-].*)?$/i.test(title) &&
+    !/^[a-f\d]{8}(?:[a-f\d-]{12,})$/i.test(title)
+  )
+    return short(title, 42);
+  const subject =
+    work.nativeId === selected?.nativeId &&
+    selected.latestReply?.text.split("\n", 1)[0].match(/《([^《》\n]{2,50})》/u)?.[1];
+  if (subject) return short(subject, 42);
+  return work.updatedAt
+    ? activityDate(work.updatedAt).slice(0, -3) + " 的" + noun
+    : `日期未记录的${noun}（第 ${index + 1} 条）`;
+}
+
 function activitySection(p, context) {
   const a = p.activity;
   if (!a) return null;
-  const elements = [];
-  if (a.status === "loading") elements.push(md("正在读取原生任务与最近回复"));
-  else if (a.status === "unavailable") elements.push(md("暂时无法读取原生进度 请稍后刷新核对"));
-  else if (a.status === "empty") elements.push(md("这次未读到可关联的Issue或会话 不代表项目没有进展"));
+  const noun = p.provider === "multica" ? "事项" : "会话";
+  const selected = a.selected;
+  const reply = selected?.latestReply;
+  const elements = [],
+    info = [];
+  if (a.status === "loading") elements.push(md("正在读取项目记录"));
+  else if (a.status === "unavailable") elements.push(md("暂时无法读取项目记录"));
+  else if (a.status === "empty") elements.push(md("这次尚未找到可查看的项目记录"));
   else {
-    if (a.status === "stale") elements.push(muted("这是缓存的动态 请刷新核对最新状态"));
-    if (a.selected) {
-      const selected = a.selected;
-      elements.push(md(`**${escape(selected.title, 140)}**`), md(`原生执行状态 ${ACTIVITY_STATES[selected.state]}`));
-      if (a.selection === "latest-updated") elements.push(muted("按更新时间选择的任务"));
-      if (a.selection === "trusted-active") elements.push(muted("优先显示已核实正在执行的任务"));
-      if (selected.membership === "cwd-unassigned") elements.push(muted("目录关联会话 原生项目归属尚未设置"));
-      const reply = selected.latestReply;
+    if (a.status === "stale") elements.push(muted("上次的缓存记录"));
+    if (selected) {
+      const name = workName(selected, noun, selected, 0);
+      const label = ["final", "final_answer"].includes(reply?.phase)
+        ? "最近最终回复"
+        : ["progress", "commentary", "partial_answer"].includes(reply?.phase)
+          ? "最近进展"
+          : "回复";
+      const delivered = reply && replyDigest(selected.resultSummary, true);
+      const concise = reply && (delivered || replyDigest(reply.text));
+      const caption = delivered
+        ? "上次结论"
+        : ["progress", "commentary", "partial_answer"].includes(reply?.phase)
+          ? "进展摘要"
+          : "回复摘要";
+      const running =
+        a.status !== "stale" && ["running", "inProgress", "queued", "pending", "failed"].includes(selected.state);
+      elements.push(md(`**${caption}**${running ? " · " + ACTIVITY_STATES[selected.state] : ""}`));
+      elements.push(
+        md(concise ? escape(concise, 118) : reply ? "回复里是明细，可展开查看。" : "这条记录尚未读到回复。"),
+      );
+      info.push(md(`**${escape(name, 42)}**`), muted(`记录中的执行状态：${ACTIVITY_STATES[selected.state]}`));
+      if (a.selection === "latest-updated") info.push(muted("按更新时间选择的记录"));
+      if (a.selection === "trusted-active") info.push(muted("优先显示已核实正在执行的记录"));
+      if (selected.membership === "cwd-unassigned") info.push(muted("目录关联会话 原生项目归属尚未设置"));
       if (reply) {
-        const label = ["final", "final_answer"].includes(reply.phase)
-          ? "最近最终回复"
-          : ["progress", "commentary", "partial_answer"].includes(reply.phase)
-            ? "最近进展"
-            : "最近Agent回复";
-        elements.push(
+        info.push(
           md(`**${label}**`),
           md("> " + goalMarkdown(reply.text).replace(/\r\n?/g, "\n").split("\n").join("\n> ")),
         );
-        if (reply.truncated) elements.push(muted("回复较长 此处已截断"));
-        if (reply.at)
-          elements.push(
-            muted(
-              `${reply.timeSource === "turn-completed" ? "本轮结束时间" : "回复记录时间"} ${activityDate(reply.at)}`,
-            ),
-          );
-        else elements.push(muted("回复时间待核对"));
-      } else elements.push(muted("尚未读到可见回复 当前读取结果不足以判断任务进展"));
-    } else elements.push(md("尚未选定可核对的任务 请刷新后查看"));
+        if (reply.truncated) info.push(muted("回复较长 此处已截断"));
+        info.push(
+          muted(
+            reply.at
+              ? `${reply.timeSource === "turn-completed" ? "本轮结束时间" : "回复记录时间"} ${activityDate(reply.at)}`
+              : "回复时间待核对",
+          ),
+        );
+      }
+    } else elements.push(md("尚未选定记录"));
   }
-  if (a.observedAt)
-    elements.push(muted(`${a.status === "stale" ? "上次读取时间" : "读取时间"} ${activityDate(a.observedAt)}`));
-  else elements.push(muted("读取时间待核对"));
-  if (!a.complete) elements.push(muted("本次读取不完整 已显示能确认的部分"));
-  if (a.note) elements.push(muted(escape(a.note, 300)));
+  if (a.observedAt) info.push(muted(`读取时间 ${activityDate(a.observedAt)}`));
+  if (!a.complete) info.push(muted("本次读取范围尚未完整"));
+  if (a.note) info.push(muted(escape(a.note, 300)));
+  if (info.length) elements.push(panel(reply ? "查看回复原文与来源" : "查看记录来源", info));
   if (context.interactive !== false) {
-    for (const [i, work] of a.works.entries())
-      elements.push(
-        button(context, `任务 ${i + 1} · ${plain(work.title, 65)}`, "activity-work", {
-          alias: p.alias,
-          workId: work.nativeId,
-        }),
-      );
-    elements.push(button(context, "刷新Agent回复", "activity-refresh", { alias: p.alias }));
+    const names = a.works.map((w, i) => workName(w, noun, selected, i));
+    const history = a.works.map((w, i) => {
+      const name = names.indexOf(names[i]) !== names.lastIndexOf(names[i]) ? `${names[i]}（记录 ${i + 1}）` : names[i];
+      return button(context, name, "activity-work", { alias: p.alias, workId: w.nativeId });
+    });
+    const tools = [
+      muted(`点${noun}名称查看当时的回复`),
+      ...history,
+      button(context, "重新读取回复", "activity-refresh", { alias: p.alias }),
+    ];
+    elements.push(panel(history.length ? `查看${noun}记录（${history.length}）` : "更新记录", tools));
   }
-  const section = panel("原生任务与Agent回复", elements);
-  section.expanded = true;
-  return section;
+  return block(elements);
 }
 function detail(v, navigation, context) {
   const p = v.projects.find((p) => p.alias === navigation.alias);
@@ -471,34 +563,48 @@ function detail(v, navigation, context) {
         : block([md("刷新目录：/loop 项目")]),
     ]);
   const controls = projectControls(p, context);
-  const draft = p.draft?.objective
-    ? [
-        md(`**目标草稿 · 尚未启动**\n${escape(p.draft.objective, 500)}`),
-        ...(Number.isSafeInteger(p.draft.maxSteps) ? [muted(`草稿自动运行上限 ${p.draft.maxSteps}`)] : []),
-      ]
-    : [];
-  return rootCard("项目详情", PROVIDERS[p.provider], [
-    block(
-      [
-        md(`**${escape(p.name, 140)}**`, "heading-3"),
-        md(`当前 ${mode(p)}`),
-        muted(escape(capability(p))),
-        ...(p.controlReason ? [muted(escape(p.controlReason))] : []),
-      ],
-      true,
-    ),
-    block([
-      md(p.objective ? `**当前目标**\n${escape(p.objective)}` : "尚未设置自动推进目标"),
-      ...(p.maxSteps ? [muted(`自动运行上限 ${p.maxSteps}`)] : []),
-      ...draft,
-      ...(p.activity ? [activitySection(p, context)] : []),
-    ]),
+  const goalLine = (value) =>
+    escape(
+      value
+        .trim()
+        .split(/[。；;\r\n]/u)
+        .find((line) => line.trim())
+        ?.trim() ?? value,
+      64,
+    );
+  const brief = [md(`**当前 ${mode(p)}**`)];
+  if (p.mode !== "manual" && p.objective) {
+    brief.push(md(`${p.mode === "paused" ? "已暂停的目标" : "当前目标"} · ${goalLine(p.objective)}`));
+  }
+  if (p.draft?.objective) brief.push(md(`目标草稿 · ${goalLine(p.draft.objective)}`));
+  if (p.mode === "manual" && !p.draft?.objective) {
+    brief.push(
+      muted(
+        ["managed-read-only", "native"].includes(p.execution) ? "设置目标后，由你确认启动" : "目前可以查看项目进展",
+      ),
+    );
+  }
+
+  const details = [
+    ...(p.objective ? [md(`**${p.mode === "manual" ? "上次目标" : "已设目标"}**\n${goalMarkdown(p.objective)}`)] : []),
+    ...(p.maxSteps ? [muted(`自动运行上限 ${p.maxSteps} 轮`)] : []),
+    ...(p.draft?.objective ? [md(`**未启动的草稿**\n${goalMarkdown(p.draft.objective)}`)] : []),
+    ...(p.draft?.maxSteps ? [muted(`草稿上限 ${p.draft.maxSteps} 轮`)] : []),
+    muted(escape(capability(p))),
+    ...(p.controlReason ? [muted(escape(p.controlReason))] : []),
+    ...commandHelp(p).elements,
+  ];
+  const card = rootCard(p.name, PROVIDERS[p.provider], [
+    block(brief, true),
     ...(controls ? [controls] : []),
-    commandHelp(p),
+    ...(p.activity ? [activitySection(p, context)] : []),
+    panel("目标详情与操作说明", details),
     ...(context.interactive !== false
       ? [navigationButtons(context, { screen: "detail", alias: p.alias, provider: p.provider }, !controls)]
       : []),
   ]);
+  card.config.summary.content = plain(`${p.name} · ${mode(p)}`, 100);
+  return card;
 }
 function backToProject(context, alias) {
   return row([column([button(context, "返回项目", "detail", { alias })])]);

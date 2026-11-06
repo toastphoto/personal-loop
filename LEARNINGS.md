@@ -36,3 +36,5 @@
 - Do not label the nightly suite passed when deep checks pass but performance budgets fail. Keep measured failures, isolate resource-sensitive checks and compare baseline without loosening thresholds.
 
 - Test project controls and decision buttons separately. Confirm the question uses a button on its delivered message, the authorized click creates one answer event, and that event wakes the intended native goal.
+
+- Phone project cards should lead with the outcome and the next decision. Distinguish past goals and conversation history from active work. Check what is visible with every optional panel closed.

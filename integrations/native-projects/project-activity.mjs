@@ -1,4 +1,6 @@
 // Read one selected provider. This service never dispatches work or imports provider-specific control APIs.
+import { createHash } from "node:crypto";
+
 const fail = (code) => Object.assign(new Error(code), { code });
 const object = (value) => value !== null && typeof value === "object" && !Array.isArray(value);
 const validId = (value) =>
@@ -148,7 +150,7 @@ function replyView(reply) {
 }
 
 export class ProjectActivity {
-  constructor(catalog, { cacheMs = 30000, timeoutMs = 8000, now = Date.now } = {}) {
+  constructor(catalog, { cacheMs = 30000, timeoutMs = 8000, now = Date.now, historyLabels = [] } = {}) {
     if (
       !object(catalog?.connectors) ||
       !Number.isFinite(cacheMs) ||
@@ -158,6 +160,16 @@ export class ProjectActivity {
       typeof now !== "function"
     )
       throw fail("PROJECT_ACTIVITY_INVALID_CONFIG");
+    if (!Array.isArray(historyLabels)) throw fail("PROJECT_ACTIVITY_INVALID_CONFIG");
+    this.historyLabels = new Map();
+    for (const entry of historyLabels) {
+      if (!object(entry) || !validId(entry.workId) || !validId(entry.title) || entry.title.length > 100)
+        throw fail("PROJECT_ACTIVITY_INVALID_CONFIG");
+      identity(entry.projectKey);
+      const key = JSON.stringify([entry.projectKey, entry.workId]);
+      if (this.historyLabels.has(key)) throw fail("PROJECT_ACTIVITY_INVALID_CONFIG");
+      this.historyLabels.set(key, entry);
+    }
     this.catalog = catalog;
     this.cacheMs = cacheMs;
     this.timeoutMs = timeoutMs;
@@ -329,6 +341,29 @@ export class ProjectActivity {
         if (!latestReply) notes.push("这条任务暂无可展示的Agent文本回复，或回复读取范围尚未完整。");
       }
     }
+    // Local display labels are private to this group. Native renames supersede a reviewed earlier title.
+    const labelFor = (row) => this.historyLabels.get(JSON.stringify([projectKey, row.nativeId]));
+    for (const row of rows) {
+      const label = labelFor(row);
+      if (label && (!row.title.trim() || row.title === row.nativeId || row.title === label.sourceTitle))
+        row.title = clip(redact(label.title), 100);
+    }
+    const report = labelFor(selected)?.report;
+    // A summary for a final answer must never follow a later message, edited excerpt or newer turn.
+    const resultSummary =
+      complete &&
+      latestReply?.id &&
+      latestReply.phase === "final_answer" &&
+      report?.replyId === latestReply.id &&
+      latestReply.at &&
+      report.replyAt === latestReply.at &&
+      selected.updatedAt &&
+      report.workUpdatedAt === selected.updatedAt &&
+      typeof report.summary === "string" &&
+      report.summary.trim() &&
+      createHash("sha256").update(latestReply.text).digest("hex") === report.replySha256
+        ? clip(redact(report.summary), 240)
+        : null;
     const comparison = rows.filter((row) => row.membership === selected.membership);
     const allTimesKnown = comparison.every((row) => row.updatedAt !== null);
     let selection = "order-only";
@@ -358,7 +393,7 @@ export class ProjectActivity {
       complete,
       selection,
       works,
-      selected: { ...selected, latestReply },
+      selected: { ...selected, latestReply, ...(resultSummary ? { resultSummary } : {}) },
       ...(notes.length ? { note: notes.join(" ") } : {}),
     };
   }

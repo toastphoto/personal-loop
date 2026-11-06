@@ -1,6 +1,7 @@
 // Keep one selected native scope, minimize reply data, and never turn timeouts or stale metadata into empty/live claims.
 import test from "node:test";
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { ProjectActivity } from "./project-activity.mjs";
 const key = "codex:local:p1";
 const iso = (n) => new Date(Date.UTC(2026, 10, 5, 0, n)).toISOString();
@@ -326,4 +327,48 @@ test("noncanonical keys and invalid work IDs reject before provider access", asy
     await assert.rejects(f.service.read(bad), { code: "PROJECT_ACTIVITY_INVALID_KEY" });
   await assert.rejects(f.service.read(key, { workId: "" }), { code: "PROJECT_ACTIVITY_INVALID_WORK" });
   assert.equal(f.calls.length, 0);
+});
+
+test("private history labels never cross project or work scope, or cause extra conversation reads", async () => {
+  const report = {
+    replyId: "m1",
+    replyAt: iso(4),
+    workUpdatedAt: iso(1),
+    replySha256: createHash("sha256").update("Assistant answer").digest("hex"),
+    summary: "A verified earlier report",
+  };
+  const annotations = [
+    { projectKey: key, workId: "t1", title: "Review the launch plan", report },
+    { projectKey: key, workId: "t2", title: "Review the demo" },
+    { projectKey: key, workId: "t3", title: "Locally named" },
+    {
+      projectKey: "codex:local:another",
+      workId: "t1",
+      title: "Private foreign title",
+      report: { ...report, summary: "Private foreign summary" },
+    },
+  ];
+  const items = [work("t1", { title: "" }), work("t2", { title: "" }), work("t3", { title: "Native author title" })];
+  const f = fixture({ items, options: { historyLabels: annotations } });
+  const view = await f.service.read(key, { workId: "t1" });
+  assert.equal(view.selected.title, "Review the launch plan");
+  assert.equal(view.selected.resultSummary, report.summary);
+  assert.equal(view.works.find((x) => x.nativeId === "t2").title, "Review the demo");
+  assert.equal(view.works.find((x) => x.nativeId === "t3").title, "Native author title");
+  assert.equal(f.calls.filter((x) => x[0] === "reply").length, 1);
+  assert.doesNotMatch(JSON.stringify(view), /Private foreign|replySha256/);
+
+  const original = f.backend.readConversation;
+  for (const patch of [
+    { latestReply: { id: "new", at: iso(4), phase: "final_answer", text: "Assistant answer" } },
+    { latestReply: { id: "m1", at: iso(4), phase: "final_answer", text: "Edited answer" } },
+    { latestReply: { id: "m1", at: iso(6), phase: "final_answer", text: "Assistant answer" } },
+    { latestReply: { id: "m1", at: iso(4), phase: "commentary", text: "Assistant answer" } },
+    { updatedAt: iso(6) },
+    { complete: false },
+    { latestReply: null },
+  ]) {
+    f.backend.readConversation = async (...args) => ({ ...(await original(...args)), ...patch });
+    assert.equal((await f.service.read(key, { workId: "t1", force: true })).selected.resultSummary, undefined);
+  }
 });
