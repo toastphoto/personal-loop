@@ -106,6 +106,60 @@ export function renderDecisionCard(card: Card) {
   };
 }
 
+// Keep the submitted result intact, and lift only a short source sentence into the phone preview.
+export function renderResultCard(card: Card) {
+  if (
+    card.kind !== "notice" ||
+    !Number.isSafeInteger(card.id) ||
+    card.id < 1 ||
+    !Number.isSafeInteger(card.version) ||
+    card.version < 1
+  )
+    throw problem("INVALID_RESULT_CARD");
+  const plain = (content: string) => ({ tag: "plain_text", content });
+  const block = (content: string) => ({ tag: "div", text: plain(content) });
+  const fullTitle = clean(card, card.title);
+  const chars = [...fullTitle];
+  const title = chars.length <= 72 ? fullTitle : chars.slice(0, 71).join("") + "…";
+  const body = [
+    ...(title !== fullTitle ? [fullTitle] : []),
+    clean(card, card.text),
+    ...(card.result?.trim() ? ["处理说明：" + clean(card, card.result)] : []),
+  ]
+    .filter(Boolean)
+    .join("\n");
+  const elements: Record<string, unknown>[] = [];
+  const lines = body.trim().split(/\r?\n/);
+  const technical =
+    /[|｜`]|https?:\/\/|(?:^|[\s(])(?:~\/|\/|\.\/)|\b[\w.-]+\.(?:md|json|yaml|yml|ts|py|log)\b|[a-f\d]{32,}/iu;
+  if ([...body].length <= 96 && lines.length <= 2 && !technical.test(body)) {
+    if (body.trim() && body.trim() !== title.trim()) elements.push(block(body));
+  } else {
+    const candidates = body
+      .replace(/```[\s\S]*?(?:```|$)/g, "\n")
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter((line) => !/^(?:[#>*\[-]|\d+[.、)]|证据|来源|依据)/u.test(line))
+      .map((line) => line.match(/^.{3,79}?[。！？!?]/u)?.[0] ?? "")
+      .filter((s) => s && !technical.test(s) && !title.includes(s));
+    const snippet = candidates.find((s) => /^(?:建议|下一步|目前|需要你|先)/u.test(s)) ?? candidates[0];
+    if (snippet) elements.push(block(snippet));
+    elements.push({
+      tag: "collapsible_panel",
+      expanded: false,
+      header: { title: plain("查看完整结果") },
+      elements: [block(body)],
+    });
+  }
+  if (!elements.length) elements.push(block("无需回复"));
+  return {
+    schema: "2.0",
+    config: { update_multi: true, enable_forward: false, summary: { content: title } },
+    header: { title: plain(title), template: card.state === "closed" ? "grey" : "blue" },
+    body: { direction: "vertical", elements },
+  };
+}
+
 function configuration(options: Record<string, unknown>) {
   const { profile, chatId, lark, deliveryNamespace } = options;
   if (typeof profile !== "string" || !/^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$/.test(profile))
@@ -123,6 +177,12 @@ function configuration(options: Record<string, unknown>) {
     interactiveAsksFromId < 1
   )
     throw problem("FEISHU_INTERACTIVE_ASK_CONFIG_INVALID");
+  const resultCutoff = options.interactiveResultsFromId;
+  if (
+    resultCutoff !== undefined &&
+    (typeof resultCutoff !== "number" || !Number.isSafeInteger(resultCutoff) || resultCutoff < 1)
+  )
+    throw problem("FEISHU_INTERACTIVE_RESULT_CONFIG_INVALID");
   const deliveryPrefix = `pl-card-${createHash("sha256")
     .update(JSON.stringify([deliveryNamespace, chatId]))
     .digest("hex")
@@ -134,6 +194,7 @@ function configuration(options: Record<string, unknown>) {
     program: (lark as string | undefined) ?? "lark-cli",
     interactiveAsks,
     interactiveAsksFromId,
+    resultCutoff,
   };
 }
 
@@ -161,7 +222,8 @@ function call(program: string, args: string[], body: string, signal: AbortSignal
 }
 
 export default async function groupText({ hub, options, log, signal }: ChannelContext) {
-  const { program, profile, chatId, deliveryPrefix, interactiveAsks, interactiveAsksFromId } = configuration(options);
+  const { program, profile, chatId, deliveryPrefix, interactiveAsks, interactiveAsksFromId, resultCutoff } =
+    configuration(options);
   while (!signal.aborted) {
     let card: Card | null;
     try {
@@ -175,19 +237,25 @@ export default async function groupText({ hub, options, log, signal }: ChannelCo
     if (!card || signal.aborted) continue;
     try {
       if (card.ref !== null && !messageId(card.ref)) throw problem("FEISHU_MESSAGE_REF_INVALID");
-      const interactive = interactiveAsks && card.kind === "ask" && card.id >= interactiveAsksFromId;
+      const interactive =
+        card.kind === "ask"
+          ? interactiveAsks && card.id >= interactiveAsksFromId
+          : resultCutoff !== undefined && card.id >= resultCutoff;
+      const content = interactive
+        ? JSON.stringify(card.kind === "ask" ? renderDecisionCard(card) : renderResultCard(card))
+        : null;
       const args = ["--profile", profile, "im"];
       let body: string;
-      if (interactive && card.ref) {
+      if (content && card.ref) {
         args.push("messages", "patch", "--message-id", card.ref, "--as", "bot", "--data", "-");
-        body = JSON.stringify({ content: JSON.stringify(renderDecisionCard(card)) });
+        body = JSON.stringify({ content });
       } else {
         if (card.ref) args.push("+messages-edit", "--message-id", card.ref);
         else args.push("+messages-send", "--chat-id", chatId);
         args.push("--as", "bot");
-        if (interactive) {
+        if (content) {
           args.push("--msg-type", "interactive", "--content", "-");
-          body = JSON.stringify(renderDecisionCard(card));
+          body = content;
         } else {
           args.push("--text", "-");
           body = renderText(card);

@@ -85,3 +85,13 @@ test("a coordinator record displays its reported progress, never the internal ro
     /试用清单已整理/,
   );
 });
+
+test("a worker's usable deliverable remains available in the history fold without routing fields", () => {
+  const content = "1. 整理资料。\n2. 验证产物。";
+  const data = card(JSON.stringify({ action: "deliver", summary: "先核对资料，再验证结果。", deliverable: content }));
+  assert.match(visible(data), /先核对资料/);
+  assert.doesNotMatch(visible(data), /整理资料。/);
+  const serialized = JSON.stringify(data);
+  assert.match(serialized, /整理资料/);
+  assert.doesNotMatch(serialized, /deliverable/);
+});

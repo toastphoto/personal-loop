@@ -141,7 +141,7 @@ export function coordinatedPrompt({ stage, goal, cwd, file, remaining }) {
       ? "本人刚才或此前已选定：" + JSON.stringify(stage.chosen) + "。沿此分支继续，不再要求他重复决定。"
       : "已获安排，可直接开展。",
     stage.review ? "复查事项：" + JSON.stringify(stage.review) : "",
-    '任务完成返回 {"action":"deliver","summary":"一条结论，不超过100字","deliverable":"可直接发回群的实际产物，最多1200字；例如五条清单要写五条完整检查项，不要只说已完成"}，不含项目路径、凭据或调度细节。',
+    '任务完成返回 {"action":"deliver","summary":"用普通中文说清实际发现或建议先做什么，不超过80字；不要只说已整理方案","deliverable":"可直接发回群的实际产物，最多1200字；例如五条清单要写五条完整检查项，不要只说已完成"}，不含项目路径、凭据或调度细节。',
     remaining > 0
       ? '确有外部等待，返回 {"action":"review","summary":"已有进展","at":"未来含时区的时间","about":"到时核对的证据与验收方式"}。'
       : "这是预算内最后一轮，请直接交付能确认的结果及局限，不安排下一轮。",

@@ -404,6 +404,15 @@ function projectControls(p, context) {
     );
   return buttons.length ? row(buttons.map((b) => column([b]))) : null;
 }
+function structuredReply(source) {
+  const json = source.trim().replace(/^```json\s*\n([\s\S]*)\n```$/iu, "$1");
+  if (!json.startsWith("{")) return null;
+  try {
+    return JSON.parse(json);
+  } catch {
+    return null;
+  }
+}
 // Use only the selected reply (or its verified delivered summary). Keep the source available in a fold.
 function replyDigest(source, delivered = false) {
   const lines = source.replace(/```[\s\S]*?(?:```|$)/g, "\n").split(/\r?\n/);
@@ -416,19 +425,15 @@ function replyDigest(source, delivered = false) {
     /(?:https?:\/\/|(?:^|[\s(`])(?:\.\.?\/|\/|~\/)|\b[a-z][\w.-]+\/[\w.-]+|\b[\w.-]+\.(?:md|json|ndjson|ya?ml|py|m?js|ts|sql|sh)\b|[a-f\d]{24,}|[{}]|`)/iu.test(
       v,
     );
-  const json = source.trim().replace(/^```json\s*\n([\s\S]*)\n```$/iu, "$1");
-  if (!delivered && json.startsWith("{")) {
-    try {
-      const record = JSON.parse(json);
-      const brief = ["ask", "dispatch"].includes(record.action)
-        ? record.progress
-        : ["deliver", "review"].includes(record.action)
-          ? record.summary
-          : null;
-      return typeof brief === "string" && brief.trim() && !technical(brief) ? short(brief, 118) : "";
-    } catch {
-      return "";
-    } // A clipped structured reply does not establish a result.
+  if (!delivered && /^(?:\{|```json)/iu.test(source.trim())) {
+    const record = structuredReply(source);
+    if (!record) return "";
+    const brief = ["ask", "dispatch"].includes(record.action)
+      ? record.progress
+      : ["deliver", "review"].includes(record.action)
+        ? record.summary
+        : null;
+    return typeof brief === "string" && brief.trim() && !technical(brief) ? short(brief, 118) : "";
   }
   const handoff = !delivered && /^项目简报[：:]\s*(.+)$/u.exec(lines.find((line) => line.trim())?.trim() ?? "")?.[1];
   if (handoff && !technical(handoff) && !/[|｜]/u.test(handoff)) return short(handoff, 118);
@@ -533,9 +538,14 @@ function activitySection(p, context) {
       if (a.selection === "trusted-active") info.push(muted("优先显示已核实正在执行的记录"));
       if (selected.membership === "cwd-unassigned") info.push(muted("目录关联会话 原生项目归属尚未设置"));
       if (reply) {
+        const structured = structuredReply(reply.text);
+        const resultText =
+          structured?.action === "deliver" && typeof structured.deliverable === "string"
+            ? structured.deliverable
+            : reply.text;
         info.push(
           md(`**${label}**`),
-          md("> " + goalMarkdown(reply.text).replace(/\r\n?/g, "\n").split("\n").join("\n> ")),
+          md("> " + goalMarkdown(resultText).replace(/\r\n?/g, "\n").split("\n").join("\n> ")),
         );
         if (reply.truncated) info.push(muted("回复较长 此处已截断"));
         info.push(

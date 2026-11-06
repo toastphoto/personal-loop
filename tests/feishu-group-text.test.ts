@@ -4,7 +4,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import channel, { renderDecisionCard, renderText } from "../plugins/feishu-group-text/channel.ts";
+import channel, { renderDecisionCard, renderResultCard, renderText } from "../plugins/feishu-group-text/channel.ts";
 import type { Card, ChannelContext } from "../host/channels.ts";
 
 const base: Card = {
@@ -208,6 +208,9 @@ test("required route configuration is rejected before reading cards", async (t) 
     { deliveryNamespace: undefined },
     { lark: "relative/script" },
     { interactiveAsks: "true" },
+    { interactiveResultsFromId: null },
+    { interactiveResultsFromId: 0 },
+    { interactiveResultsFromId: "3" },
     { interactiveAsksFromId: 0 },
     { interactiveAsksFromId: Number.MAX_SAFE_INTEGER + 1 },
   ]) {
@@ -374,4 +377,55 @@ test("unstructured questions, missing recommendations and empty reasons never fa
     assert.ok(printed.includes(data.text));
     assert.ok(!printed.includes("建议选「"));
   }
+});
+
+test("a delivered plan has a real headline and short verdict above its complete collapsed body", () => {
+  const title = "第一轮试用清单已完成";
+  const detail =
+    "建议先让一名新同事走完申请流程。\n\n一、详细安排\n" + "试用人逐项核对并签字。\n".repeat(80) + "最终核查";
+  const card = renderResultCard({ ...base, title, kind: "notice", text: detail, options: [] });
+  assert.equal(card.header.title.content, title);
+  const panels = card.body.elements.filter((e: any) => e.tag === "collapsible_panel") as any[];
+  assert.equal(panels.length, 1);
+  assert.equal(panels[0].expanded, false);
+  assert.equal(panels[0].elements[0].text.content, detail);
+  const visible = JSON.stringify(card.body.elements.filter((x: any) => x.tag !== "collapsible_panel"));
+  assert.match(visible, /建议先让一名新同事走完申请流程/);
+  assert.doesNotMatch(visible, /详细安排|最终核查/);
+  const onlyEvidence = renderResultCard({
+    ...base,
+    kind: "notice",
+    title,
+    text: "|证据|文件|\n|---|---|\n|完成|some/private.md|",
+    options: [],
+  });
+  assert.ok(onlyEvidence.body.elements.every((x: any) => x.tag === "collapsible_panel"));
+});
+test("notice message type stays fixed across version and body length after explicit opt-in", async (t) => {
+  const short = { ...base, kind: "notice" as const, title: "小组试用", text: "两位同事已确认时间。", options: [] };
+  const f = fixture(
+    t,
+    [
+      { ...short, id: 41, ref: "om_saved", version: 2 },
+      short,
+      { ...short, version: 2, ref: "om_saved", state: "closed", result: "归档", text: "试用准备详情。\n".repeat(120) },
+    ],
+    "empty-patch-ack",
+  );
+  f.context.options.interactiveResultsFromId = 42;
+  await channel(f.context);
+  const [before, created, edited] = f.calls();
+  assert.ok(before.args.includes("+messages-edit") && before.args.includes("--text"));
+  assert.ok(created.args.includes("interactive") && created.args.includes("--idempotency-key"));
+  const card = JSON.parse(created.input);
+  assert.equal(card.body.elements[0].text.content, short.text);
+  assert.equal(card.body.elements.length, 1);
+  assert.ok(edited.args.includes("patch") && edited.args.includes("om_saved"));
+  const after = JSON.parse(JSON.parse(edited.input).content);
+  assert.equal(
+    after.body.elements.some((x: any) => x.tag === "collapsible_panel" && !x.expanded),
+    true,
+  );
+  assert.match(edited.input, /归档/);
+  assert.equal(f.delivered.length, 3);
 });
