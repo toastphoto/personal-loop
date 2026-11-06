@@ -256,3 +256,93 @@ test("questions mentioned in narrative, malformed recommendations and exhausted 
     assert.equal(got.parsed.notice[0].text, body);
   }
 });
+
+const missingMaterial =
+  "需要你协助：用哪份样例核对员工入口？\n已核对：现有资料只有旧样例，正式版入口尚不能验收。\n1. 我已补好正式样例，重新核实\n2. 先用旧样例列待补项\n建议选第二项，因为能先完成不依赖正式样例的部分。";
+test("a confirmed need for owner help sends a scoped actionable question; choosing to supply material leads to re-verification", async (t) => {
+  const f = fixture(t, 3);
+  const router = await f.run(1, [f.activeEvent]);
+  f.setQueue("completed");
+  f.setReply(missingMaterial);
+  const stopped = await f.run(2, [router.parsed.events[0]]);
+  const ask = stopped.parsed.ask?.[0];
+  assert.ok(ask, "material blockers must not silently become a completed deliverable");
+  assert.match(ask.text, /现有资料只有旧样例/);
+  assert.equal(ask.recommend, 1);
+  assert.deepEqual(ask.options, ["我已补好正式样例，重新核实", "先用旧样例列待补项"]);
+  assert.equal(stopped.parsed.later, undefined);
+  assert.deepEqual((await f.run(2, [router.parsed.events[0]])).parsed.ask, [ask]);
+  const answer = eventAnswered(ask, 0);
+  f.setReply("已在原资料中重新核对该项。");
+  const resumed = await f.run(3, answer.events, { answers: answer.answers });
+  assert.equal(resumed.parsed.notice[0].text, "已在原资料中重新核对该项。");
+  assert.match(f.queuedText[1], /我已补好正式样例，重新核实/);
+  assert.match(f.queuedText[1], /重新核实|重新核对/);
+  assert.match(f.queuedText[1], /不代表|不等于/);
+});
+
+test("a confirmed missing input offers a recheck only with continuation budget", async (t) => {
+  for (const [budget, reply] of [
+    [2, missingMaterial],
+    [3, "需要你协助：请在原对话补一份脱敏样例。\n已核对：当前资料没有样例，无法验证表单。"],
+  ]) {
+    const f = fixture(t, budget);
+    const first = await f.run(1, [f.activeEvent]);
+    f.setQueue("completed");
+    f.setReply(reply);
+    const result = await f.run(2, [first.parsed.events[0]]);
+    if (budget === 3) {
+      const ask = result.parsed.ask[0];
+      assert.deepEqual(ask.options, ["我已处理，重新核实", "先暂停此目标"]);
+      assert.match(ask.text, /先处理/);
+      assert.equal(result.parsed.notice, undefined);
+      continue;
+    }
+    assert.equal(result.parsed.ask, undefined);
+    assert.equal(result.r.coordinator.action, "attention");
+    assert.match(result.parsed.notice[0].title, /协助/);
+    assert.match(result.parsed.notice[0].text, /样例/);
+    assert.doesNotMatch(result.parsed.notice[0].text, /已完成|马上自动/);
+  }
+});
+
+test("repeated lost verification asks the owner to check once without treating an ordinary wait as a blocker", async () => {
+  const { runBoundStage } = await import("./bound-coordination.mjs");
+  const started = Date.now() - 15 * 60000;
+  const threadId = "original";
+  const observed = async (handoff, status, code) =>
+    runBoundStage(
+      {
+        stage: { role: "bound-observe", handoff },
+        goal: {},
+        binding: { threadId },
+        runId: "7",
+        remaining: 1,
+        guard() {},
+      },
+      { inspectBoundChat: async () => ({ threadId, status, code }) },
+    );
+  const handoff = {
+    threadId,
+    submittedAt: started,
+    requestId: "native-run:6",
+    text: "核对导航",
+    checks: 2,
+    uncertainSince: started,
+    uncertainCount: 2,
+  };
+  const receipt = (r) => resultFrom(readMessage(r.text), {}).result;
+  const wait = await observed(handoff, "queued");
+  assert.equal(receipt(wait).notice, undefined);
+  const transient = await observed({ ...handoff, uncertainSince: Date.now() }, "unknown", "BOUND_UNVERIFIED");
+  assert.equal(receipt(transient).notice, undefined);
+  const help = await observed(handoff, "unknown", "BOUND_UNVERIFIED");
+  assert.equal(receipt(help).notice.length, 1);
+  assert.equal(receipt(help).later.length, 1);
+  assert.match(receipt(help).notice[0].text, /不用重发/);
+  const next = await observed(help.coordinator.handoff, "unknown", "BOUND_UNVERIFIED");
+  assert.equal(receipt(next).notice, undefined);
+  const changed = await observed(handoff, "unknown", "BOUND_SCOPE_MISMATCH");
+  assert.equal(changed.coordinator.action, "attention");
+  assert.equal(receipt(changed).later, undefined);
+});

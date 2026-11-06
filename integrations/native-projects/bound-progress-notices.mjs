@@ -24,6 +24,52 @@ const categories = [
   ["blocker", /^(?:当前受阻|受阻|当前阻塞|暂时无法继续|执行失败)[：:]\s*(.{3,90})$/u, "遇到阻塞，可能需要你处理"],
   ["milestone", /^(?:已交付|交付完成|通过验收|已通过验收|已上线|已发布)[：:]\s*(.{3,90})$/u, "报告已有新的交付结果"],
 ];
+// Only a current, explicit dependency on the reader qualifies. Emit a fixed action, never private reply text.
+function humanBlocker(body) {
+  if (body.length > 32000) return null;
+  const lines = body
+    .trim()
+    .split(/\r?\n/u)
+    .filter((line) => line.trim());
+  const line = lines.at(-1)?.trim();
+  if (
+    !line ||
+    line.length > 180 ||
+    /[>`「」“”]|(?:例如|示例|假设|如果|历史|此前|之前|以前|曾经|已(?:经)?(?:解决|收到|恢复)|可以继续|先继续|不(?:用|要|必)|无需)/u.test(
+      line,
+    )
+  )
+    return null;
+  // Do not lift a sentence from an example, a quote, or an unclosed fenced block.
+  const prefix = lines.slice(0, -1).join("\n");
+  if (/([：:>]|(?:例如|示例|原话|历史记录)[。.]?)\s*$/u.test(prefix) || (prefix.match(/```/gu)?.length ?? 0) % 2)
+    return null;
+  const request =
+    /(?:请(?:你|您)?|麻烦(?:你|您)|需要(?:你|您|本人))\s*(?:先|帮我|帮忙|协助)?\s*(补充|提供|上传|指定|联系|开通|授权|批准|确认|选择)(.{1,75})/u.exec(
+      line,
+    );
+  if (
+    !request ||
+    !safe(request[1] + request[2]) ||
+    !/(?:缺少|欠缺|还缺|没有(?:访问)?权限|无法(?:继续|访问|登录)|才能(?:继续|完成|核对|开始)|尚不能继续)/u.test(line)
+  )
+    return null;
+  const verb = request[1];
+  let sentence;
+  if (/^(?:开通|授权|批准)$/u.test(verb) || /(?:权限|授权|访问资格)/u.test(request[2]))
+    sentence = "原聊天受权限限制。请在原系统核对所需授权，再回原对话说明。";
+  else if (/^(?:补充|提供|上传)$/u.test(verb))
+    sentence = "原聊天缺少所需资料。请在原对话补充可用资料或说明从哪里获取。";
+  else if (/^(?:指定|联系)$/u.test(verb) && /(?:人选|同事|负责人|谁|对接人)/u.test(request[2]))
+    sentence = "原聊天需要有人对接。请在原对话指定负责这件事的同事。";
+  else if (/^(?:确认|选择)$/u.test(verb)) sentence = "原聊天需要你确认一个条件才能继续。请回原对话查看并决定。";
+  if (!sentence) return null;
+  return {
+    kind: "blocker",
+    sentence,
+    fingerprint: hash(["owner-blocker", line.normalize("NFKC").replace(/[\s\p{P}]/gu, "")]),
+  };
+}
 export function noticeSignal(turn) {
   if (!turn || turn.status !== "completed" || turn.itemsView !== "full" || !Array.isArray(turn.items)) return null;
   const users = turn.items.filter((i) => i?.type === "userMessage");
@@ -41,12 +87,20 @@ export function noticeSignal(turn) {
     typeof finals[0].text !== "string"
   )
     return null;
+  if (/(?:不要|不必|不用|无需|请勿).{0,6}(?:通知|转发|发群)/u.test(finals[0].text)) return null;
+  const blocker = humanBlocker(finals[0].text);
+  if (blocker) return { ...blocker, clientId: users[0].clientId ?? null };
   const line = finals[0].text
     .trimStart()
     .split(/\r?\n/u, 1)[0]
     .trim()
     .replace(/^\*\*([^*]+)\*\*$/u, "$1");
   for (const [kind, pattern, summary] of categories) {
+    if (
+      kind !== "milestone" &&
+      /(?:已(?:经)?(?:解决|恢复|收到)|可以继续|无需(?:处理|确认))/u.test(finals[0].text.trim().split(/\r?\n/u).at(-1))
+    )
+      continue;
     const match = pattern.exec(line),
       detail = match?.[1]?.trim();
     if (!safe(detail) || /(?:例如|举例|示例|假设|假如|并未|尚未交付|待交付|还未交付|模拟|测试消息)/u.test(detail))

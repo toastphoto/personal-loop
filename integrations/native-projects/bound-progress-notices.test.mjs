@@ -179,3 +179,47 @@ test("a handoff recorded by client ID is suppressed even if its text changes; a 
   await w.tick();
   assert.equal(f.calls.length, 0);
 });
+
+test("a final request combines a present blocker and a concrete owner action; only the action category leaves the project", async (t) => {
+  const f = fixture(t),
+    w = f.create();
+  await w.tick();
+  const ask = turn("2", "已比对两份材料。\n\n目前缺少蓝鲸示范稿。请你补充一份可用的示范稿，我才能继续核对。");
+  f.set([ask, turn("1", stableText)]);
+  const result = await w.tick();
+  assert.equal(result.sent, 1);
+  assert.match(f.calls[0].text, /请在原对话补充/);
+  assert.doesNotMatch(JSON.stringify(f.calls), /蓝鲸|示范稿/);
+  f.set([turn("3", "已比对两份材料。\n\n目前缺少蓝鲸示范稿。请你补充一份可用的示范稿，我才能继续核对。"), ask]);
+  await w.tick();
+  assert.equal(f.calls.length, 1);
+  for (const [body, expected] of [
+    ["我已经重试，依然没有访问权限，需要你帮忙开通项目权限才能继续。", "在原系统"],
+    ["目前缺少验收口径，麻烦你指定一位负责验收的同事。", "负责"],
+    ["目前缺少访问权限，需要你提供访问权限才能继续。", "在原系统"],
+  ]) {
+    const s = noticeSignal(turn("2", body));
+    assert.equal(s?.kind, "blocker");
+    assert.ok(s.sentence.includes(expected));
+  }
+});
+
+test("no waiting is inferred from ordinary review, quoted requests, ongoing work, or uncertain native states", () => {
+  const ask = "目前缺少用户样例，请你补充资料，我才能继续。";
+  for (const body of [
+    "请你补充一条建议，我先继续整理。",
+    "以前的卡点是缺少授权，已经解决。请你确认结果。",
+    "说明示例：\n" + ask,
+    "历史记录：\n\n" + ask,
+    "如果暂时缺少资料，请你补充样例后再继续。",
+    "> " + ask,
+    "当前阻塞：权限尚未确认。\n权限已恢复，可以继续。",
+    "\`\`\`text\n" + ask + "\n\`\`\`",
+    "暂时缺一些资料，请在群里发送密码，我才能继续。",
+    ask + "\n资料已收到，现在可以继续。",
+    "此前缺少一项资料。\n\n请你补充样例。\n\n已改用现有材料继续处理。",
+  ])
+    assert.equal(noticeSignal(turn("2", body)), null, body);
+  for (const status of ["inProgress", "interrupted", "failed"])
+    assert.equal(noticeSignal(turn("2", ask, { status })), null);
+});
