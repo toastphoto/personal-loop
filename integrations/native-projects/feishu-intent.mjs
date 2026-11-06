@@ -109,6 +109,14 @@ function directoryRequest(text) {
     /^(?:我(?:的)?)?(?:所有|全部)?项目(?:列表|目录|清单)?$/u.test(body)
   );
 }
+export function asksForChatPicker(text) {
+  return (
+    typeof text === "string" &&
+    /^(?:(?:请|帮我|让我|我要|我想)\s*)?(?:选(?:择)?|更换|切换|换)(?:一条|一个|个|一下)?(?:工作|项目|原)?(?:对话|聊天)(?:卡片)?[。！!]?$/u.test(
+      text.trim(),
+    )
+  );
+}
 
 function statusTarget(text) {
   const headed = /^(?:看看|看一下|查看|查一下|查询)\s*(.+)$/u.exec(text);
@@ -168,6 +176,7 @@ export function interpretProjectRequest(text, { view, contextAlias } = {}) {
       .replace(/[?？]+$/u, "")
       .trim(),
   );
+  if (asksForChatPicker(normalized)) return { kind: "query", action: "pick-chat" };
   if (directoryRequest(normalized)) return { kind: "query", action: "projects" };
   const target = statusTarget(normalized);
   if (target) return requested("query", "status", target, projects, contextAlias);

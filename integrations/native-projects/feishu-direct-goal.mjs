@@ -149,6 +149,7 @@ export function directGoalRequest(event, routing, text) {
     projectKey,
     name,
     objective,
+    ...(entry.selectedThreadId && { threadId: entry.selectedThreadId }),
     ...(boundChat && { threadId: boundChat.threadId, chatTitle: boundChat.title }),
   };
 }

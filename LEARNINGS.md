@@ -40,3 +40,5 @@
 - Phone project cards should lead with the outcome and the next decision. Distinguish past goals and conversation history from active work. Check what is visible with every optional panel closed.
 
 - A project is not a conversation. Bind the owner-selected conversation, including legacy chats verified by exact root, separately from the native project. An accepted queue entry establishes delivery intent; report execution only after matching it to the original thread and turn.
+
+- Show available working chats and mark the selected one in the project card. A person should not need to memorize a title. Selecting a destination, saving a draft, and starting a goal are distinct actions.

@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 import { directGoalRequest } from "./feishu-direct-goal.mjs";
+import { asksForChatPicker } from "./feishu-intent.mjs";
 export function commandText(event) {
   if (typeof event?.content !== "string") return "";
   let value = event.content.trim();
@@ -34,7 +35,7 @@ export function routeProjectMessage(event, routing = {}) {
   )
     return "legacy";
   if (!event.mentions?.some((m) => typeof m?.id === "string" && routing.botMentionIds?.includes(m.id))) return "legacy";
-  if (directGoalRequest(event, routing, text)) return "loop";
+  if (asksForChatPicker(text) || directGoalRequest(event, routing, text)) return "loop";
   const terms = [
     "项目",
     "原对话",
@@ -64,16 +65,58 @@ export function routeProjectMessage(event, routing = {}) {
     ? "loop"
     : "legacy";
 }
-export function readRouting(file) {
+export function readRouting(file, strict = false) {
   try {
-    return JSON.parse(readFileSync(file, "utf8"));
-  } catch {
+    const routing = JSON.parse(readFileSync(file, "utf8"));
+    if (!routing.bindingControlsFile) return routing;
+    try {
+      if (!path.isAbsolute(routing.bindingControlsFile)) throw new Error("Invalid control path");
+      const state = JSON.parse(readFileSync(routing.bindingControlsFile, "utf8"));
+      if (
+        state.version !== 1 ||
+        !state.projects ||
+        typeof state.projects !== "object" ||
+        Array.isArray(state.projects) ||
+        (state.chatBindings !== undefined &&
+          (!state.chatBindings || typeof state.chatBindings !== "object" || Array.isArray(state.chatBindings)))
+      )
+        throw new Error("Invalid control state");
+      const directGoalProjects = (routing.directGoalProjects ?? []).map((entry) => {
+        if (!Object.hasOwn(state.chatBindings ?? {}, entry.projectKey)) return entry;
+        const chat = state.chatBindings[entry.projectKey];
+        if (
+          !chat ||
+          entry.projectKey !== "codex:local:" + encodeURIComponent(chat.projectId) ||
+          !Number.isSafeInteger(chat.revision) ||
+          chat.revision < 1 ||
+          !path.isAbsolute(chat.root) ||
+          !/^[a-f\d]{8}(?:-[a-f\d]{4}){3}-[a-f\d]{12}$/iu.test(chat.threadId) ||
+          typeof chat.title !== "string" ||
+          !chat.title.trim() ||
+          !Number.isFinite(Date.parse(chat.updatedAt)) ||
+          !Number.isFinite(Date.parse(entry.enabledAt))
+        )
+          throw new Error("Invalid selected chat");
+        const enabledAt = new Date(Math.max(Date.parse(chat.updatedAt), Date.parse(entry.enabledAt))).toISOString();
+        return {
+          ...entry,
+          enabledAt,
+          selectedThreadId: chat.threadId,
+          boundChat: { threadId: chat.threadId, title: chat.title, enabledAt },
+        };
+      });
+      return { ...routing, directGoalProjects };
+    } catch {
+      return { ...routing, directGoalProjects: [] };
+    }
+  } catch (error) {
+    if (strict) throw error;
     return {};
   }
 }
 if (process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1])) {
   try {
-    const cfg = JSON.parse(readFileSync(process.argv[2], "utf8"));
+    const cfg = readRouting(process.argv[2], true);
     const event = JSON.parse(readFileSync(0, "utf8"));
     process.stdout.write(routeProjectMessage(event, cfg));
   } catch {

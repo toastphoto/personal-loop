@@ -8,6 +8,7 @@ const EXECUTION = {
   unavailable: "目录待核对 暂不启用新的任务",
 };
 const PAGE_SIZE = 4;
+const CHAT_PAGE_SIZE = 8;
 const MAX_BYTES = 28000;
 const MAX_ELEMENTS = 180;
 const fail = (code) => Object.assign(new Error(code), { code });
@@ -172,6 +173,45 @@ function activityDate(value) {
     hourCycle: "h23",
   }).format(new Date(value));
 }
+// The picker contains only provider-verified display metadata. IDs stay inside scoped callbacks.
+function pickerView(raw) {
+  if (!raw || typeof raw !== "object") return null;
+  const clean = (v) => {
+    if (!validNativeId(v?.threadId) || v.threadId.length > 160) return null;
+    const title = typeof v.title === "string" && v.title.trim() !== v.threadId ? short(v.title.trim(), 160) : "";
+    return {
+      threadId: v.threadId,
+      title,
+      updatedAt: activityTime(v.updatedAt),
+      summary: typeof v.summary === "string" ? short(v.summary.trim(), 72) : "",
+    };
+  };
+  const seen = new Set();
+  const items = [];
+  let complete = raw.complete === true && Array.isArray(raw.items);
+  for (const v of Array.isArray(raw.items) ? raw.items : []) {
+    const item = clean(v);
+    if (!item || seen.has(item.threadId)) {
+      complete = false;
+      continue;
+    }
+    seen.add(item.threadId);
+    items.push(item);
+  }
+  return {
+    items,
+    complete,
+    current: clean(raw.current),
+    canChange: raw.canChange === true,
+    reason: typeof raw.reason === "string" ? short(raw.reason, 100) : "",
+    draftNeedsReview: raw.draftNeedsReview === true,
+  };
+}
+
+function chatName(item) {
+  return item.title || (item.updatedAt ? activityDate(item.updatedAt).slice(0, -3) + " 的对话" : "未命名对话");
+}
+
 function normalize(view) {
   if (!["project-directory", "project-status"].includes(view?.kind)) throw fail("PROJECT_CARD_VIEW_INVALID");
   const source = view.kind === "project-status" ? [view.project] : view.projects;
@@ -189,9 +229,13 @@ function normalize(view) {
       mode: p.mode,
       execution: p.execution,
       ...(p.activity ? { activity: activityView(p.activity) } : {}),
+      ...(p.provider === "codex" && p.chatPicker ? { chatPicker: pickerView(p.chatPicker) } : {}),
       ...(typeof p.objective === "string" && p.objective ? { objective: p.objective } : {}),
       ...(Number.isSafeInteger(p.maxSteps) && p.maxSteps > 0 ? { maxSteps: p.maxSteps } : {}),
       controlRevision: p.controlRevision ?? p.revision,
+      ...(goalValid(p.goalSuggestion)
+        ? { goalSuggestion: { objective: p.goalSuggestion.objective, maxSteps: p.goalSuggestion.maxSteps } }
+        : {}),
       canSetGoal: p.canSetGoal === true,
       canStart: p.canStart === true,
       canPause: p.canPause === true,
@@ -388,6 +432,12 @@ function interactiveList(v, navigation, context) {
     navigationButtons(context, { screen: "list", provider, page }),
   ]);
 }
+function newGoalSuggestion(p) {
+  return (
+    p.goalSuggestion &&
+    (p.goalSuggestion.objective !== p.draft?.objective || p.goalSuggestion.maxSteps !== p.draft?.maxSteps)
+  );
+}
 function projectControls(p, context) {
   if (context.interactive === false || context.mutationEnabled !== true) return null;
   const buttons = [];
@@ -397,8 +447,16 @@ function projectControls(p, context) {
     buttons.push(pause);
   }
   if (p.canResume) buttons.push(button(context, "恢复原目标", "resume", { alias: p.alias }, !buttons.length));
-  if (p.canStart && goalValid(p.draft))
-    buttons.push(button(context, "检查并启动", "start", { alias: p.alias }, !buttons.length));
+  if (p.canStart && goalValid(p.draft) && (!p.chatPicker || (p.chatPicker.current && !p.chatPicker.draftNeedsReview)))
+    buttons.push(
+      button(
+        context,
+        newGoalSuggestion(p) ? "检查已存草稿" : "检查并启动",
+        "start",
+        { alias: p.alias },
+        !buttons.length && !newGoalSuggestion(p),
+      ),
+    );
   if (p.canSetGoal)
     buttons.push(
       button(
@@ -541,7 +599,7 @@ function activitySection(p, context) {
         md(concise ? escape(concise, 118) : reply ? "回复里是明细，可展开查看。" : "这条记录尚未读到回复。"),
       );
       info.push(md(`**${escape(name, 42)}**`), muted(`记录中的执行状态：${ACTIVITY_STATES[selected.state]}`));
-      if (a.selection === "bound-chat") elements.unshift(muted("主对话 · " + escape(name, 42)));
+      if (a.selection === "bound-chat" && !p.chatPicker) elements.unshift(muted("主对话 · " + escape(name, 42)));
       if (a.selection === "latest-updated") info.push(muted("按更新时间选择的记录"));
       if (a.selection === "trusted-active") info.push(muted("优先显示已核实正在执行的记录"));
       if (selected.membership === "cwd-unassigned") info.push(muted("目录关联会话 原生项目归属尚未设置"));
@@ -585,6 +643,78 @@ function activitySection(p, context) {
   }
   return block(elements);
 }
+function chatPickerPage(v, navigation, context) {
+  const p = v.projects.find((p) => p.alias === navigation.alias);
+  const picker = p?.chatPicker;
+  if (!picker || context.interactive === false || context.mutationEnabled !== true)
+    return detail(v, navigation, context);
+  const pages = Math.max(1, Math.ceil(picker.items.length / CHAT_PAGE_SIZE));
+  const page = Number.isSafeInteger(navigation.page) ? Math.min(pages - 1, Math.max(0, navigation.page)) : 0;
+  const alias = p.alias;
+  const current = picker.current;
+  const selectable = picker.canChange && picker.complete && p.mode === "manual";
+  const overview = [md(current ? `当前工作对话 · **${escape(chatName(current), 140)}**` : "还没有选择工作对话")];
+  if (!selectable)
+    overview.push(
+      muted(escape(picker.reason || (!picker.complete ? "对话清单尚未读全，请稍后重新查看" : "当前只能查看对话"))),
+    );
+  const open = (title, page) => button(context, title, "open-chat-picker", { alias, page });
+
+  if (navigation.screen === "confirm-chat") {
+    const choice = picker.items.find((item) => item.threadId === navigation.threadId);
+    if (choice && selectable)
+      return rootCard("确认工作对话", p.name, [
+        block(
+          [
+            md(`**${escape(chatName(choice), 160)}**`, "heading-3"),
+            ...(choice.updatedAt ? [muted("最近更新 " + activityDate(choice.updatedAt).slice(0, -3))] : []),
+            ...(choice.summary ? [md(escape(choice.summary, 72))] : []),
+            muted("之后的目标和拍板结果都交回这条对话"),
+          ],
+          true,
+        ),
+        block([button(context, "使用这条对话", "save-chat", { alias, threadId: choice.threadId }, true)]),
+        row([column([open("返回对话列表", page)]), column([button(context, "返回项目", "detail", { alias })])]),
+      ]);
+    return rootCard("选择工作对话", p.name, [
+      block([md("这条对话暂时不能选择"), ...overview], true),
+      block([open("重新查看对话", 0)]),
+      backToProject(context, alias),
+    ]);
+  }
+
+  const names = picker.items.map((item) => plain(chatName(item), 52));
+  const counts = new Map();
+  for (const name of names) counts.set(name, (counts.get(name) || 0) + 1);
+  const entries = picker.items.slice(page * CHAT_PAGE_SIZE, (page + 1) * CHAT_PAGE_SIZE).flatMap((item, index) => {
+    const absolute = page * CHAT_PAGE_SIZE + index;
+    const name = names[absolute];
+    const label =
+      (current?.threadId === item.threadId ? "当前 · " : "") +
+      name +
+      (counts.get(name) > 1 ? `（同名记录 ${absolute + 1}）` : "");
+    const info = [item.updatedAt ? "最近更新 " + activityDate(item.updatedAt).slice(0, -3) : "", item.summary]
+      .filter(Boolean)
+      .join(" · ");
+    return [
+      selectable ? button(context, label, "preview-chat", { alias, threadId: item.threadId, page }) : md(escape(label)),
+      ...(info ? [muted(escape(info, 110))] : []),
+    ];
+  });
+  const paging = [];
+  if (page > 0) paging.push(column([open("上一页", page - 1)]));
+  if (page + 1 < pages) paging.push(column([open("下一页", page + 1)]));
+  return rootCard("选择工作对话", p.name, [
+    block(
+      [...overview, ...(pages > 1 ? [muted(`共 ${picker.items.length} 条 · 第 ${page + 1} / ${pages} 页`)] : [])],
+      true,
+    ),
+    block(entries.length ? entries : [md(picker.complete ? "这个项目暂无可选对话" : "暂时无法列出项目对话")]),
+    ...(paging.length ? [row(paging)] : []),
+    backToProject(context, alias),
+  ]);
+}
+
 function detail(v, navigation, context) {
   const p = v.projects.find((p) => p.alias === navigation.alias);
   if (!p)
@@ -605,10 +735,31 @@ function detail(v, navigation, context) {
       64,
     );
   const brief = [md(`**当前 ${mode(p)}**`)];
+  if (p.chatPicker) {
+    const current = p.chatPicker.current;
+    brief.push(md(current ? `工作对话 · **${escape(chatName(current), 140)}**` : "**尚未选择工作对话**"));
+    if (context.interactive !== false && context.mutationEnabled === true)
+      brief.push(
+        button(
+          context,
+          p.chatPicker.canChange ? (current ? "更换工作对话" : "选择工作对话") : "查看工作对话",
+          "open-chat-picker",
+          { alias: p.alias, page: 0 },
+        ),
+      );
+  }
+
   if (p.mode !== "manual" && p.objective) {
     brief.push(md(`${p.mode === "paused" ? "已暂停的目标" : "当前目标"} · ${goalLine(p.objective)}`));
   }
+  if (newGoalSuggestion(p) && p.canSetGoal && context.interactive !== false && context.mutationEnabled === true) {
+    brief.push(
+      md(`本次目标 · ${goalLine(p.goalSuggestion.objective)}`),
+      button(context, "用这次的目标", "use-goal-suggestion", { alias: p.alias }, true),
+    );
+  }
   if (p.draft?.objective) brief.push(md(`目标草稿 · ${goalLine(p.draft.objective)}`));
+  if (p.chatPicker?.draftNeedsReview && p.draft?.objective) brief.push(muted("草稿来自先前的对话，请重新保存后再启动"));
   if (p.mode === "manual" && !p.draft?.objective) {
     brief.push(
       muted(
@@ -654,7 +805,16 @@ function goalForm(v, navigation, context) {
     block(
       [
         md("**保存草稿不会启动**", "heading-3"),
-        muted("当前项目模式和正在执行的目标保持不变"),
+        ...(p.chatPicker
+          ? [
+              md(
+                p.chatPicker.current
+                  ? `工作对话 · **${escape(chatName(p.chatPicker.current), 140)}**`
+                  : "工作对话尚未选择",
+              ),
+            ]
+          : [muted("当前项目模式和正在执行的目标保持不变")]),
+        ...(p.chatPicker?.draftNeedsReview ? [muted("草稿来自先前的对话，请核对内容后重新保存")] : []),
         ...(p.draft?.objective && !validDraft ? [muted("旧草稿内容或轮数超出表单范围 未截断预填 请重新填写")] : []),
       ],
       true,
@@ -707,7 +867,11 @@ function confirmGoal(v, navigation, context, resume) {
   const p = v.projects.find((p) => p.alias === navigation.alias);
   const goal = resume ? p : p?.draft;
   const permitted =
-    p && context.interactive !== false && context.mutationEnabled === true && (resume ? p.canResume : p.canStart);
+    p &&
+    context.interactive !== false &&
+    context.mutationEnabled === true &&
+    (!p.chatPicker || (p.chatPicker.current && (resume || !p.chatPicker.draftNeedsReview))) &&
+    (resume ? p.canResume : p.canStart);
   if (!permitted || !goalValid(goal)) {
     return rootCard(resume ? "恢复原目标" : "启动前确认", p ? plain(p.name, 80) : "项目待核对", [
       block(
@@ -730,11 +894,18 @@ function confirmGoal(v, navigation, context, resume) {
   confirm.confirm = {
     title: text(resume ? "确认恢复原目标" : "确认启动这个目标"),
     text: text(
-      `${goalPlain(goal.objective)}\n\n最多 ${goal.maxSteps} 轮${resume ? " · 不会重置已使用轮数" : ""}\n${capability(p)}`,
+      `${p.chatPicker?.current ? "工作对话 · " + plain(chatName(p.chatPicker.current), 140) + "\n\n" : ""}${goalPlain(goal.objective)}\n\n最多 ${goal.maxSteps} 轮${resume ? " · 不会重置已使用轮数" : ""}\n${capability(p)}`,
     ),
   };
   return rootCard(resume ? "恢复前确认" : "启动前确认", plain(p.name, 80), [
-    block([md(resume ? "**继续原目标**" : "**启动这个目标**", "heading-3"), muted(escape(capability(p)))], true),
+    block(
+      [
+        md(resume ? "**继续原目标**" : "**启动这个目标**", "heading-3"),
+        ...(p.chatPicker?.current ? [md(`工作对话 · **${escape(chatName(p.chatPicker.current), 140)}**`)] : []),
+        muted(escape(capability(p))),
+      ],
+      true,
+    ),
     block([
       md(goalMarkdown(goal.objective)),
       md(`最多 ${goal.maxSteps} 轮`),
@@ -815,6 +986,8 @@ export function renderProjectCard(view, navigation = {}, context = {}) {
   else if (nav.screen === "goal") card = decorated(goalForm(v, nav, context));
   else if (nav.screen === "confirm-start") card = decorated(confirmGoal(v, nav, context, false));
   else if (nav.screen === "confirm-resume") card = decorated(confirmGoal(v, nav, context, true));
+  else if (nav.screen === "chat-picker" || nav.screen === "confirm-chat")
+    card = decorated(chatPickerPage(v, nav, context));
   else if (nav.screen === "detail") card = decorated(detail(v, nav, context));
   else if (!interactive) {
     for (let limit = Math.min(45, v.projects.length); limit >= 0; limit--) {

@@ -39,21 +39,7 @@ export class LoopControls {
   ) {
     if (!["manual", "active", "paused"].includes(mode) || typeof key !== "string" || !key || !actor)
       throw failure("INVALID_MODE_CHANGE");
-    mkdirSync(path.dirname(this.file), { recursive: true, mode: 0o700 });
-    let lock;
-    try {
-      lock = new DatabaseSync(this.file + ".lock.db");
-      chmodSync(this.file + ".lock.db", 0o600);
-      lock.exec("PRAGMA busy_timeout=0; CREATE TABLE IF NOT EXISTS guard(id INTEGER PRIMARY KEY); BEGIN IMMEDIATE;");
-    } catch (error) {
-      try {
-        lock?.close();
-      } catch {}
-      if (error.errcode === 5 || error.errcode === 6) throw failure("CONTROL_UPDATE_BUSY");
-      throw error;
-    }
-    try {
-      const data = this.read();
+    return this.withLock((data) => {
       let requestHash;
       if (requestId !== undefined) {
         if (typeof requestId !== "string" || !/^[A-Za-z0-9_.:-]{1,512}$/.test(requestId))
@@ -117,9 +103,30 @@ export class LoopControls {
         data.requests ??= {};
         data.requests[requestId] = { hash: requestHash, result: next };
       }
-      writeFileSync(this.file + ".tmp", JSON.stringify(data, null, 2) + "\n", { mode: 0o600 });
-      renameSync(this.file + ".tmp", this.file);
+      this.save(data);
       return next;
+    });
+  }
+  save(data) {
+    writeFileSync(this.file + ".tmp", JSON.stringify(data, null, 2) + "\n", { mode: 0o600 });
+    renameSync(this.file + ".tmp", this.file);
+  }
+  withLock(fn) {
+    mkdirSync(path.dirname(this.file), { recursive: true, mode: 0o700 });
+    let lock;
+    try {
+      lock = new DatabaseSync(this.file + ".lock.db");
+      chmodSync(this.file + ".lock.db", 0o600);
+      lock.exec("PRAGMA busy_timeout=0; CREATE TABLE IF NOT EXISTS guard(id INTEGER PRIMARY KEY); BEGIN IMMEDIATE;");
+    } catch (error) {
+      try {
+        lock?.close();
+      } catch {}
+      if (error.errcode === 5 || error.errcode === 6) throw failure("CONTROL_UPDATE_BUSY");
+      throw error;
+    }
+    try {
+      return fn(this.read());
     } finally {
       if (lock.isTransaction) lock.exec("ROLLBACK");
       lock.close();

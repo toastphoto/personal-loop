@@ -135,7 +135,11 @@ export class CardSessions {
           chat,
           alias,
           revision,
-          JSON.stringify({ objective: data.objective.trim(), maxSteps: data.maxSteps }),
+          JSON.stringify({
+            objective: data.objective.trim(),
+            maxSteps: data.maxSteps,
+            ...(data.expectedThreadId && { expectedThreadId: data.expectedThreadId }),
+          }),
         );
       return this.draft(actor, chat, alias);
     });
@@ -180,8 +184,8 @@ export class CardSessions {
 }
 
 export class ProjectCardController {
-  constructor(config, { store, catalog, controls, runtime, activity, transportReady = () => true } = {}) {
-    Object.assign(this, { config, store, catalog, controls, runtime, activity, transportReady });
+  constructor(config, { store, catalog, controls, runtime, activity, bindings, transportReady = () => true } = {}) {
+    Object.assign(this, { config, store, catalog, controls, runtime, activity, bindings, transportReady });
     this.scope = digest([config.profile ?? "", config.chatId, [...config.allowedSenderIds].sort()]);
   }
   enabled() {
@@ -297,7 +301,10 @@ export class ProjectCardController {
       return;
     }
     try {
-      project.activity = await this.activity.read(key, { workId, force });
+      const primary =
+        workId === undefined && this.bindings?.available(key) ? this.bindings.current(key)?.threadId : null;
+      project.activity = await this.activity.read(key, { workId: primary || workId, force });
+      if (primary && project.activity?.selected?.nativeId === primary) project.activity.selection = "bound-chat";
     } catch {
       project.activity = {
         status: "unavailable",
@@ -307,6 +314,68 @@ export class ProjectCardController {
         note: "会话归属或读取结果未能确认 没有显示回复 请刷新目录后再试",
       };
     }
+  }
+  // Store the private source identities with the issued card. The renderer projects only safe names and controls.
+  async chatView(view, targets, nav, suggestion) {
+    const key = targets[nav.alias],
+      p = view.projects.find((v) => v.alias === nav.alias);
+    if (!p) return;
+    delete p.goalSuggestion;
+    if (suggestion && validGoal(suggestion) && p.canSetGoal && nav.alias === suggestion.alias) {
+      p.goalSuggestion = { objective: suggestion.objective, maxSteps: suggestion.maxSteps };
+      if (nav.screen === "goal" && nav.useSuggestion)
+        p.draft = { ...p.goalSuggestion, revision: p.draft?.revision ?? 0 };
+    }
+    if (!key || !this.bindings?.available(key)) {
+      delete p.chatPicker;
+      return;
+    }
+    const old = p.chatPicker?.current;
+    const current = this.bindings.current(key),
+      control = this.controls.get(key);
+    let pickedTitle =
+      current &&
+      (current.title ||
+        (p.activity?.selected?.nativeId === current.threadId ? p.activity.selected.title : null) ||
+        (old?.threadId === current.threadId ? old.title : null));
+    if (current && !pickedTitle && !["chat-picker", "confirm-chat"].includes(nav.screen))
+      pickedTitle = (await this.bindings.describe?.(key))?.title;
+    p.chatPicker = {
+      current: current ? { ...current, title: pickedTitle || null } : null,
+      revision: current?.revision ?? 0,
+      controlRevision: control.revision,
+      canChange: control.mode === "manual",
+      items: [],
+      complete: false,
+      ...(control.mode !== "manual" && { reason: "当前目标保留原对话，收尾后可更换" }),
+    };
+    if (nav.screen === "chat-picker" || nav.screen === "confirm-chat") {
+      const list = await this.bindings.list(key);
+      p.chatPicker = { ...p.chatPicker, ...list, canChange: list.canChange === true && control.mode === "manual" };
+    }
+    const picker = p.chatPicker;
+    const needsReview =
+      !!p.draft &&
+      (p.draft.expectedThreadId ? p.draft.expectedThreadId !== picker.current?.threadId : picker.revision !== 0);
+    picker.draftNeedsReview = needsReview;
+    if (!picker.current || needsReview) p.canStart = false;
+    if (control.expectedThreadId && control.expectedThreadId !== picker.current?.threadId) p.canResume = false;
+  }
+  verifyShownBinding(key, shown) {
+    if (!this.bindings?.available(key)) {
+      if (shown?.chatPicker) throw failure("CARD_BINDING_CHANGED");
+      return null;
+    }
+    const current = this.bindings.current(key);
+    if (
+      !current ||
+      !shown?.chatPicker ||
+      current.threadId !== shown.chatPicker.current?.threadId ||
+      current.revision !== shown.chatPicker.revision ||
+      this.controls.get(key).revision !== shown.controlRevision
+    )
+      throw failure("CARD_BINDING_CHANGED");
+    return current;
   }
   render(sessionId, revision, view, navigation, notice) {
     return renderProjectCard(view, navigation, {
@@ -323,14 +392,29 @@ export class ProjectCardController {
     if (chat !== this.config.chatId || !this.config.allowedSenderIds.includes(actor))
       throw failure("CARD_SCOPE_MISMATCH");
     const { view, overview } = await this.overview(snapshot);
-    if (navigation.alias) await this.enrich(view, overview, navigation.alias, actor, chat, previewDraft);
+    if (navigation.alias)
+      await this.enrich(
+        view,
+        overview,
+        navigation.alias,
+        actor,
+        chat,
+        navigation.screen === "chat-picker" ? undefined : previewDraft,
+      );
     if (!this.enabled()) navigation = { screen: "probe" };
     if (navigation.screen === "detail") await this.readActivity(view, this.targets(overview), navigation.alias);
+    const targets = this.targets(overview);
+    const goalSuggestion =
+      navigation.screen === "chat-picker" && navigation.alias && validGoal(previewDraft)
+        ? { alias: navigation.alias, objective: previewDraft.objective, maxSteps: previewDraft.maxSteps }
+        : null;
+    await this.chatView(view, targets, navigation, goalSuggestion);
     const s = this.store.create(item.requestId, actor, chat, (id) => ({
       view,
-      targets: this.targets(overview),
+      targets,
       navigation,
       notice,
+      ...(goalSuggestion && { goalSuggestion }),
       card: this.render(id, 0, view, navigation, notice),
     }));
     return this.response(s);
@@ -352,6 +436,20 @@ export class ProjectCardController {
     const actor = item.event.sender_id,
       chat = item.event.chat_id;
     const intent = interpretProjectRequest(text, { view, contextAlias: this.store.context(actor, chat) });
+    if (intent.action === "pick-chat") {
+      const eligible = overview.projects.filter((p) => this.bindings?.available(p.key));
+      const existing = this.store.context(actor, chat);
+      const selected =
+        eligible.find((p) => projectAlias(p) === existing) ?? (eligible.length === 1 ? eligible[0] : null);
+      const response = await this.create(
+        item,
+        selected ? { screen: "chat-picker", alias: projectAlias(selected) } : { screen: "home" },
+        selected ? undefined : "先选项目，再选工作对话",
+        undefined,
+        overview,
+      );
+      return { ok: true, action: "natural", text: "请选择工作对话", response };
+    }
     if (intent.kind === "help")
       return {
         ok: true,
@@ -462,11 +560,14 @@ export class ProjectCardController {
       await this.readActivity(view, targets, navigation.alias, { workId, force: forceActivity });
       this.decorateLocal(view, targets, navigation.alias, session.actor, session.chat);
     }
+    const { goalSuggestion } = session.data;
+    await this.chatView(view, targets, navigation, goalSuggestion);
     const next = {
       view,
       targets,
       navigation,
       notice,
+      ...(goalSuggestion && { goalSuggestion }),
       card: this.render(session.id, session.revision + 1, view, navigation, notice),
     };
     return this.response(this.store.advance(session.id, session.revision, next));
@@ -514,6 +615,18 @@ export class ProjectCardController {
     if (prior) {
       if (prior.hash !== fingerprint || prior.session_id !== session.id) throw failure("CARD_EVENT_CONFLICT");
       if (prior.state === "done") return JSON.parse(prior.result_json);
+      if (value.action === "save-chat") {
+        if (value.revision !== session.revision) return this.store.finishEvent(e.eventId, this.response(session));
+        return this.store.finishEvent(
+          e.eventId,
+          await this.refreshSession(
+            session,
+            { screen: "detail", alias: value.alias },
+            "已核对当前工作对话，可继续设置目标。",
+            { activity: true },
+          ),
+        );
+      }
       return this.recoverPending(session, e);
     }
     if (value.revision !== session.revision) {
@@ -541,10 +654,62 @@ export class ProjectCardController {
         this.store.remember(e.actor, e.chat, alias);
       } else if (value.action === "refresh") navigation = { ...navigation };
       else if (["activity-work", "activity-refresh"].includes(value.action)) navigation = { screen: "detail", alias };
-      else if (value.action === "edit-goal") navigation = { screen: "goal", alias };
-      else if (value.action === "save-goal") {
+      else if (value.action === "open-chat-picker" || value.action === "preview-chat" || value.action === "save-chat") {
+        const key = session.data.targets?.[alias],
+          picker = shown?.chatPicker;
+        if (!key || !this.bindings?.available(key) || !picker) throw failure("CARD_ACTION_NOT_ISSUED");
+        if (value.action === "open-chat-picker") navigation = { screen: "chat-picker", alias, page: value.page ?? 0 };
+        else {
+          const row = picker.items?.find((x) => x.threadId === value.threadId);
+          if (!row || !picker.complete || !picker.canChange) throw failure("CARD_ACTION_NOT_ISSUED");
+          if (value.action === "preview-chat")
+            navigation = { screen: "confirm-chat", alias, threadId: value.threadId, page: value.page ?? 0 };
+          else {
+            if (
+              navigation.screen !== "confirm-chat" ||
+              navigation.threadId !== row.threadId ||
+              navigation.alias !== alias
+            )
+              throw failure("CARD_ACTION_NOT_ISSUED");
+            const guard = () => {
+              if (
+                !this.enabled() ||
+                this.store.get(session.id)?.revision !== session.revision ||
+                this.controls.get(key).mode !== "manual" ||
+                this.controls.get(key).revision !== picker.controlRevision
+              )
+                throw failure("CARD_BINDING_CHANGED");
+            };
+            guard();
+            await this.bindings.select({
+              projectKey: key,
+              threadId: row.threadId,
+              expectedTitle: row.title,
+              expectedRevision: picker.revision,
+              expectedControlRevision: picker.controlRevision,
+              requestId: "card:" + digest(e.eventId),
+              actor: e.actor,
+              beforeMutation: guard,
+            });
+            navigation = { screen: "detail", alias };
+            notice = "工作对话已保存，可设置目标。";
+          }
+        }
+      } else if (value.action === "edit-goal" || value.action === "use-goal-suggestion") {
+        const useSuggestion = value.action === "use-goal-suggestion";
+        if (useSuggestion && (!validGoal(session.data.goalSuggestion) || session.data.goalSuggestion.alias !== alias))
+          throw failure("CARD_ACTION_NOT_ISSUED");
+        navigation = { screen: "goal", alias, ...(useSuggestion && { useSuggestion: true }) };
+      } else if (value.action === "save-goal") {
         if (!shown?.canSetGoal || navigation.screen !== "goal") throw failure("CARD_ACTION_NOT_ISSUED");
-        this.store.saveDraft(e.actor, e.chat, alias, goal, shown.draft?.revision ?? 0);
+        const selected = this.verifyShownBinding(session.data.targets?.[alias], shown);
+        this.store.saveDraft(
+          e.actor,
+          e.chat,
+          alias,
+          { ...goal, ...(selected && { expectedThreadId: selected.threadId }) },
+          shown.draft?.revision ?? 0,
+        );
         navigation = { screen: "detail", alias };
         notice = "目标草稿已保存 尚未启动";
       } else if (value.action === "start") navigation = { screen: "confirm-start", alias };
@@ -555,15 +720,57 @@ export class ProjectCardController {
         if (value.action === "confirm-start") {
           const draft = this.store.draft(e.actor, e.chat, alias);
           if (!validGoal(draft) || digest(draft) !== digest(shown.draft)) throw failure("CARD_DRAFT_CHANGED");
-          command = { action: "enable", target: alias, objective: draft.objective, maxSteps: draft.maxSteps };
-        } else command = { action: value.action === "pause" ? "pause" : "resume", target: alias };
+          const selected = this.verifyShownBinding(session.data.targets?.[alias], shown);
+          if (
+            selected &&
+            (draft.expectedThreadId ? draft.expectedThreadId !== selected.threadId : selected.revision !== 0)
+          )
+            throw failure("CARD_DRAFT_CHANGED");
+          command = {
+            action: "enable",
+            target: alias,
+            objective: draft.objective,
+            maxSteps: draft.maxSteps,
+            ...(selected && { expectedThreadId: selected.threadId }),
+          };
+        } else {
+          command = { action: value.action === "pause" ? "pause" : "resume", target: alias };
+          if (value.action === "confirm-resume") {
+            const key = session.data.targets?.[alias],
+              selected = this.verifyShownBinding(key, shown);
+            if (selected) {
+              const original = this.controls.get(key).expectedThreadId;
+              if (original && original !== selected.threadId) throw failure("CARD_BINDING_CHANGED");
+              command.expectedThreadId = selected.threadId;
+            }
+          }
+        }
         command.expectedRevision = shown.controlRevision ?? shown.revision;
         const result = await handleLoopCommand(command, {
-          catalog: this.catalog,
+          catalog:
+            command.expectedThreadId && this.catalog.readProvider
+              ? {
+                  refresh: async () => {
+                    const directory = await this.catalog.readProvider("codex");
+                    const key = session.data.targets?.[alias];
+                    if (
+                      directory.complete !== true ||
+                      directory.projects.filter((v) => v.key === key && v.capabilities?.queueBound === true).length !==
+                        1
+                    )
+                      throw failure("CARD_BINDING_CHANGED");
+                    return directory;
+                  },
+                }
+              : this.catalog,
           controls: this.controls,
           actor: e.actor,
           requestId: "card:" + digest(e.eventId),
-          readiness: (p) => this.runtime.readiness(p),
+          readiness: async (p) => {
+            const ready = await this.runtime.readiness(p);
+            if (command.expectedThreadId) this.verifyShownBinding(p.key, shown);
+            return ready;
+          },
           syncRules: (a) => this.runtime.sync(a),
         });
         notice = result.text;
@@ -573,16 +780,22 @@ export class ProjectCardController {
         e.eventId,
         await this.refreshSession(session, navigation, notice, {
           fresh: ["start", "resume", "refresh"].includes(value.action),
-          activity: ["detail", "select", "activity-work", "activity-refresh", "refresh"].includes(value.action),
+          activity: ["detail", "select", "activity-work", "activity-refresh", "refresh", "save-chat"].includes(
+            value.action,
+          ),
           workId: value.action === "activity-work" ? value.workId : undefined,
           forceActivity: ["activity-refresh", "refresh"].includes(value.action),
         }),
       );
     } catch (error) {
       const notice =
-        error.code === "CARD_DRAFT_CHANGED"
-          ? "目标草稿已在别处更新 请核对后重新确认"
-          : "本次操作没有确认成功 已显示当前状态 请核对后重试";
+        error.code === "CARD_BINDING_CHANGED" ||
+        error.code?.startsWith("CHAT_SELECTION_") ||
+        error.code?.startsWith("CHAT_PICKER_")
+          ? "工作对话或状态已变化。请重新打开工作对话核对后再操作。"
+          : error.code === "CARD_DRAFT_CHANGED"
+            ? "目标草稿已在别处更新 请核对后重新确认"
+            : "本次操作没有确认成功 已显示当前状态 请核对后重试";
       return this.store.finishEvent(
         e.eventId,
         await this.refreshSession(this.store.get(session.id), { screen: "detail", alias }, notice),

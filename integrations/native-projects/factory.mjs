@@ -3,6 +3,8 @@ import path from "node:path";
 import { ProjectCatalog, failure, projectKey } from "./catalog.mjs";
 import { CodexConnector } from "./codex.mjs";
 import { MulticaConnector } from "./multica.mjs";
+import { LoopControls } from "./controls.mjs";
+import { effectiveBoundChats } from "./chat-binding-store.mjs";
 import { DshConnector } from "./dsh.mjs";
 import { DshBridgeConnector } from "./dsh-bridge.mjs";
 
@@ -11,6 +13,15 @@ export function readConfig(file) {
   if (value.version !== 1 || !value.providers || typeof value.providers !== "object") throw failure("INVALID_CONFIG");
   for (const name of Object.keys(value.providers))
     if (!["codex", "multica", "dsh"].includes(name)) throw failure("UNKNOWN_PROVIDER");
+  if (value.managedCodex && path.isAbsolute(value.controlsFile ?? "")) {
+    const managed = value.managedCodex,
+      base = managed.boundChats ?? {},
+      controls = new LoopControls(value.controlsFile);
+    Object.defineProperty(managed, "boundChats", {
+      enumerable: true,
+      get: () => effectiveBoundChats(base, controls.read()),
+    });
+  }
   return value;
 }
 export function createCatalog(config) {

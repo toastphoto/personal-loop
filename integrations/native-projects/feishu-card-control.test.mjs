@@ -389,3 +389,125 @@ test("project detail reads only its bounded activity and draft navigation does n
   assert.equal(calls[1].options.force, true);
   assert.equal(f.controls.get(project.key).mode, "manual");
 });
+
+test("an issued chat choice persists without starting work; a retained previous draft explicitly needs saving to the chosen chat", async (t) => {
+  const f = fixture(t);
+  const a = { threadId: "native-first", title: "原对话", updatedAt: "2026-11-06T01:00:00Z" };
+  const b = { threadId: "native-second", title: "另一条工作线", updatedAt: "2026-11-06T02:00:00Z" };
+  let choice = { ...a, revision: 0 };
+  const selections = [];
+  f.controller.bindings = {
+    available: (k) => k === project.key,
+    current: () => choice,
+    list: async () => ({
+      current: choice,
+      revision: choice.revision,
+      controlRevision: f.controls.get(project.key).revision,
+      canChange: true,
+      complete: true,
+      items: [a, b],
+    }),
+    select: async (args) => {
+      assert.deepEqual([args.threadId, args.expectedTitle, args.expectedRevision], [b.threadId, b.title, 0]);
+      args.beforeMutation();
+      selections.push(args);
+      choice = { ...b, revision: 1 };
+      return choice;
+    },
+  };
+  let r = await detailed(f);
+  r = await saveGoal(f, r);
+  const saved = f.store.draft("ou_owner", "oc_group", projectAlias(project));
+  assert.equal(saved.expectedThreadId, a.threadId);
+  const oldStart = await f.controller.handle(event(r, action(r, "start")));
+  // Open the picker through another legitimately bound card, leaving the old confirmation page in place.
+  let current = await f.controller.create(
+    { requestId: "second-card", event: { sender_id: "ou_owner", chat_id: "oc_group" } },
+    { screen: "detail", alias: projectAlias(project) },
+  );
+  f.controller.bind(current.sessionId, "om_second");
+  const call = (response, v) => event(response, v, { cardMessageId: "om_second" });
+  current = await f.controller.handle(call(current, action(current, "open-chat-picker")));
+  const choose = nodes(current.card)
+    .map((n) => n.behaviors?.[0]?.value)
+    .find((v) => v?.action === "preview-chat" && v.threadId === b.threadId);
+  assert.ok(choose);
+  assert.equal(selections.length, 0);
+  await assert.rejects(f.controller.handle(call(current, { ...choose, action: "save-chat" })), {
+    code: "CARD_ACTION_NOT_ISSUED",
+  });
+  current = await f.controller.handle(call(current, choose));
+  const click = call(current, action(current, "save-chat"));
+  const after = await f.controller.handle(click);
+  assert.deepEqual(await f.controller.handle(click), after);
+  assert.equal(selections.length, 1);
+  assert.equal(f.controls.get(project.key).mode, "manual");
+  assert.deepEqual(f.store.draft("ou_owner", "oc_group", projectAlias(project)), saved);
+  assert.ok(!nodes(after.card).some((n) => n.behaviors?.[0]?.value.action === "start"));
+  await f.controller.handle(event(oldStart, action(oldStart, "confirm-start")));
+  assert.equal(f.controls.get(project.key).mode, "manual");
+});
+
+test("a suggested objective is private to the issued picker and replaces an old draft only after the owner saves the form; the start pins that chat", async (t) => {
+  const f = fixture(t);
+  await probed(f);
+  const alias = projectAlias(project),
+    a = { threadId: "thread-A", title: "原对话", revision: 0 };
+  f.controller.bindings = {
+    available: (k) => k === project.key,
+    current: () => a,
+    list: async () => ({ current: a, revision: 0, controlRevision: 0, complete: true, canChange: true, items: [a] }),
+  };
+  f.store.saveDraft("ou_owner", "oc_group", alias, { objective: "上次的草稿", maxSteps: 1 });
+  const old = f.store.draft("ou_owner", "oc_group", alias);
+  let r = await f.controller.create(
+    { requestId: "picker-with-suggestion", event: { sender_id: "ou_owner", chat_id: "oc_group" } },
+    { screen: "chat-picker", alias },
+    undefined,
+    { objective: "梳理完整导航", maxSteps: 3 },
+  );
+  f.controller.bind(r.sessionId, "om_suggestion");
+  const click = (r, id) => event(r, action(r, id), { cardMessageId: "om_suggestion" });
+  assert.deepEqual(f.store.draft("ou_owner", "oc_group", alias), old);
+  r = await f.controller.handle(click(r, "detail"));
+  r = await f.controller.handle(click(r, "use-goal-suggestion"));
+  const input = nodes(r.card).find((n) => n.tag === "input");
+  assert.equal(input.default_value, "梳理完整导航");
+  assert.deepEqual(f.store.draft("ou_owner", "oc_group", alias), old);
+  const submit = nodes(r.card).find((n) => n.form_action_type === "submit");
+  r = await f.controller.handle(
+    event(
+      r,
+      {},
+      {
+        cardMessageId: "om_suggestion",
+        actionName: submit.name,
+        formValue: JSON.stringify({ objective: "梳理完整导航", max_steps: "3" }),
+      },
+    ),
+  );
+  assert.equal(f.store.draft("ou_owner", "oc_group", alias).expectedThreadId, a.threadId);
+  assert.equal(f.controls.get(project.key).mode, "manual");
+  r = await f.controller.handle(click(r, "start"));
+  r = await f.controller.handle(click(r, "confirm-start"));
+  assert.equal(f.controls.get(project.key).mode, "active");
+  assert.equal(f.controls.get(project.key).expectedThreadId, a.threadId);
+});
+
+test("owner can request a working chat card without remembering any title; opening it does not start or select", async (t) => {
+  const f = fixture(t);
+  f.store.verifyCallback(f.controller.scope);
+  const c = { threadId: "33333333-3333-3333-3333-333333333333", title: "最近工作", revision: 0 };
+  f.controller.bindings = {
+    available: (key) => key === project.key,
+    current: () => c,
+    list: async () => ({ items: [c], current: c, complete: true, canChange: true, revision: 0 }),
+  };
+  const res = await f.controller.natural(
+    { requestId: "get-picker", event: { sender_id: "ou_owner", chat_id: "oc_group" } },
+    "选对话",
+  );
+  assert.equal(f.store.get(res.response.sessionId).data.navigation.screen, "chat-picker");
+  assert.ok(JSON.stringify(res.response.card).includes(c.title));
+  assert.equal(f.controls.get(project.key).mode, "manual");
+});

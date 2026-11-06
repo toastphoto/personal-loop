@@ -12,6 +12,7 @@ import { startLoopHub } from "./hub-host.mjs";
 import { commandText, routeProjectMessage, readRouting } from "./feishu-route.mjs";
 import { directGoalRequest } from "./feishu-direct-goal.mjs";
 export { commandText } from "./feishu-route.mjs";
+import { ChatBindingStore } from "./chat-binding-store.mjs";
 import { CardSessions, ProjectCardController } from "./feishu-card-control.mjs";
 import { CardEventSubscriber } from "./callback-consumer.mjs";
 import { FeishuCardRelay } from "./feishu-card-relay.mjs";
@@ -199,7 +200,7 @@ export class FeishuLoopRelay {
               )
             )
               throw failure("DIRECT_GOAL_SCOPE_CHANGED");
-            if (threadId) {
+            if (threadId && chatTitle) {
               const backend = this.catalog.connectors?.[provider];
               const listed =
                 matches[0].capabilities?.queueBound && backend && (await backend.listWork(matches[0].nativeId));
@@ -345,6 +346,7 @@ async function main() {
       callbackQueue = new RelayQueue(c.databaseFile);
       cards = new ProjectCardController(config, {
         store: cardStore,
+        bindings: new ChatBindingStore({ configFile: config.nativeConfigFile, controls, catalog }),
         catalog,
         controls,
         runtime,

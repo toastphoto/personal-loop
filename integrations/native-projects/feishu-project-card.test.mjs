@@ -567,3 +567,109 @@ test("the mobile detail separates the previous goal from an active goal and puts
   assert.ok(visible(d).includes("准备员工试用清单"));
   assert.ok(!visible(d).includes("草稿中详细的验收和分配要求"));
 });
+
+const chatItem = (i, title = "工作记录 " + i) => ({
+  threadId: "private-chat-" + i,
+  title,
+  updatedAt: new Date(Date.UTC(2026, 10, 5, 11, i)).toISOString(),
+});
+function chatPage(screen, navigation = {}, extra = {}, ctx = mutationContext) {
+  const chats = Array.from({ length: 11 }, (_, i) => chatItem(i, i === 0 || i === 1 ? "同名方案" : "工作记录 " + i));
+  chats[2].summary = "已整理试用范围";
+  const p = controlledProject({
+    execution: "bound-chat",
+    chatPicker: { current: chats[1], canChange: true, complete: true, items: chats, ...extra },
+    canStart: true,
+    draft: { objective: "整理试用条件", maxSteps: 3, revision: 1 },
+  });
+  return renderProjectCard(view([p]), { screen, alias: p.alias, ...navigation }, ctx);
+}
+const intentButtons = (card, action) => tagged(card, "button").filter((b) => b.behaviors?.[0]?.value.action === action);
+test("project, goal form and start confirmation identify the actual selected work chat", () => {
+  const detail = chatPage("detail");
+  assert.ok(tagged(detail.body.elements[0], "markdown").some((m) => m.content.includes("同名方案")));
+  assert.match(intentButtons(detail, "open-chat-picker")[0].text.content, /工作对话/);
+  assert.ok(!actions(detail).includes("save-chat"));
+  for (const page of ["goal", "confirm-start"]) {
+    const c = chatPage(page);
+    assert.ok(tagged(c, "markdown").some((m) => m.content.includes("同名方案")));
+  }
+  assert.match(intentButtons(chatPage("confirm-start"), "confirm-start")[0].confirm.text.content, /同名方案/);
+  budget(detail);
+});
+test("every conversation is reachable and duplicate visible titles can be told apart before confirming", () => {
+  const cards = [chatPage("chat-picker"), chatPage("chat-picker", { page: 1 })];
+  const buttons = cards.flatMap((c) => intentButtons(c, "preview-chat"));
+  assert.equal(buttons.length, 11);
+  assert.deepEqual(
+    buttons.map((b) => b.behaviors[0].value.threadId),
+    Array.from({ length: 11 }, (_, i) => chatItem(i).threadId),
+  );
+  assert.notEqual(buttons[0].text.content, buttons[1].text.content);
+  for (const b of buttons) {
+    assert.equal(b.behaviors[0].value.revision, mutationContext.revision);
+    assert.equal(b.behaviors[0].value.session, mutationContext.sessionId);
+    assert.equal(b.behaviors[0].value.alias, project(1).alias);
+    assert.doesNotMatch(b.text.content, /private-chat/);
+  }
+  assert.ok(intentButtons(cards[0], "open-chat-picker").some((b) => b.behaviors[0].value.page === 1));
+  assert.ok(intentButtons(cards[1], "open-chat-picker").some((b) => b.behaviors[0].value.page === 0));
+  assert.ok(cards.every((c) => !actions(c).includes("save-chat") && !actions(c).includes("confirm-start")));
+  cards.forEach(budget);
+  const selected = chatPage("confirm-chat", { threadId: chatItem(2).threadId, page: 0 });
+  assert.ok(JSON.stringify(selected).includes("已整理试用范围"));
+  assert.equal(intentButtons(selected, "save-chat")[0].behaviors[0].value.threadId, chatItem(2).threadId);
+  assert.ok(!actions(selected).includes("confirm-start"));
+  budget(selected);
+});
+test("disabled, incomplete, duplicated or missing choices never offer a save action", () => {
+  for (const extra of [
+    { complete: false },
+    { canChange: false },
+    { items: [chatItem(1), chatItem(1)] },
+    { items: [] },
+  ]) {
+    const c = chatPage("confirm-chat", { threadId: chatItem(1).threadId }, extra);
+    assert.ok(!actions(c).includes("save-chat"));
+  }
+  assert.ok(!actions(chatPage("confirm-chat", { threadId: "bogus" })).includes("save-chat"));
+  assert.ok(!actions(chatPage("confirm-chat", { threadId: chatItem(1).threadId }, {}, context)).includes("save-chat"));
+});
+
+test("a supplied goal can be used without copying text or overwriting a different saved draft", () => {
+  const p = controlledProject({
+    execution: "bound-chat",
+    chatPicker: { current: chatItem(2), canChange: true, draftNeedsReview: true },
+    draft: { objective: "从上条对话带来的旧草稿", maxSteps: 3, revision: 2 },
+    canStart: true,
+    goalSuggestion: { objective: "这次梳理一级入口", maxSteps: 3 },
+  });
+  const c = renderProjectCard(view([p]), { screen: "detail", alias: p.alias }, mutationContext);
+  const use = intentButtons(c, "use-goal-suggestion");
+  assert.equal(use.length, 1);
+  assert.equal(use[0].behaviors[0].value.alias, p.alias);
+  assert.ok(JSON.stringify(c).includes("这次梳理一级入口"));
+  assert.ok(JSON.stringify(c).includes("从上条对话带来的旧草稿"));
+  assert.equal(intentButtons(c, "start").length, 0);
+  const confirm = renderProjectCard(view([p]), { screen: "confirm-start", alias: p.alias }, mutationContext);
+  assert.equal(intentButtons(confirm, "confirm-start").length, 0);
+  const form = renderProjectCard(view([p]), { screen: "goal", alias: p.alias }, mutationContext);
+  assert.equal(tagged(form, "input")[0].default_value, p.draft.objective);
+});
+
+test("saving a card suggestion leaves a single obvious next action to start that saved goal", () => {
+  const goal = { objective: "梳理所有入口", maxSteps: 3 };
+  const p = controlledProject({
+    execution: "bound-chat",
+    canStart: true,
+    goalSuggestion: goal,
+    draft: { ...goal, revision: 1 },
+    chatPicker: { current: chatItem(1), canChange: true },
+  });
+  const show = () => renderProjectCard(view([p]), { screen: "detail", alias: p.alias }, mutationContext);
+  assert.equal(intentButtons(show(), "use-goal-suggestion").length, 0);
+  assert.equal(intentButtons(show(), "start")[0].text.content, "检查并启动");
+  p.draft = { objective: "旧稿目标", maxSteps: 1, revision: 1 };
+  assert.equal(intentButtons(show(), "start")[0].text.content, "检查已存草稿");
+  assert.equal(intentButtons(show(), "use-goal-suggestion").length, 1);
+});
