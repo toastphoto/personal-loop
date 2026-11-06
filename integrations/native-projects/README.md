@@ -123,11 +123,11 @@ Reads coalesce, cache for 30 seconds and have an 8-second UI deadline. Failed re
 
 The first execution scope is **read-only**. Final report text is saved to a private worker artifact, not written into the source project. Owned execution does not prove the absence of manual work in the same source directory. It is not a general editing or production-deployment grant.
 
-`plugins/native-managed/` runs this executor for one existing-hub run. Stable run IDs and durable intent records prevent duplicate dispatch. Unknown results block further work and create an attention request. The step budget survives pause/resume. Stop targets the exact owned turn and separately verifies its terminal state.
+`plugins/native-managed/` runs this executor for one existing-hub run. Stable run/attempt IDs and durable intent records prevent duplicate dispatch. A new upstream attempt runs only after its same-goal predecessor is verified to have completed with a valid failed receipt. Unknown results block further work and create an attention request. The step budget survives pause/resume. Stop targets the exact owned turn and separately verifies its terminal state.
 
 `managedCodex` uses `enabled`, `stateDir`, `projectRoots`, `timeoutMs` and `waitTimeoutMs`. `loopHub` uses `autoStart`, `configFile`, `rulesFile`, `workerName` and `controlCwd`. Rules remain the authority in the original hub; the helper does not add a separate scheduler. `startOwned` means a separate read-only execution is supported, not control of old manual chats. All projects still default to manual.
 
-`maxSteps` limits automatic run rounds, not internal tool calls and not a promise to run exactly that many times. Valid `later/ask/notice` receipts reach the upstream kernel. A malformed receipt is preserved and safely surfaced as an attention request without repeating business or its usage; affected goals remain isolated until explicitly investigated.
+`maxSteps` limits actual automatic execution attempts, including confirmed-failure retries; it is not an internal tool-call count or a promise to run exactly that many times. Valid `later/ask/notice` receipts reach the upstream kernel. A malformed receipt is preserved and safely surfaced as an attention request without repeating business or its usage; affected goals remain isolated until explicitly investigated.
 
 Token usage uses a persisted cumulative-total baseline per owned turn. Native `last` is the last model request, not the whole user turn. Missing baselines or counters are reported as missing rather than zero; raw usage is retained privately and is not a monetary bill.
 
@@ -143,3 +143,5 @@ npm run format:check
 The latest recorded quick suite contains 723 tests: 721 passed and 2 skipped. This result must be rerun after relevant code changes.
 
 Tests use fake transports, temporary files and local HTTP/WebSocket servers. They cannot prove account authorization, live mutation semantics, business acceptance, or the user's desired notification experience. The separate live evidence is limited to the three-provider catalogue, one owned read-only Codex task, DSH Host plugin loading after a normal restart, and Feishu service readiness. Real owner group queries, replies and navigation callbacks have been exercised. Bounded reply samples from all three native sources were read without starting models.
+
+The execution policy follows the upstream event/later/answer lifecycle and keeps ordinary completion/no-change quiet. The worker supplies `AGENT_AUTOLOOP_ATTEMPT`; missing values default to legacy attempt 1. Attempt 1 retains old ledger/request keys, while attempts 2–10 get distinct keys and consume budget. Upstream backoff and scheduling remain authoritative. See `docs/project_memory/EXECUTION_ALIGNMENT_20261106.md` for isolated evidence and the open performance-budget findings.

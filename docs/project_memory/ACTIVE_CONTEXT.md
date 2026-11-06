@@ -1,6 +1,6 @@
 # Active context
 
-Updated: 2026-11-05. Branch: `codex/native-project-loop`; fork `toastphoto/personal-loop`, draft PR #1. Recheck Git, deployed code and service state before continuing.
+Updated: 2026-11-06. Branch: `codex/native-project-loop`; fork `toastphoto/personal-loop`, draft PR #1. Recheck Git, deployed code and service state before continuing.
 
 The integration keeps Codex, Multica and DSH native identities and upstream autoloop scheduling. All projects default to manual; enable and resume are explicit, pause persists, and cancelling an active task is separate. Execution currently supports loop-owned read-only Codex work, not takeover of existing manual chats or accepted Multica/DSH writes.
 
@@ -12,10 +12,14 @@ The owner rejected the paginated menu. The current card restores native source f
 
 Natural-language entry accepts configured owner mentions of the verified bot for project queries/proposals, using the same classifier as legacy dispatch. It supports bounded common Chinese wording, not unrestricted chat. Ambiguous/negative/quoted/multiple instructions never directly mutate state. Context comes only from a delivered/selected card.
 
-Latest full quick suite: 901 tests, 899 passed, 2 skipped; type/format checks passed. Five synthetic interactive card screens were accepted by the official CardKit API. Later synthetic fixture-name cleanup passed all 52 intent tests. No new project was activated during deployment. Real goal-form submission, native execution from the buttons, latest phone latency/UX, and business acceptance remain distinct checks.
+Latest final quick suite: 921 tests, 919 passed, 2 skipped; type/format checks passed. Full/deep evidence and failed performance budgets are detailed in the execution-alignment record. Five synthetic interactive card screens were accepted by the official CardKit API. Later synthetic fixture-name cleanup passed all 52 intent tests. No new project was activated during deployment. Real goal-form submission, native execution from the buttons, latest phone latency/UX, and business acceptance remain distinct checks.
 
 Read the integration README, decisions and root LEARNINGS. Recheck native versions/authorization, roots, source read completeness, project modes/budgets, message/callback queues and loaded services. Private configs, identities, raw receipts and user project names stay outside Git. Old PATCH requests may arrive late; revision guards prevent acting on the stale view, but remote display ordering is not atomic.
 
 The owner requested actual task/Agent replies and an upstream comparison. Selected-project preview is deployed for Codex, Multica and DSH, with real bounded samples verified for each. DSH plugin 0.1.1 loaded after a normal idle restart. Current original detail card was updated; its selected project returned an empty native task list, which is shown as a gap rather than invented progress. Recent-record selection, stored runtime uncertainty and excerpt limits remain explicit. “Active” now means enabled; it does not claim execution is running.
 
 Read [mechanism review](LOOP_MECHANISM_REVIEW.md): current core remains v1.1.1, reviewed upstream release is v1.2.0 and reviewed main includes later fixes. No compatible-core upgrade was silently applied. `observe` has no resident deployment; budgets do not create runs, and no fixed periodic report is configured. A receipt replay/usage defect was repaired with conservative attention escalation, not automatic business replay. Full sustained business advancement is not yet accepted.
+
+The owner approved upstream-style execution. See [execution alignment](EXECUTION_ALIGNMENT_20261106.md). Rule wording now keeps ordinary completion quiet; confirmed failures can retry under the original backoff using a trusted attempt ID, while same-attempt replay and unknown results remain protected. Every actual attempt consumes a round. Real temporary-hub integration passed; no real model/project was started. Final quick 921/919 passed/2 skipped, full core/fault/deep checks passed as documented, but the performance stage remains failed on cold start, idle memory and durable throughput. Do not describe all checks as green. The additive attempt environment field is the only worker-core extension; kernel scheduling remains unchanged.
+
+Deployment: the personal-loop relay and owned hub were restarted successfully on 2026-11-06 after confirming no active projects/runs. New goals will use the aligned policy and trusted attempt metadata. No hourly schedule or project activation was added. Private receipt: runtime/native-projects/deployment/execution-alignment-20261106/install-receipt.json outside this checkout.

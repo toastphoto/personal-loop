@@ -1,7 +1,9 @@
-// Prevent duplicate model dispatch, budget resets on resume, cross-project execution, and false completion after uncertain stops.
+// Prevent duplicate model dispatch, lost legitimate failure retries, repeated usage, budget resets on resume, cross-project execution, and false completion after uncertain stops.
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, rmSync, readFileSync, statSync } from "node:fs";
+import { mkdtempSync, mkdirSync, rmSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { runManagedWorker } from "./managed-worker.mjs";
@@ -30,11 +32,15 @@ function fixture(t, options = {}) {
     calls = [],
     instances = [];
   const catalog = {
-    async refresh() {},
+    async refresh() {
+      await options.afterRefresh?.(set);
+    },
     resolve() {
       return { project };
     },
-    async close() {},
+    async close() {
+      await options.afterCatalogClose?.(set);
+    },
   };
   const factory = (cfg) => {
     calls.push(["factory", cfg]);
@@ -476,5 +482,311 @@ test("later blocked runs reuse the same receipt-attention key", async (t) => {
   const first = await f.run("1"),
     later = await f.run("2");
   assert.equal(receiptResult(first.text).result.ask[0].key, receiptResult(later.text).result.ask[0].key);
+  assert.equal(f.calls.filter((c) => c[0] === "continue").length, 1);
+});
+
+const temporaryFailure = "没跑成：本次临时连接失败，稍后再查";
+
+test("a confirmed failure retries once per attempt in the same owned goal and reports only that attempt's usage", async (t) => {
+  const options = { finalText: temporaryFailure };
+  const f = fixture(t, options);
+  const first = await f.run("1");
+  assert.equal(first.state, "completed");
+  assert.equal(receiptResult(first.text).result.outcome, "failed");
+  options.finalText = "本次核查完成";
+  const second = await f.run("1", { attempt: 2 });
+  assert.equal(second.text, options.finalText);
+  assert.equal(second.state, "completed");
+  const calls = f.calls.filter((c) => c[0] === "continue").map((c) => c[1]);
+  assert.deepEqual(
+    calls.map((c) => c.requestId),
+    ["native-run:1", "native-run:1:attempt:2"],
+  );
+  assert.equal(calls[0].threadId, calls[1].threadId);
+  assert.doesNotMatch(calls[0].text, /第 2 次尝试/);
+  assert.match(calls[1].text, /第 2 次尝试.*临时失败.*不重做已完成业务/);
+  assert.match(calls[1].text, /本目标始终是：核对项目当前状态/);
+  assert.match(calls[1].text, /可信上游提示/);
+  const goals = f.calls.filter((c) => c[0] === "create").map((c) => c[1].goalId);
+  assert.equal(goals[0], goals[1]);
+  assert.equal(first.session, second.session);
+  assert.deepEqual(second.usage, { input: 20, output: 10, cached: 4 });
+  assert.deepEqual(second.cumulativeUsage, { input: 40, output: 20 });
+  assert.notEqual(first.artifact, second.artifact);
+  assert.equal(JSON.parse(readFileSync(first.artifact, "utf8")).text, temporaryFailure);
+  assert.equal(JSON.parse(readFileSync(second.artifact, "utf8")).text, options.finalText);
+  const replay = await f.run("1", { attempt: 2, prompt: "同一次尝试的重复领取" });
+  assert.equal(replay.text, second.text);
+  assert.deepEqual(replay.usage, second.usage);
+  assert.equal(replay.artifact, second.artifact);
+  assert.equal((await f.run("1", { attempt: 1 })).text, first.text);
+  assert.equal(f.calls.filter((c) => c[0] === "continue").length, 2);
+});
+
+test("attempt requires an integer from one through ten before reserving or dispatching", async (t) => {
+  for (const attempt of [0, -1, 1.5, 11, "2", null, NaN, Infinity]) {
+    const f = fixture(t);
+    const output = await f.run("1", { attempt });
+    assert.equal(output.state, "needs-attention");
+    assert.equal(output.errorCode, "MANAGED_CONFIG_ERROR");
+    assert.equal(f.calls.length, 0);
+  }
+});
+
+test("a retry requires the immediately preceding attempt and the same current goal", async (t) => {
+  for (const scenario of ["missing", "skipped", "changed-goal", "changed-root", "completed", "nothing"]) {
+    const f = fixture(t, {
+      finalText: scenario === "completed" ? "已完成" : scenario === "nothing" ? "没事可做：没有变化" : temporaryFailure,
+    });
+    if (scenario !== "missing") await f.run("1");
+    const before = f.calls.filter((c) => c[0] === "continue").length;
+    if (scenario === "changed-goal") f.set("active", { objective: "另一目标" });
+    if (scenario === "changed-root") f.project.roots = [path.join(f.dir, "other-root")];
+    const output = await f.run("1", { attempt: scenario === "skipped" ? 3 : 2 });
+    assert.equal(output.state, "needs-attention", scenario);
+    assert.equal(output.errorCode, "MANAGED_RETRY_NOT_CONFIRMED", scenario);
+    assert.equal(output.usage, undefined, scenario);
+    assert.equal(f.calls.filter((c) => c[0] === "continue").length, before, scenario);
+  }
+});
+
+test("unknown, intent and invalid legacy results can never authorize another attempt", async (t) => {
+  for (const scenario of [
+    "unknown",
+    "intent",
+    "missing-result",
+    "malformed-record",
+    "bad-receipt",
+    "invalid-schema",
+    "result-state",
+  ]) {
+    const f = fixture(t, { finalText: temporaryFailure });
+    const first = await f.run("1");
+    const db = new DatabaseSync(path.join(path.dirname(first.artifact), "worker.db"));
+    const legacy = { ...first };
+    let state = "completed",
+      encoded = JSON.stringify(legacy);
+    if (scenario === "unknown" || scenario === "intent") state = scenario;
+    if (scenario === "missing-result") encoded = null;
+    if (scenario === "malformed-record") encoded = "invalid JSON";
+    if (scenario === "bad-receipt") encoded = JSON.stringify({ ...legacy, text: "没跑成：错误\n" + brokenReceipt });
+    if (scenario === "invalid-schema")
+      encoded = JSON.stringify({
+        ...legacy,
+        text: '没跑成：错误\n```agent-autoloop\n{"later":[{"key":"review","at":3}]}\n```',
+      });
+    if (scenario === "result-state") encoded = JSON.stringify({ ...legacy, state: "unknown" });
+    db.prepare("UPDATE requests SET state=?, result=? WHERE run_id='1'").run(state, encoded);
+    db.close();
+    const output = await f.run("1", { attempt: 2 });
+    assert.equal(output.state, "needs-attention", scenario);
+    assert.equal(output.errorCode, "MANAGED_RETRY_NOT_CONFIRMED", scenario);
+    assert.equal(output.usage, undefined, scenario);
+    assert.equal(f.calls.filter((c) => c[0] === "continue").length, 1, scenario);
+  }
+});
+
+test("every real failed attempt consumes the same goal budget across pause and resume", async (t) => {
+  const f = fixture(t, { finalText: temporaryFailure });
+  assert.equal((await f.run("1")).state, "completed");
+  assert.equal((await f.run("1", { attempt: 2 })).state, "completed");
+  f.set("paused");
+  f.set("active");
+  const exhausted = await f.run("1", { attempt: 3 });
+  assert.equal(exhausted.errorCode, "MANAGED_STEP_BUDGET");
+  assert.equal(exhausted.usage, undefined);
+  assert.equal(f.calls.filter((c) => c[0] === "continue").length, 2);
+  assert.equal((await f.run("1", { attempt: 2 })).state, "completed");
+  assert.equal(f.calls.filter((c) => c[0] === "continue").length, 2);
+});
+
+test("repair replay addresses its own attempt and never duplicates usage or authorizes a new attempt", async (t) => {
+  const options = { finalText: temporaryFailure };
+  const f = fixture(t, options);
+  await f.run("1");
+  options.finalText = "第二次尝试结束";
+  const second = await f.run("1", { attempt: 2 });
+  const replay = await f.run("1", { attempt: 2, prompt: repairPrompt("旧上游读取失败") });
+  assert.equal(replay.text, second.text);
+  assert.equal(replay.receiptRepairReplay, true);
+  assert.equal(replay.usage, undefined);
+  assert.equal(replay.cumulativeUsage, undefined);
+  const orphan = await f.run("1", { attempt: 3, prompt: repairPrompt("没有原始记录") });
+  assert.equal(orphan.errorCode, "MANAGED_RECEIPT_REPAIR_CONTEXT_MISSING");
+  assert.equal(f.calls.filter((c) => c[0] === "continue").length, 2);
+});
+
+test("retry stop requests include the execution key and stop only that attempt's owned turn", async (t) => {
+  const options = { finalText: temporaryFailure };
+  const f = fixture(t, options);
+  await f.run("1");
+  options.signal = new AbortController();
+  const second = await f.run("1", { attempt: 2 });
+  assert.equal(second.state, "needs-attention");
+  const cancellation = f.calls.find((c) => c[0] === "cancel")[1];
+  assert.equal(cancellation.requestId, "native-stop:1:attempt:2");
+  assert.equal(cancellation.turnId, "turn-2");
+  assert.equal(cancellation.threadId, "thread-1");
+  assert.equal(f.calls.filter((c) => c[0] === "continue").length, 2);
+});
+
+test("overlapping claims for a retry reserve once and its in-flight result cannot authorize the next attempt", async (t) => {
+  const options = { finalText: temporaryFailure };
+  const f = fixture(t, options);
+  await f.run("1");
+  let release, arrive;
+  const waiting = new Promise((resolve) => {
+    release = resolve;
+  });
+  const created = new Promise((resolve) => {
+    arrive = resolve;
+  });
+  options.afterCreate = () => {
+    arrive();
+    return waiting;
+  };
+  const running = f.run("1", { attempt: 2 });
+  await created;
+  assert.equal((await f.run("1", { attempt: 2 })).state, "unknown");
+  assert.equal((await f.run("1", { attempt: 3 })).errorCode, "MANAGED_RETRY_NOT_CONFIRMED");
+  release();
+  assert.equal((await running).state, "completed");
+  assert.equal(f.calls.filter((c) => c[0] === "continue").length, 2);
+});
+
+test("the tenth sequential confirmed failure is allowed without bypassing the attempt bound", async (t) => {
+  const f = fixture(t, { finalText: temporaryFailure });
+  f.set("active", { maxSteps: 10 });
+  for (let attempt = 1; attempt <= 10; attempt++) {
+    assert.equal((await f.run("1", { attempt })).state, "completed");
+  }
+  assert.equal((await f.run("1", { attempt: 11 })).errorCode, "MANAGED_CONFIG_ERROR");
+  assert.equal(f.calls.filter((c) => c[0] === "continue").length, 10);
+});
+
+test("CLI rejects an invalid trusted attempt environment before opening a provider or executor", (t) => {
+  const f = fixture(t);
+  const configPath = path.join(f.dir, "worker-config.json");
+  writeFileSync(configPath, JSON.stringify(f.config));
+  const output = execFileSync(
+    process.execPath,
+    [
+      "--disable-warning=ExperimentalWarning",
+      fileURLToPath(new URL("./managed-worker.mjs", import.meta.url)),
+      configPath,
+      f.key,
+      "可信上游提示",
+    ],
+    {
+      encoding: "utf8",
+      env: { ...process.env, AGENT_AUTOLOOP_RUN: "1", AGENT_AUTOLOOP_ATTEMPT: "11" },
+    },
+  );
+  const result = JSON.parse(output.trim());
+  assert.equal(result.type, "native.result");
+  assert.equal(result.errorCode, "MANAGED_CONFIG_ERROR");
+  assert.equal(result.state, "needs-attention");
+});
+
+test("replaying an existing attempt after changing its goal or native root returns no prior result", async (t) => {
+  for (const attempt of [1, 2]) {
+    for (const change of ["objective", "root"]) {
+      const options = { finalText: attempt === 2 ? temporaryFailure : "原目标专属结果" };
+      const f = fixture(t, options);
+      const first = await f.run("1");
+      options.finalText = "原目标专属结果";
+      const prior = attempt === 2 ? await f.run("1", { attempt }) : first;
+      const database = path.join(path.dirname(prior.artifact), "worker.db");
+      const snapshot = () => {
+        const db = new DatabaseSync(database, { readOnly: true });
+        try {
+          return {
+            requests: db.prepare("SELECT * FROM requests ORDER BY run_id").all(),
+            blocks: db.prepare("SELECT * FROM receipt_blocks ORDER BY run_id").all(),
+          };
+        } finally {
+          db.close();
+        }
+      };
+      const before = snapshot();
+      const oldArtifact = readFileSync(prior.artifact, "utf8");
+      if (change === "objective") f.set("active", { objective: "新目标" });
+      else f.project.roots = [path.join(f.dir, "new-native-root")];
+      const output = await f.run("1", { attempt });
+      assert.equal(output.state, "needs-attention", `${attempt}:${change}`);
+      assert.equal(output.errorCode, "MANAGED_REPLAY_GOAL_MISMATCH");
+      assert.equal(receiptResult(output.text).problem, undefined);
+      assert.doesNotMatch(output.text, /原目标专属结果/);
+      for (const field of ["session", "usage", "cumulativeUsage", "artifact", "originalText"])
+        assert.equal(output[field], undefined, field);
+      assert.deepEqual(snapshot(), before);
+      assert.equal(readFileSync(prior.artifact, "utf8"), oldArtifact);
+      assert.equal(f.calls.filter((c) => c[0] === "continue").length, attempt);
+      const repair = await f.run("1", { attempt, prompt: repairPrompt("读取旧结果失败") });
+      assert.equal(repair.errorCode, "MANAGED_REPLAY_GOAL_MISMATCH");
+      assert.equal(repair.session, undefined);
+      assert.equal(repair.usage, undefined);
+      assert.deepEqual(snapshot(), before);
+    }
+  }
+});
+
+test("same goal and root can replay the same attempt when only the upstream context file changes", async (t) => {
+  const options = { finalText: temporaryFailure };
+  const f = fixture(t, options);
+  await f.run("1");
+  options.finalText = "目标原结果";
+  const first = await f.run("1", { attempt: 2, prompt: "本轮资料在 /private/runtime/context-before.json" });
+  const replay = await f.run("1", { attempt: 2, prompt: "本轮资料在 /private/runtime/context-after.json" });
+  assert.deepEqual(replay, first);
+  assert.equal(f.calls.filter((c) => c[0] === "continue").length, 2);
+});
+
+test("replay checks the original control revision after catalogue refresh and again after catalogue close", async (t) => {
+  for (const boundary of ["afterRefresh", "afterCatalogClose"]) {
+    for (const change of ["objective", "paused", "budget"]) {
+      const options = { finalText: temporaryFailure };
+      const f = fixture(t, options);
+      await f.run("1");
+      options.finalText = "旧控制版本的私有结果";
+      const original = await f.run("1", { attempt: 2 });
+      const database = path.join(path.dirname(original.artifact), "worker.db");
+      const readLedger = () => {
+        const db = new DatabaseSync(database, { readOnly: true });
+        try {
+          return db.prepare("SELECT * FROM requests ORDER BY run_id").all();
+        } finally {
+          db.close();
+        }
+      };
+      const before = readLedger(),
+        artifactBefore = readFileSync(original.artifact, "utf8");
+      options[boundary] = async (set) => {
+        await Promise.resolve();
+        if (change === "paused") set("paused");
+        else set("active", change === "objective" ? { objective: "等待期间的新目标" } : { maxSteps: 3 });
+      };
+      const replay = await f.run("1", { attempt: 2 });
+      assert.equal(replay.state, "needs-attention", `${boundary}:${change}`);
+      assert.equal(replay.errorCode, change === "paused" ? "LOOP_NOT_ACTIVE" : "CONTROL_REVISION_CHANGED");
+      assert.doesNotMatch(replay.text, /旧控制版本的私有结果/);
+      for (const field of ["session", "usage", "cumulativeUsage", "artifact", "originalText"])
+        assert.equal(replay[field], undefined, field);
+      assert.deepEqual(readLedger(), before);
+      assert.equal(readFileSync(original.artifact, "utf8"), artifactBefore);
+      assert.equal(f.calls.filter((c) => c[0] === "continue").length, 2);
+      assert.deepEqual(f.events.at(-1), { type: "native.result", ...replay });
+    }
+  }
+});
+
+test("a pause during final catalogue close preserves a newly executed result and its real usage", async (t) => {
+  const f = fixture(t, { afterCatalogClose: (set) => set("paused") });
+  const output = await f.run("1");
+  assert.equal(f.controls.get(f.key).mode, "paused");
+  assert.equal(output.state, "completed");
+  assert.equal(output.session, "thread-1");
+  assert.deepEqual(output.usage, { input: 20, output: 10, cached: 4 });
+  assert.equal(JSON.parse(readFileSync(output.artifact, "utf8")).text, output.text);
   assert.equal(f.calls.filter((c) => c[0] === "continue").length, 1);
 });

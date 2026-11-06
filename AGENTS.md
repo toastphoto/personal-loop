@@ -73,3 +73,5 @@
 ## Personal-loop integration
 
 For `integrations/native-projects/`, read [current context](docs/project_memory/ACTIVE_CONTEXT.md), [decisions](docs/project_memory/DECISIONS.md) and [handoff](docs/project_memory/HANDOFF_TEMPLATE.md). All projects default to manual. Project selection and pause are explicit persistent choices; an unavailable native connection never means an empty successful catalogue. Keep runtime metadata and credentials outside Git. Update these memory files and root LEARNINGS after corrections. Run `python3 scripts/verify_project_memory.py` and `npm run test:native`, plus the existing applicable checks.
+
+Execution defaults follow upstream events, justified `later` checks and owner answers; do not add an hourly digest or a second scheduler. A confirmed-failure retry is a new bounded attempt, while retransmission of that attempt is idempotent. Preserve current goal/revision checks when replaying stored results.

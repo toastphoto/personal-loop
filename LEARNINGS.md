@@ -30,3 +30,7 @@
 - Package staging must use explicit paths when the shell working directory is the plugin subdirectory; a failed documentation edit must not be mistaken for a completed release update.
 
 - Validate protocol enums against the installed native schema. The owned executor's active-turn read/cancel preflight used obsolete itemsView="none"; switch to notLoaded without weakening project/turn identity checks.
+
+- Upstream retries reuse a run ID but increment attempt. Deduplicating by run alone replayed failed results and usage without retrying. Separate attempt identity, require a verified failed predecessor, and count each real attempt against budget.
+- Cached replay needs the same goal and control revision as well as an idempotency key. Recheck after asynchronous catalogue work; do not suppress results of newly completed work merely because the owner paused afterward.
+- Do not label the nightly suite passed when deep checks pass but performance budgets fail. Keep measured failures, isolate resource-sensitive checks and compare baseline without loosening thresholds.

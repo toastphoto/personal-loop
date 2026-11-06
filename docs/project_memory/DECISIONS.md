@@ -24,3 +24,8 @@
 - On explicit owner request, allow bounded visible Agent reply reads for the selected native project only; keep metadata/MCP defaults and native identity guards. Display unknown/stored states honestly and do not treat a quoted completion claim as business acceptance.
 - Keep scheduling and reporting separate. The original `needed` policy is not a fixed reporting interval; no recurring summary was inferred from a question about how reporting works.
 - Preserve malformed original receipts privately, produce a valid attention request, isolate the affected goal and avoid duplicate work/usage. Automatic receipt repair remains unimplemented.
+
+- 2026-11-05: Rechecked upstream main `a3b77bf26c0b98bb9eb1edd10ede2e3c13bfdd5d`: default reporting remains `tell:needed`, with no mandatory hourly digest. The owner prefers no hourly briefing; keep on-demand notifications and do not add an hourly report schedule. Execution/rechecks are separate from notifications. The optional upstream Feishu brief recipe runs weekly, not hourly.
+
+- 2026-11-06: The owner approved upstream-style execution: event/later/answer-driven continuation, quiet ordinary completion and no fixed hourly reporting. Keep project activation and access scope explicit.
+- Use upstream retry attempts as distinct bounded executions only after a verified failed predecessor; deduplicate the same attempt. Preserve attempt-1 legacy keys and count retries against the owner's round limit. Unknown results still require reconciliation.
