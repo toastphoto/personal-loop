@@ -366,3 +366,147 @@ test("owner natural language is handled by cards once and its delivery is bound 
   assert.deepEqual(bound, [["s", "om_response"]]);
   assert.equal(queue.get("om_natural").state, "replied");
 });
+
+test("a named owner goal starts once, preserving pauses, opt-in scope and newer control generations", async (t) => {
+  const dir = mkdtempSync(path.join(tmpdir(), "relay-direct-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const queuePath = path.join(dir, "queue.ndjson"),
+    routing = path.join(dir, "routing.json");
+  const setting = { name: "测试工作台", projectKey: "codex:local:fixture", enabledAt: "2026-01-01T00:00:00Z" };
+  const route = {
+    enabled: true,
+    chatId: config.chatId,
+    allowedSenderIds: config.allowedSenderIds,
+    botMentionIds: ["ou_bot"],
+    projectNames: [setting.name],
+    directGoalProjects: [setting],
+  };
+  writeFileSync(routing, JSON.stringify(route));
+  writeFileSync(queuePath, "");
+  const queue = new RelayQueue(path.join(dir, "q.db")),
+    controls = new LoopControls(path.join(dir, "modes.json"));
+  t.after(() => queue.close());
+  const p = {
+    key: setting.projectKey,
+    provider: "codex",
+    host: "local",
+    nativeId: "fixture",
+    name: setting.name,
+    capabilities: { startOwned: true, continuationMode: "managed-read-only" },
+  };
+  const dirResult = { complete: true, projects: [p] };
+  const cache = new Map();
+  let coordinatorReady = false;
+  let failDelivery = false,
+    dispatch = 0,
+    reads = 0,
+    duringReady;
+  const relay = new FeishuLoopRelay(
+    { ...config, queuePath, naturalRoutingFile: routing, retryMs: 0 },
+    {
+      catalog: {
+        projects: cache,
+        refresh: async () => {
+          throw Error("must not open unrelated native providers");
+        },
+        readProvider: async (provider) => {
+          assert.equal(provider, "codex");
+          reads++;
+          return dirResult;
+        },
+      },
+      queue,
+      controls,
+      canCoordinate: (key) => coordinatorReady && key === p.key,
+      cards: { enabled: () => true, prepare: async () => null, natural: async () => ({ ok: true, text: "proposal" }) },
+      readiness: async () => {
+        duringReady?.();
+        return { ready: true, rulesReady: true };
+      },
+      syncRules: async () => {
+        dispatch++;
+        return { ok: true };
+      },
+      reply: async () => {
+        if (failDelivery) {
+          failDelivery = false;
+          throw Error();
+        }
+        return "om_response";
+      },
+    },
+  );
+  const goal = "准备第一次试用方案";
+  function send(id, extra = {}) {
+    appendFileSync(
+      queuePath,
+      JSON.stringify(
+        event(id, "@Bot " + p.name + "，帮我" + goal, {
+          create_time: "1793934661118",
+          mentions: [{ id: "ou_bot", name: "Bot" }],
+          ...extra,
+        }),
+      ) + "\n",
+    );
+  }
+  await relay.tick();
+  send("om_unavailable");
+  await relay.tick();
+  assert.equal(dispatch, 0);
+  assert.match(queue.get("om_unavailable").response, /协调入口/);
+  coordinatorReady = true;
+  failDelivery = true;
+  send("om_goal");
+  await relay.tick();
+  send("om_goal");
+  await relay.tick();
+  assert.equal(queue.get("om_goal").state, "replied");
+  assert.match(queue.get("om_goal").response, /先看/);
+  assert.equal(dispatch, 1);
+  assert.equal(reads, 1);
+  assert.equal(controls.get(p.key).objective, goal);
+  assert.equal(controls.get(p.key).maxSteps, 3);
+  send("om_echo");
+  await relay.tick();
+  assert.equal(dispatch, 1);
+  assert.equal(controls.get(p.key).revision, 1);
+  controls.set(p.key, "paused", { actor: "owner" });
+  send("om_paused");
+  await relay.tick();
+  assert.equal(controls.get(p.key).mode, "paused");
+  controls.set(p.key, "manual", { actor: "owner" });
+  dirResult.projects.push({ ...p, key: "codex:local:second", nativeId: "second" });
+  send("om_same_name");
+  await relay.tick();
+  assert.equal(controls.get(p.key).mode, "manual");
+  assert.match(queue.get("om_same_name").response, /归属/);
+  assert.equal(dispatch, 1);
+  dirResult.projects.pop();
+  cache.set("dsh:local:another", { provider: "dsh", key: "dsh:local:another", name: p.name });
+  send("om_cached_conflict");
+  await relay.tick();
+  assert.equal(dispatch, 1);
+  assert.match(queue.get("om_cached_conflict").response, /归属/);
+  cache.clear();
+  dirResult.complete = false;
+  send("om_incomplete");
+  await relay.tick();
+  assert.equal(dispatch, 1);
+  assert.match(queue.get("om_incomplete").response, /归属/);
+  dirResult.complete = true;
+  send("om_old", { create_time: "1000000000000" });
+  await relay.tick();
+  assert.equal(queue.get("om_old").response, "proposal");
+  assert.equal(dispatch, 1);
+  duringReady = () => controls.set(p.key, "paused", { actor: "owner" });
+  send("om_race");
+  await relay.tick();
+  assert.equal(controls.get(p.key).mode, "paused");
+  assert.equal(dispatch, 1);
+  duringReady = () => writeFileSync(routing, JSON.stringify({ ...route, directGoalProjects: [] }));
+  controls.set(p.key, "manual", { actor: "owner" });
+  send("om_revoked");
+  await relay.tick();
+  assert.equal(controls.get(p.key).mode, "manual");
+  assert.equal(dispatch, 1);
+});

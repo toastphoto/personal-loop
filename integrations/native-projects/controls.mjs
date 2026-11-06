@@ -75,7 +75,18 @@ export class LoopControls {
         cancelRunning: false,
       };
       if (typeof projectName === "string" && projectName.trim()) next.projectName = projectName.slice(0, 500);
-      if (objective !== undefined) next.objective = objective;
+      if (objective !== undefined) {
+        next.objective = objective;
+        if (mode === "active") next.goalRevision = next.revision;
+      }
+      if (mode === "active" && requestId !== undefined) {
+        next.goalControlEvent =
+          "native-control-" +
+          createHash("sha256")
+            .update(JSON.stringify([key, requestId]))
+            .digest("hex");
+        if (objective !== undefined) next.goalStartEvent = next.goalControlEvent;
+      }
       if (maxSteps !== undefined) next.maxSteps = maxSteps;
       if (deadline !== undefined) next.deadline = deadline;
       if (mode === "active") {

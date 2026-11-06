@@ -416,6 +416,20 @@ function replyDigest(source, delivered = false) {
     /(?:https?:\/\/|(?:^|[\s(`])(?:\.\.?\/|\/|~\/)|\b[a-z][\w.-]+\/[\w.-]+|\b[\w.-]+\.(?:md|json|ndjson|ya?ml|py|m?js|ts|sql|sh)\b|[a-f\d]{24,}|[{}]|`)/iu.test(
       v,
     );
+  const json = source.trim().replace(/^```json\s*\n([\s\S]*)\n```$/iu, "$1");
+  if (!delivered && json.startsWith("{")) {
+    try {
+      const record = JSON.parse(json);
+      const brief = ["ask", "dispatch"].includes(record.action)
+        ? record.progress
+        : ["deliver", "review"].includes(record.action)
+          ? record.summary
+          : null;
+      return typeof brief === "string" && brief.trim() && !technical(brief) ? short(brief, 118) : "";
+    } catch {
+      return "";
+    } // A clipped structured reply does not establish a result.
+  }
   const handoff = !delivered && /^项目简报[：:]\s*(.+)$/u.exec(lines.find((line) => line.trim())?.trim() ?? "")?.[1];
   if (handoff && !technical(handoff) && !/[|｜]/u.test(handoff)) return short(handoff, 118);
   const prose = lines.flatMap((line) => {

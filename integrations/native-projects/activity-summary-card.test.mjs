@@ -66,3 +66,22 @@ test("a worker handoff leads with its human conclusion even when later evidence 
   assert.ok(!visible(v).includes("五十行"));
   assert.ok(JSON.stringify(v).includes("五十行"));
 });
+
+test("a coordinator record displays its reported progress, never the internal routing JSON", () => {
+  const raw = JSON.stringify({
+    action: "ask",
+    progress: "现有试点只涉及两人。",
+    question: "先测试哪个环节？",
+    options: ["录入", "交付"],
+    recommend: 0,
+    reason: "先确定输入格式。",
+    nextStep: "整理流程",
+    expectedResult: "核对表",
+  });
+  assert.match(visible(card(raw)), /现有试点只涉及两人/);
+  assert.doesNotMatch(visible(card(raw)), /expectedResult|recommend|需要你决定/);
+  assert.match(
+    visible(card(JSON.stringify({ action: "deliver", summary: "试用清单已整理。", deliverable: "供员工试用。" }))),
+    /试用清单已整理/,
+  );
+});

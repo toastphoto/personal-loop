@@ -507,6 +507,7 @@ test("a root mapping changed after readiness cannot retarget the selected projec
 
 async function decisionClickFixture(t, options = {}) {
   const f = fixture(t);
+  if (options.coordinator) f.nativeConfig.managedCodex.coordinatorProjectKeys = [f.key];
   await f.runtime.readiness(f.project);
   const control = f.set("active");
   await f.sync(control);
@@ -710,4 +711,46 @@ test("group decision opt-in starts at its explicit inclusive card ID and expired
   writeFileSync(f.controls.file, JSON.stringify(state));
   assert.equal((await f.click()).code, "LOOP_CARD_GOAL_INACTIVE");
   assert.equal(f.sent.length, 0);
+});
+
+test("a coordinator handoff can wake only the selected project and is disabled for ordinary goals", async (t) => {
+  const f = fixture(t);
+  f.nativeConfig.managedCodex.coordinatorProjectKeys = [f.key];
+  f.saveConfig();
+  const changed = "native.project." + subjectFor(f.key).slice(0, 32) + ".changed";
+  const handoff = changed.replace(/changed$/, "handoff");
+  assert.equal((await f.runtime.readiness(f.project)).ready, true);
+  await f.sync(f.set("active"));
+  const rule = f.readRules().rules.find((r) => r.to.startsWith("native-managed-"));
+  assert.deepEqual(rule.when.types, [changed, handoff]);
+  assert.deepEqual(rule.emits, { source: "native", types: [handoff] });
+  assert.equal(f.events.length, 1);
+  assert.equal(f.events[0].type, changed);
+  const other = f.runtime.desired(f.otherKey, { revision: 1 }, f.runtime.layout()).rule;
+  assert.equal(other.emits, undefined);
+  assert.equal(other.when.types.length, 1);
+  for (const conflict of [
+    { when: { source: "native", types: [handoff] } },
+    { emits: { source: "native", types: ["native.project.*"] } },
+  ]) {
+    const raw = structuredClone(f.rules);
+    Object.assign(raw.rules[0], conflict);
+    f.saveRules(raw);
+    assert.equal((await f.runtime.readiness(f.project)).code, "LOOP_EVENT_SCOPE_CONFLICT");
+  }
+});
+
+test("only the same coordinator goal can answer its question after pause and resume", async (t) => {
+  const f = await decisionClickFixture(t, { coordinator: true });
+  await f.sync(f.set("paused"), "pause", "pause-user");
+  assert.equal((await f.click()).ok, false);
+  const resumed = f.controls.set(f.key, "active", { actor: "fixture" });
+  await f.sync(resumed, "resume", "resume-user");
+  f.put("config", "rules", { value: f.readRules(), version: 6 });
+  assert.equal((await f.click()).ok, true);
+  const replaced = f.set("active");
+  await f.sync(replaced, "enable", "replace-goal");
+  f.put("config", "rules", { value: f.readRules(), version: 7 });
+  assert.equal((await f.click()).code, "LOOP_CARD_GOAL_CHANGED");
+  assert.equal(f.sent.length, 1);
 });

@@ -34,9 +34,25 @@ function outcome(card: Card) {
   ].filter(Boolean);
 }
 
+// New coordinator asks put the reason on the last line. Earlier cards keep their prose as delivered.
+function messageLines(card: Card): string[] {
+  const body = clean(card, card.text);
+  if (!body) return [];
+  if (card.kind !== "ask" || card.recommend === null) return [body];
+  const option = card.options[card.recommend];
+  const match = /(?:^|\r?\n)推荐理由[：:][ \t]*([^\r\n]+)$/u.exec(body.trimEnd());
+  const reason = match?.[1].trim();
+  if (!option || !match || !reason) return [body];
+  const context = body.slice(0, match.index).trimEnd();
+  return [
+    ...(context ? [context] : []),
+    ...(card.state === "open" ? [`建议选「${clean(card, option)}」：${reason}`] : []),
+  ];
+}
+
 export function renderText(card: Card): string {
   if (!Number.isSafeInteger(card.id) || card.id < 1) throw problem("INVALID_CARD_ID");
-  const lines = [`${heading(card)} #${card.id}`, clean(card, card.title), clean(card, card.text)];
+  const lines = [`${heading(card)} #${card.id}`, clean(card, card.title), ...messageLines(card)];
   if (card.state === "open" && card.kind === "ask") {
     if (!card.options.length) throw problem("CARD_OPTIONS_REQUIRED");
     lines.push(
@@ -62,7 +78,7 @@ export function renderDecisionCard(card: Card) {
   const plain = (content: string) => ({ tag: "plain_text", content });
   const block = (content: string) => ({ tag: "div", text: plain(content) });
   const elements: Record<string, unknown>[] = [block(clean(card, card.title))];
-  if (card.text) elements.push(block(clean(card, card.text)));
+  elements.push(...messageLines(card).map(block));
   if (card.state === "open") {
     if (card.options.length < 2 || card.options.length > 5) throw problem("CARD_OPTIONS_REQUIRED");
     card.options.forEach((option, index) => {

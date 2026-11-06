@@ -4,7 +4,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import channel, { renderText } from "../plugins/feishu-group-text/channel.ts";
+import channel, { renderDecisionCard, renderText } from "../plugins/feishu-group-text/channel.ts";
 import type { Card, ChannelContext } from "../host/channels.ts";
 
 const base: Card = {
@@ -334,4 +334,44 @@ test("cutover keeps earlier unsent questions, earlier edits and every notice on 
   await channel(f.context);
   assert.ok(f.calls().every((call) => call.args.includes("--text")));
   assert.equal(f.delivered.length, 3);
+});
+
+test("recommendation names its actual option and explains why, while an opposite click governs follow-up", () => {
+  const question: Card = {
+    ...base,
+    options: ["员工第一次使用", "前后端接口"],
+    text: "两项准备都已梳理。\n推荐理由：团队先约定数据格式，试用时更容易定位问题。",
+    recommend: 1,
+  };
+  const suggestion = "建议选「前后端接口」：团队先约定数据格式，试用时更容易定位问题。";
+  const opened = renderDecisionCard(question);
+  const blocks = opened.body.elements.filter((e) => e.tag === "div").map((e: any) => e.text.content);
+  assert.deepEqual(blocks, [question.title, "两项准备都已梳理。", suggestion]);
+  assert.ok(renderText(question).includes(suggestion));
+  const buttons = opened.body.elements.filter((e) => e.tag === "button");
+  assert.equal(buttons.length, 2);
+  assert.equal((buttons[0] as any).behaviors[0].value.choice, 0);
+  for (const state of ["decided", "done"] as const) {
+    const after = { ...question, state, choice: 0, result: state === "done" ? "首位员工上手清单已整理。" : null };
+    for (const content of [JSON.stringify(renderDecisionCard(after)), renderText(after)]) {
+      assert.ok(content.includes("你的选择：员工第一次使用"));
+      assert.ok(
+        !content.includes("建议选") && !content.includes("推荐理由") && !content.includes("团队先约定数据格式"),
+      );
+      if (after.result) assert.ok(content.includes(after.result));
+    }
+  }
+});
+test("unstructured questions, missing recommendations and empty reasons never fabricate advice", () => {
+  for (const data of [
+    { text: "这次希望先做哪项？", recommend: 0 },
+    { text: "推荐理由：需要再核实。", recommend: null },
+    { text: "推荐理由：", recommend: 0 },
+    { text: "说明正文提及推荐理由：先做哪个比较好？", recommend: 0 },
+  ]) {
+    const question = { ...base, ...data };
+    const printed = JSON.stringify(renderDecisionCard(question));
+    assert.ok(printed.includes(data.text));
+    assert.ok(!printed.includes("建议选「"));
+  }
 });

@@ -88,3 +88,23 @@ test("a scoped metadata read passes native project identity to the provider", as
   assert.equal(item.nativeProjectId, null);
   assert.equal(item.membership, "cwd-unassigned");
 });
+test("scoped authority reads only the chosen provider and leaves unrelated cached projects intact", async () => {
+  let otherReads = 0;
+  const r = {
+    listProjects: async () => {
+      otherReads++;
+      return { projects: [project("other")], complete: true };
+    },
+  };
+  const c = new ProjectCatalog({ codex: connector([project("one")]), multica: r, dsh: r });
+  await c.refresh();
+  assert.equal(otherReads, 2);
+  const d = await c.readProvider("codex");
+  assert.equal(d.complete, true);
+  assert.deepEqual(
+    d.projects.map((p) => p.provider),
+    ["codex"],
+  );
+  assert.equal(otherReads, 2);
+  assert.equal(c.resolve(projectKey("dsh", "local", "other")).project.name, "Same name");
+});

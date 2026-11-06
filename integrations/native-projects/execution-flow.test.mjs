@@ -3,11 +3,13 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { once } from "node:events";
-import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync, appendFileSync } from "node:fs";
 import path from "node:path";
 import { setup } from "../../tests/helpers.ts";
 import { NativeLoopRuntime } from "./loop-runtime.mjs";
 import { LoopControls, subjectFor } from "./controls.mjs";
+import { FeishuLoopRelay } from "./feishu-relay.mjs";
+import { RelayQueue } from "./relay-queue.mjs";
 import { runManagedWorker } from "./managed-worker.mjs";
 import adapter from "../../plugins/native-managed/agent.ts";
 import { promptFor, readMessage, resultFrom } from "../../worker/contract.ts";
@@ -26,7 +28,7 @@ process.env.AGENT_AUTOLOOP_RULES = rulesFile;
 const hub = await import("../../host/runtime.ts");
 const receipt = (summary, body) => summary + "\n```agent-autoloop\n" + JSON.stringify(body) + "\n```";
 
-function fixture(t, name, replies) {
+function fixture(t, name, replies, { coordinator = false } = {}) {
   for (const table of ["run_events", "runs", "events", "seen", "cards", "deliveries", "timers", "schedules"])
     hub.fixtureClear(table);
   writeFileSync(rulesFile, JSON.stringify(emptyRules()), { mode: 0o600 });
@@ -42,9 +44,11 @@ function fixture(t, name, replies) {
   const project = {
     key: projectKey,
     provider: "codex",
+    host: "local",
+    name: "演示项目",
     nativeId,
     roots: [sourceRoot],
-    capabilities: { continue: true },
+    capabilities: { read: true, continue: true, startOwned: true, continuationMode: "managed-read-only" },
   };
   const configFile = path.join(directory, "native.json"),
     hubFile = path.join(home, name + "-hub.json");
@@ -56,6 +60,7 @@ function fixture(t, name, replies) {
       enabled: true,
       stateDir: path.join(directory, "owned"),
       projectRoots: { [projectKey]: sourceRoot },
+      ...(coordinator && { coordinatorProjectKeys: [projectKey] }),
     },
     loopHub: { configFile: hubFile, rulesFile, workerName: "fixture-worker", controlCwd },
   };
@@ -72,7 +77,7 @@ function fixture(t, name, replies) {
   const controls = new LoopControls(config.controlsFile);
   let clock = Date.now(),
     claims = 0,
-    owned = null,
+    ownedByFile = new Map(),
     active = 0,
     closed = 0,
     currentContextFile;
@@ -100,7 +105,13 @@ function fixture(t, name, replies) {
     hub.tick(clock);
   };
   const catalog = {
-    async refresh() {},
+    async refresh() {
+      return {
+        complete: true,
+        projects: [project],
+        providers: [{ provider: "codex", status: "connected", complete: true }],
+      };
+    },
     resolve(key) {
       assert.equal(key, projectKey);
       return { project };
@@ -109,6 +120,7 @@ function fixture(t, name, replies) {
   };
   const executorFactory = (options) => {
     assert.equal(options.sandbox, "read-only");
+    let owned = ownedByFile.get(options.stateFile);
     let running = false,
       turnId,
       text;
@@ -123,17 +135,21 @@ function fixture(t, name, replies) {
           stateFile: options.stateFile,
         };
         if (owned) assert.deepEqual(identity, owned.identity, "one objective keeps the same owned session identity");
-        else owned = { identity, nativeId: "owned-" + name };
+        else {
+          owned = { identity, nativeId: "owned-" + name + "-" + ownedByFile.size };
+          ownedByFile.set(options.stateFile, owned);
+        }
         return { nativeId: owned.nativeId };
       },
       async continueOwned(input) {
         input.beforeMutation();
         assert.equal(input.threadId, owned.nativeId);
         const context = JSON.parse(readFileSync(currentContextFile, "utf8"));
-        assert.ok(input.text.includes(currentContextFile), "the model receives the actual upstream context path");
+        if (!coordinator)
+          assert.ok(input.text.includes(currentContextFile), "the model receives the actual upstream context path");
         const step = replies[executions.length];
         assert.ok(step, "no unplanned model invocation");
-        text = step(context, clock);
+        text = step(context, clock, input.text);
         turnId = "turn-" + (executions.length + 1);
         executions.push({ ...input, context, goalId: owned.identity.goalId });
         running = true;
@@ -167,6 +183,7 @@ function fixture(t, name, replies) {
       actor: "fixture-owner",
       objective: "Complete the bounded fixture goal",
       maxSteps: 8,
+      requestId: "enable-" + name,
     });
     return runtime.sync({ projectKey, control, action: "enable", requestId: "enable-" + name });
   }
@@ -189,7 +206,14 @@ function fixture(t, name, replies) {
     assert.deepEqual(argv.slice(-3), [configFile, projectKey, prompt]);
     const output = [];
     const result = await runManagedWorker(
-      { config, projectKey: argv.at(-2), prompt: argv.at(-1), runId: String(job.run), attempt: job.attempt },
+      {
+        config,
+        contextFile: currentContextFile,
+        projectKey: argv.at(-2),
+        prompt: argv.at(-1),
+        runId: String(job.run),
+        attempt: job.attempt,
+      },
       {
         controls,
         catalog,
@@ -208,7 +232,11 @@ function fixture(t, name, replies) {
     return { job, result, parsed: parsed.result };
   }
   return {
+    directory,
+    catalog,
+    project,
     hubFile,
+    sourceRoot,
     runtime,
     controls,
     projectKey,
@@ -226,8 +254,149 @@ function fixture(t, name, replies) {
   };
 }
 
+async function bindGroupChannel(t, f) {
+  const { serve } = await import("../../host/http.ts");
+  const server = serve(0);
+  await once(server, "listening");
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+  const settings = JSON.parse(readFileSync(f.hubFile, "utf8"));
+  settings.url = "http://127.0.0.1:" + server.address().port;
+  settings.channels = {
+    fixture: {
+      use: "feishu-group-text",
+      interactiveAsks: true,
+      interactiveAsksFromId: 1,
+      profile: "test",
+      chatId: "oc_t",
+      key: hub.addKey("channel", "fixture"),
+    },
+  };
+  writeFileSync(f.hubFile, JSON.stringify(settings));
+}
+
 test("selected native goals use upstream events, receipts, timers and answers without an extra scheduler", async (t) => {
   t.after(() => hub.db.close());
+
+  for (const route of ["ask", "dispatch"])
+    await t.test("named IM goal coordinates with a separate worker via " + route, async (t) => {
+      const routes = ["先试员工首次使用", "先试部件接口"];
+      const decision = {
+        action: route,
+        progress: "一页试用草案已就绪",
+        nextStep: "围绕试用重点生成检查清单",
+        expectedResult: "可执行的条目",
+      };
+      if (route === "ask")
+        Object.assign(decision, {
+          question: "第一轮试用优先看什么？",
+          options: routes,
+          recommend: 0,
+          reason: "首轮先确认员工能走完整个流程，再扩大范围。",
+        });
+      const final = { action: "deliver", summary: "试用清单已准备", deliverable: "1. 核对输入。\n2. 测试交付结果。" };
+      const f = fixture(
+        t,
+        "owner-" + route,
+        [
+          () => JSON.stringify(decision),
+          (context, clock, text) => {
+            assert.equal(context.events.length, 1);
+            assert.ok(text.includes(decision.nextStep), "worker receives the coordinator's actual plan");
+            if (route === "ask") {
+              assert.equal(context.events[0].type, "card.answered");
+              assert.equal(context.answers[0].choice, 1);
+              assert.ok(
+                text.includes(routes[1]),
+                "worker receives the owner's choice, even when different from the recommendation",
+              );
+            } else assert.ok(context.events[0].type.endsWith(".handoff"));
+            return JSON.stringify(final);
+          },
+        ],
+        { coordinator: true },
+      );
+      writeFileSync(path.join(f.sourceRoot, "AGENTS.md"), "已准备好一页试用草案。");
+      await bindGroupChannel(t, f);
+      const queuePath = path.join(f.directory, "im.ndjson");
+      const naturalRoutingFile = path.join(f.directory, "routing.json");
+      const config = {
+        chatId: "oc_t",
+        allowedSenderIds: ["fixture-owner"],
+        queuePath,
+        naturalRoutingFile,
+        profile: "test",
+      };
+      writeFileSync(queuePath, "");
+      writeFileSync(
+        naturalRoutingFile,
+        JSON.stringify({
+          ...config,
+          enabled: true,
+          botMentionIds: ["ou_bot"],
+          projectNames: [f.project.name],
+          directGoalProjects: [{ name: f.project.name, projectKey: f.projectKey, enabledAt: "2026-01-01T00:00:00Z" }],
+        }),
+      );
+      const queue = new RelayQueue(path.join(f.directory, "im.db"));
+      t.after(() => queue.close());
+      const relay = new FeishuLoopRelay(config, {
+        queue,
+        controls: f.controls,
+        catalog: f.catalog,
+        canCoordinate: (key) => key === f.projectKey,
+        cards: { enabled: () => true, prepare: async () => null },
+        readiness: (p) => f.runtime.readiness(p),
+        syncRules: (args) => f.runtime.sync(args),
+        reply: async () => "om_ack",
+      });
+      await relay.tick();
+      const event = {
+        message_id: "om_pilot_" + route,
+        message_type: "text",
+        sender_type: "user",
+        sender_id: "fixture-owner",
+        chat_id: "oc_t",
+        create_time: String(Date.now()),
+        mentions: [{ id: "ou_bot", name: "Bot" }],
+        content: "@Bot 演示项目，帮我准备一份小组试用方案。",
+      };
+      appendFileSync(queuePath, JSON.stringify(event) + "\n");
+      await relay.tick();
+      assert.match(queue.get(event.message_id).response, /先看/);
+      const first = await f.executeNext();
+      assert.equal(
+        (route === "ask" ? first.parsed.ask : first.parsed.events)?.length,
+        1,
+        first.result.errorCode ?? first.parsed.summary,
+      );
+      if (route === "ask") {
+        const ask = f.nextCard();
+        assert.equal(ask.kind, "ask");
+        assert.equal(ask.recommend, 0);
+        assert.ok(ask.text.includes(decision.reason));
+        assert.equal(await f.executeNext(), null);
+        hub.delivered("fixture", ask.id, ask.version, "om_original_question");
+        const click = {
+          cardId: ask.id,
+          version: ask.version,
+          choice: 1,
+          actor: "fixture-owner",
+          profile: "test",
+          chatId: "oc_t",
+          messageId: "om_original_question",
+          requestId: "owner-click",
+        };
+        assert.equal((await f.runtime.answerDecisionClick(click)).changed, true);
+        assert.equal((await f.runtime.answerDecisionClick(click)).changed, false);
+      }
+      f.advance(1);
+      const work = await f.executeNext();
+      assert.ok(work?.parsed.notice?.some((x) => x.text.includes("测试交付结果")));
+      assert.equal(f.executions.length, 2);
+      assert.notEqual(f.executions[0].threadId, f.executions[1].threadId);
+      assert.equal(await f.executeNext(), null);
+      assert.equal(f.waitingTimers().length, 0);
+    });
   await t.test(
     "a mobile choice uses the delivered Feishu message and wakes precisely the chosen native branch",
     async (t) => {
@@ -242,23 +411,7 @@ test("selected native goals use upstream events, receipts, timers and answers wi
           return "Contract checklist completed";
         },
       ]);
-      const { serve } = await import("../../host/http.ts");
-      const server = serve(0);
-      await once(server, "listening");
-      t.after(() => new Promise((resolve) => server.close(resolve)));
-      const settings = JSON.parse(readFileSync(f.hubFile, "utf8"));
-      settings.url = "http://127.0.0.1:" + server.address().port;
-      settings.channels = {
-        fixture: {
-          use: "feishu-group-text",
-          interactiveAsks: true,
-          interactiveAsksFromId: 1,
-          profile: "test",
-          chatId: "oc_t",
-          key: hub.addKey("channel", "fixture"),
-        },
-      };
-      writeFileSync(f.hubFile, JSON.stringify(settings));
+      await bindGroupChannel(t, f);
       await f.enable();
       await f.executeNext();
       const ask = f.nextCard();

@@ -10,6 +10,7 @@ import { failure, safeError } from "./catalog.mjs";
 import { NativeLoopRuntime } from "./loop-runtime.mjs";
 import { startLoopHub } from "./hub-host.mjs";
 import { commandText, routeProjectMessage, readRouting } from "./feishu-route.mjs";
+import { directGoalRequest } from "./feishu-direct-goal.mjs";
 export { commandText } from "./feishu-route.mjs";
 import { CardSessions, ProjectCardController } from "./feishu-card-control.mjs";
 import { CardEventSubscriber } from "./callback-consumer.mjs";
@@ -103,7 +104,10 @@ export async function larkReply(config, item, execute = runProgram) {
 }
 
 export class FeishuLoopRelay {
-  constructor(config, { queue, catalog, controls, reply, readiness, syncRules, answerCard, cards } = {}) {
+  constructor(
+    config,
+    { queue, catalog, controls, reply, readiness, syncRules, answerCard, cards, canCoordinate } = {},
+  ) {
     if (
       !config?.chatId ||
       !Array.isArray(config.allowedSenderIds) ||
@@ -120,6 +124,7 @@ export class FeishuLoopRelay {
     this.syncRules = syncRules;
     this.answerCard = answerCard;
     this.cards = cards;
+    this.canCoordinate = canCoordinate ?? (() => false);
     this.stopping = false;
     this.editedCommandsIgnored = 0;
   }
@@ -132,6 +137,71 @@ export class FeishuLoopRelay {
     }
     this.batch?.set(event.message_id, { event });
     return true;
+  }
+  async acceptGoal(item, goal) {
+    const { projectKey, name, objective } = goal;
+    const before = this.controls.get(projectKey);
+    const prior = this.controls.read().requests?.[item.requestId]?.result;
+    const reply = (text) => ({ ok: false, action: "natural-goal", changed: false, text });
+    if (prior && (prior.projectKey !== projectKey || prior.revision !== before.revision))
+      return reply("这条消息已处理，项目保留你后来设置的状态。");
+    if (before.mode === "paused") return reply("这个项目已暂停。要继续时，请在项目卡里确认恢复或设置新目标。");
+    if (before.mode === "active" && !prior)
+      return reply("这个项目已有目标在推进。可在项目卡查看进展或暂停，再设置新目标。");
+    if (!this.canCoordinate(projectKey)) return reply("这个项目的协调入口还未就绪，这次没有启动。");
+    if (!this.cards?.enabled?.() || !this.syncRules) return reply("群里的决策按钮还未就绪，这次没有启动。");
+    const authorized = () =>
+      directGoalRequest(item.event, readRouting(this.config.naturalRoutingFile), commandText(item.event))
+        ?.projectKey === projectKey;
+    const result = await handleLoopCommand(
+      { action: "enable", target: projectKey, objective, maxSteps: 3, expectedRevision: before.revision },
+      {
+        catalog: {
+          refresh: async () => {
+            const provider = projectKey.split(":", 1)[0];
+            const directory = this.catalog.readProvider
+              ? await this.catalog.readProvider(provider)
+              : await this.catalog.refresh();
+            // Cached identities can reject ambiguity, but only the selected provider can authorize a start.
+            const cachedConflict = Array.from(this.catalog.projects?.values() ?? []).some(
+              (p) => p.provider !== provider && p.name === name && p.key !== projectKey,
+            );
+            const storedConflict = this.controls
+              .list()
+              .some(
+                (c) =>
+                  !c.projectKey.startsWith(provider + ":") && c.projectName === name && c.projectKey !== projectKey,
+              );
+            const matches = directory.projects.filter((p) => p.name === name);
+            if (
+              directory.complete !== true ||
+              cachedConflict ||
+              storedConflict ||
+              matches.length !== 1 ||
+              matches[0].key !== projectKey ||
+              matches[0].capabilities?.startOwned !== true ||
+              matches[0].capabilities?.continuationMode !== "managed-read-only"
+            )
+              throw failure("DIRECT_GOAL_SCOPE_CHANGED");
+            return directory;
+          },
+        },
+        controls: this.controls,
+        actor: item.event.sender_id,
+        requestId: item.requestId,
+        readiness: async (...args) => {
+          const ready = await this.readiness(...args);
+          if (!authorized() || !this.cards.enabled() || !this.canCoordinate(projectKey)) return { ready: false };
+          return ready;
+        },
+        syncRules: this.syncRules,
+      },
+    );
+    if (result.code === "DIRECT_GOAL_SCOPE_CHANGED")
+      return reply("项目归属或目录还没核实，这次没有启动。请查看项目卡。");
+    if (result.ok && result.syncStatus === "confirmed")
+      result.text = `收到，我先看「${name}」的进展，再按目标往下做。需要你决定时，我会在这里给选项和建议。`;
+    return result;
   }
   async tick({ sendReplies = true } = {}) {
     this.batch = new Map();
@@ -163,6 +233,14 @@ export class FeishuLoopRelay {
             code: error.code ?? "LOOP_COMMAND_USAGE",
             text: error.userMessage ?? "项目指令格式不正确，请使用 /loop 项目 查看说明。",
           };
+        }
+        if (!result && !command && this.config.naturalRoutingFile) {
+          const goal = directGoalRequest(
+            item.event,
+            readRouting(this.config.naturalRoutingFile),
+            commandText(item.event),
+          );
+          if (goal) result = await this.acceptGoal(item, goal);
         }
         if (!result && !command && this.cards) result = await this.cards.natural(item, commandText(item.event));
         if (!result)
@@ -267,6 +345,10 @@ async function main() {
     cards,
     ...(runtime
       ? {
+          canCoordinate: (key) =>
+            Array.isArray(native.managedCodex?.coordinatorProjectKeys) &&
+            native.managedCodex.coordinatorProjectKeys.includes(key) &&
+            !!runtime.layout().decisionChannel(config.profile, config.chatId),
           readiness: (project) => runtime.readiness(project),
           syncRules: (args) => runtime.sync(args),
           answerCard: (args) => runtime.answerCard(args),

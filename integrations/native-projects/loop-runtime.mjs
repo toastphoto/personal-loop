@@ -165,9 +165,18 @@ export class NativeLoopRuntime {
     const subject = subjectFor(projectKey),
       ruleName = `native-project:${subject}`,
       agentId = `native-managed-${subject}`;
-    const eventType = `native.project.${subject.slice(0, 32)}.changed`;
+    const prefix = `native.project.${subject.slice(0, 32)}`;
+    const eventType = `${prefix}.changed`;
+    const keys = this.config.managedCodex?.coordinatorProjectKeys;
+    if (keys !== undefined && (!Array.isArray(keys) || keys.some((key) => typeof key !== "string" || !key)))
+      throw failure("LOOP_COORDINATOR_CONFIG_INVALID");
+    const handoff = keys?.includes(projectKey) ? `${prefix}.handoff` : null;
+    const generation =
+      handoff && Number.isSafeInteger(control.goalRevision) && control.goalRevision > 0
+        ? `原生项目 ${subject.slice(0, 10)} · 目标 ${control.goalRevision} · 控制 `
+        : null;
     const agent = {
-      name: `原生项目 ${subject.slice(0, 10)} · 控制 ${control.revision}`,
+      name: (generation ?? `原生项目 ${subject.slice(0, 10)} · 控制 `) + control.revision,
       worker: layout.workerName,
       use: "native-managed",
       access: "read",
@@ -175,7 +184,8 @@ export class NativeLoopRuntime {
     };
     const rule = {
       name: ruleName,
-      when: { source: layout.sourceName, types: [eventType] },
+      when: { source: layout.sourceName, types: handoff ? [eventType, handoff] : [eventType] },
+      ...(handoff ? { emits: { source: layout.sourceName, types: [handoff] } } : {}),
       to: agentId,
       cwd: layout.controlCwd,
       group: ruleName,
@@ -192,7 +202,7 @@ export class NativeLoopRuntime {
         "首版只读，不修改原项目。每次继续前核对最新控制状态；项目暂停后不再推进，按原回执约定结束。",
       ].join("\n"),
     };
-    return { subject, ruleName, agentId, eventType, agent, rule };
+    return { subject, ruleName, agentId, eventType, agent, rule, generation };
   }
   candidate(raw, target, projectKey, active, layout) {
     const existingAgent = raw.agents[target.agentId];
@@ -202,7 +212,9 @@ export class NativeLoopRuntime {
     if (priorRule && priorRule.to !== target.agentId) throw failure("LOOP_RULE_OWNERSHIP_CONFLICT");
     raw.rules = raw.rules.filter((r) => r.name !== target.ruleName);
     if (active) {
-      if (raw.rules.some((r) => r.when.source === layout.sourceName && typeMatches(r.when.types, target.eventType)))
+      const overlaps = (filter) =>
+        filter?.source === layout.sourceName && target.rule.when.types.some((type) => typeMatches(filter.types, type));
+      if (raw.rules.some((r) => overlaps(r.when) || (target.rule.emits && overlaps(r.emits))))
         throw failure("LOOP_EVENT_SCOPE_CONFLICT");
       raw.agents[target.agentId] = target.agent;
       raw.rules.push(target.rule);
@@ -222,7 +234,7 @@ export class NativeLoopRuntime {
           : line?.agent === target.agentId &&
             line.group === target.ruleName &&
             line.source === layout.sourceName &&
-            JSON.stringify(line.types) === JSON.stringify([target.eventType]) &&
+            JSON.stringify(line.types) === JSON.stringify(target.rule.when.types) &&
             agent?.name === target.agent.name &&
             agent.use === "native-managed" &&
             agent.worker === layout.workerName;
@@ -409,11 +421,22 @@ export class NativeLoopRuntime {
         (!pause && control.deadline && Date.parse(control.deadline) <= Date.now())
       )
         return deny("LOOP_CARD_GOAL_INACTIVE");
-      const target = this.desired(key, { revision: control.revision - (ownPause ? 1 : 0) }, layout);
+      const revision = control.revision - (ownPause ? 1 : 0);
+      const target = this.desired(key, { ...control, revision }, layout);
+      // A resumed goal keeps its pending question. A new goal, even with identical text, has another generation.
+      const originalRevision =
+        target.generation && typeof author.name === "string" && author.name.startsWith(target.generation)
+          ? Number(author.name.slice(target.generation.length))
+          : NaN;
+      const sameGeneration =
+        Number.isSafeInteger(originalRevision) &&
+        originalRevision >= control.goalRevision &&
+        originalRevision <= revision &&
+        author.name === target.generation + originalRevision;
       if (
         card.agent !== target.agentId ||
         card.rule !== target.ruleName ||
-        author.name !== target.agent.name ||
+        (author.name !== target.agent.name && !sameGeneration) ||
         !frozen.rules.some((r) => r.name === card.rule && r.to === card.agent)
       )
         return deny("LOOP_CARD_GOAL_CHANGED");

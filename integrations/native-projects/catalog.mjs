@@ -17,42 +17,43 @@ export class ProjectCatalog {
     this.host = host;
     this.projects = new Map();
   }
+  async readProvider(provider) {
+    try {
+      const backend = this.connectors[provider];
+      if (!backend || !Object.hasOwn(this.connectors, provider)) throw failure("UNKNOWN_PROVIDER");
+      const result = await backend.listProjects();
+      if (!Array.isArray(result?.projects)) throw failure("INVALID_PROVIDER_RESPONSE");
+      const found = new Set();
+      const projects = result.projects.map((p) => {
+        if (!string(p.nativeId) || !string(p.name)) throw failure("INVALID_PROJECT_IDENTITY");
+        const host = p.host ?? this.host;
+        const key = projectKey(provider, host, p.nativeId);
+        if (found.has(key)) throw failure("DUPLICATE_PROJECT_IDENTITY");
+        found.add(key);
+        return {
+          key,
+          provider,
+          host,
+          nativeId: p.nativeId,
+          name: p.name,
+          roots: Array.isArray(p.roots) ? p.roots.filter(string) : [],
+          capabilities: p.capabilities ?? { read: true, continue: false, cancel: false },
+          ...(p.nativeState !== undefined ? { nativeState: p.nativeState } : {}),
+        };
+      });
+      return {
+        provider,
+        status: "connected",
+        complete: result.complete === true,
+        observedAt: result.observedAt ?? new Date().toISOString(),
+        projects,
+      };
+    } catch (error) {
+      return { provider, status: "unavailable", complete: false, errorCode: safeError(error), projects: [] };
+    }
+  }
   async refresh() {
-    const entries = await Promise.all(
-      Object.entries(this.connectors).map(async ([provider, backend]) => {
-        try {
-          const result = await backend.listProjects();
-          if (!Array.isArray(result?.projects)) throw failure("INVALID_PROVIDER_RESPONSE");
-          const found = new Set();
-          const projects = result.projects.map((p) => {
-            if (!string(p.nativeId) || !string(p.name)) throw failure("INVALID_PROJECT_IDENTITY");
-            const host = p.host ?? this.host;
-            const key = projectKey(provider, host, p.nativeId);
-            if (found.has(key)) throw failure("DUPLICATE_PROJECT_IDENTITY");
-            found.add(key);
-            return {
-              key,
-              provider,
-              host,
-              nativeId: p.nativeId,
-              name: p.name,
-              roots: Array.isArray(p.roots) ? p.roots.filter(string) : [],
-              capabilities: p.capabilities ?? { read: true, continue: false, cancel: false },
-              ...(p.nativeState !== undefined ? { nativeState: p.nativeState } : {}),
-            };
-          });
-          return {
-            provider,
-            status: "connected",
-            complete: result.complete === true,
-            observedAt: result.observedAt ?? new Date().toISOString(),
-            projects,
-          };
-        } catch (error) {
-          return { provider, status: "unavailable", complete: false, errorCode: safeError(error), projects: [] };
-        }
-      }),
-    );
+    const entries = await Promise.all(Object.keys(this.connectors).map((provider) => this.readProvider(provider)));
     this.projects.clear();
     for (const entry of entries) for (const project of entry.projects) this.projects.set(project.key, project);
     return {

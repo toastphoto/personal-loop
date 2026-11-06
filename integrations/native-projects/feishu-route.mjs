@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
+import { directGoalRequest } from "./feishu-direct-goal.mjs";
 export function commandText(event) {
   if (typeof event?.content !== "string") return "";
   let value = event.content.trim();
@@ -33,6 +34,7 @@ export function routeProjectMessage(event, routing = {}) {
   )
     return "legacy";
   if (!event.mentions?.some((m) => typeof m?.id === "string" && routing.botMentionIds?.includes(m.id))) return "legacy";
+  if (directGoalRequest(event, routing, text)) return "loop";
   const terms = [
     "项目",
     "目标",
