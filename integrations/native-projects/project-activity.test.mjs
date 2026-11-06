@@ -372,3 +372,16 @@ test("private history labels never cross project or work scope, or cause extra c
     assert.equal((await f.service.read(key, { workId: "t1", force: true })).selected.resultSummary, undefined);
   }
 });
+test("the project's bound chat is the default even when a different conversation is newer; a missing binding never falls back", async () => {
+  const f = fixture({
+    items: [work("recent", { updatedAt: iso(15) }), work("primary", { membership: "cwd-unassigned" })],
+    options: { boundChats: { [key]: { threadId: "primary" } } },
+  });
+  const primary = await f.service.read(key);
+  assert.equal(primary.selected.nativeId, "primary");
+  assert.equal(primary.selection, "bound-chat");
+  assert.equal((await f.service.read(key, { workId: "recent" })).selected.nativeId, "recent");
+  const missing = fixture({ items: [work("other")], options: { boundChats: { [key]: { threadId: "absent" } } } });
+  await assert.rejects(missing.service.read(key), { code: "PROJECT_ACTIVITY_SCOPE_MISMATCH" });
+  assert.ok(!missing.calls.some((c) => c[0] === "reply"));
+});

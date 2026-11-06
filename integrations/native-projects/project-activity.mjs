@@ -72,7 +72,7 @@ function identity(key) {
   return { provider: parts[0], host: parts[1], nativeId: parts[2] };
 }
 
-function redact(value) {
+export function redact(value) {
   return value
     .replace(
       /-----BEGIN (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----[\s\S]*?(?:-----END (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----|$)/g,
@@ -150,7 +150,10 @@ function replyView(reply) {
 }
 
 export class ProjectActivity {
-  constructor(catalog, { cacheMs = 30000, timeoutMs = 8000, now = Date.now, historyLabels = [] } = {}) {
+  constructor(
+    catalog,
+    { cacheMs = 30000, timeoutMs = 8000, now = Date.now, historyLabels = [], boundChats = {} } = {},
+  ) {
     if (
       !object(catalog?.connectors) ||
       !Number.isFinite(cacheMs) ||
@@ -161,6 +164,7 @@ export class ProjectActivity {
     )
       throw fail("PROJECT_ACTIVITY_INVALID_CONFIG");
     if (!Array.isArray(historyLabels)) throw fail("PROJECT_ACTIVITY_INVALID_CONFIG");
+    this.boundChats = boundChats;
     this.historyLabels = new Map();
     for (const entry of historyLabels) {
       if (!object(entry) || !validId(entry.workId) || !validId(entry.title) || entry.title.length > 100)
@@ -208,9 +212,11 @@ export class ProjectActivity {
 
   async read(projectKey, { workId, force = false } = {}) {
     const target = identity(projectKey);
+    const main = workId === undefined && Object.hasOwn(this.boundChats, projectKey);
+    if (main) workId = this.boundChats[projectKey]?.threadId ?? "";
     if (workId !== undefined && !validId(workId)) throw fail("PROJECT_ACTIVITY_INVALID_WORK");
     if (typeof force !== "boolean") throw fail("PROJECT_ACTIVITY_INVALID_WORK");
-    const cacheKey = JSON.stringify([projectKey, workId ?? null]);
+    const cacheKey = JSON.stringify([projectKey, workId ?? null, main]);
     const backend = Object.hasOwn(this.catalog.connectors, target.provider)
       ? this.catalog.connectors[target.provider]
       : null;
@@ -231,7 +237,7 @@ export class ProjectActivity {
     let job = this.inflight.get(cacheKey);
     if (!job) {
       job = {};
-      job.promise = this.fetch(projectKey, target, backend, workId);
+      job.promise = this.fetch(projectKey, target, backend, workId, main);
       this.inflight.set(cacheKey, job);
       job.promise
         .then(
@@ -271,7 +277,7 @@ export class ProjectActivity {
     }
   }
 
-  async fetch(projectKey, target, backend, workId) {
+  async fetch(projectKey, target, backend, workId, main) {
     const directory = await backend.listProjects();
     if (!Array.isArray(directory?.projects)) throw fail("PROJECT_ACTIVITY_INVALID_RESPONSE");
     const projects = directory.projects.filter(
@@ -367,7 +373,8 @@ export class ProjectActivity {
     const comparison = rows.filter((row) => row.membership === selected.membership);
     const allTimesKnown = comparison.every((row) => row.updatedAt !== null);
     let selection = "order-only";
-    if (workId !== undefined) notes.push("按你选定的会话或Issue展示。");
+    if (main) selection = "bound-chat";
+    else if (workId !== undefined) notes.push("按你选定的会话或Issue展示。");
     else if (active(selected)) selection = "trusted-active";
     else if (
       selected.updatedAt &&

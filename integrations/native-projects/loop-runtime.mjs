@@ -4,6 +4,7 @@ import { readFileSync, writeFileSync, renameSync, unlinkSync, lstatSync, existsS
 import path from "node:path";
 import { hubClient as connectHub } from "../../protocol/client.ts";
 import { digest } from "../../kernel/credentials.ts";
+import { verifyBoundChat } from "./bound-chat.mjs";
 import { parseRules } from "../../protocol/rules.ts";
 import { typeMatches } from "../../kernel/rules.ts";
 import { subjectFor } from "./controls.mjs";
@@ -111,6 +112,13 @@ export class NativeLoopRuntime {
         !path.isAbsolute(managed.stateDir ?? "")
       )
         throw failure("LOOP_NATIVE_ROOT_UNCONFIRMED");
+      if (Object.hasOwn(managed.boundChats ?? {}, project.key)) {
+        if (
+          !managed.coordinatorProjectKeys?.includes(project.key) ||
+          (await verifyBoundChat({ config: this.config, projectKey: project.key })).status !== "verified"
+        )
+          throw failure("BOUND_CHAT_UNAVAILABLE");
+      }
       const layout = this.layout();
       if (inside(layout.controlCwd, root) || inside(managed.stateDir, root))
         throw failure("LOOP_PRIVATE_SCOPE_INVALID");

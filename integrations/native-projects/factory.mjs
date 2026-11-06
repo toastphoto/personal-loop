@@ -30,13 +30,15 @@ export function createCatalog(config) {
           projects: result.projects.map((p) => {
             const key = projectKey(name, p.host ?? "local", p.nativeId),
               root = config.managedCodex.projectRoots?.[key];
+            const bound = Object.hasOwn(config.managedCodex.boundChats ?? {}, key);
             const available = typeof root === "string" && path.isAbsolute(root) && p.roots.includes(root);
             return {
               ...p,
               capabilities: {
                 ...p.capabilities,
-                startOwned: available,
-                continuationMode: available ? "managed-read-only" : undefined,
+                startOwned: available && !bound,
+                ...(bound && { queueBound: available }),
+                continuationMode: available ? (bound ? "bound-chat" : "managed-read-only") : undefined,
               },
             };
           }),

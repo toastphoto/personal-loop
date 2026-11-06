@@ -38,3 +38,5 @@
 - Test project controls and decision buttons separately. Confirm the question uses a button on its delivered message, the authorized click creates one answer event, and that event wakes the intended native goal.
 
 - Phone project cards should lead with the outcome and the next decision. Distinguish past goals and conversation history from active work. Check what is visible with every optional panel closed.
+
+- A project is not a conversation. Bind the owner-selected conversation, including legacy chats verified by exact root, separately from the native project. An accepted queue entry establishes delivery intent; report execution only after matching it to the original thread and turn.

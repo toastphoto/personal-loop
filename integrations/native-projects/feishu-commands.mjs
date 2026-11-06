@@ -118,6 +118,7 @@ function findProject(target, projects) {
 }
 
 function executionLabel(project) {
+  if (project.capabilities?.queueBound === true) return "交回已绑定的原对话";
   if (project.capabilities?.startOwned === true) {
     return project.capabilities.continuationMode === "managed-read-only"
       ? "受管只读（不接管原聊天）"
@@ -135,13 +136,15 @@ function projectDisplayView(project, control, { available, providerStatus } = {}
   const execution =
     available === false || project.stored === true || providerStatus === "unavailable"
       ? "unavailable"
-      : caps.startOwned === true && caps.continuationMode === "managed-read-only"
-        ? "managed-read-only"
-        : caps.continue === true || caps.startOwned === true
-          ? "native"
-          : caps.read === true
-            ? "read-only"
-            : "unavailable";
+      : caps.queueBound === true
+        ? "bound-chat"
+        : caps.startOwned === true && caps.continuationMode === "managed-read-only"
+          ? "managed-read-only"
+          : caps.continue === true || caps.startOwned === true
+            ? "native"
+            : caps.read === true
+              ? "read-only"
+              : "unavailable";
   const objective = viewText(control?.objective, 500);
   return {
     alias: projectAlias(project),
@@ -368,7 +371,11 @@ export async function handleLoopCommand(
         return failed(action, "LOOP_ALREADY_ACTIVE");
     }
     if (action !== "pause") {
-      if (project.capabilities?.continue !== true && project.capabilities?.startOwned !== true)
+      if (
+        project.capabilities?.continue !== true &&
+        project.capabilities?.startOwned !== true &&
+        project.capabilities?.queueBound !== true
+      )
         return failed(action, "PROJECT_CONTROL_NOT_READY");
       if (action === "resume" && (!before.objective || !Number.isSafeInteger(before.maxSteps)))
         return failed(action, "OBJECTIVE_REQUIRED");

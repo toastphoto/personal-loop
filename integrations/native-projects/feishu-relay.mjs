@@ -179,8 +179,12 @@ export class FeishuLoopRelay {
               storedConflict ||
               matches.length !== 1 ||
               matches[0].key !== projectKey ||
-              matches[0].capabilities?.startOwned !== true ||
-              matches[0].capabilities?.continuationMode !== "managed-read-only"
+              !(
+                (matches[0].capabilities?.startOwned === true &&
+                  matches[0].capabilities?.continuationMode === "managed-read-only") ||
+                (matches[0].capabilities?.queueBound === true &&
+                  matches[0].capabilities?.continuationMode === "bound-chat")
+              )
             )
               throw failure("DIRECT_GOAL_SCOPE_CHANGED");
             return directory;
@@ -319,7 +323,9 @@ async function main() {
         controls,
         runtime,
         activity:
-          config.projectActivity?.enabled === true ? new ProjectActivity(catalog, config.projectActivity) : undefined,
+          config.projectActivity?.enabled === true
+            ? new ProjectActivity(catalog, { ...config.projectActivity, boundChats: native.managedCodex?.boundChats })
+            : undefined,
         transportReady: () => subscriber.status().ready,
       });
       callbackRelay = new FeishuCardRelay(c, {

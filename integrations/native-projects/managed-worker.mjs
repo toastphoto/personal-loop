@@ -7,6 +7,7 @@ import { LoopControls, subjectFor } from "./controls.mjs";
 import { createCatalog, readConfig } from "./factory.mjs";
 import { failure, safeError } from "./catalog.mjs";
 import { ManagedCodexExecutor } from "./managed-codex.mjs";
+import { runBoundStage } from "./bound-coordination.mjs";
 import { readMessage, resultFrom, repairPrompt } from "../../worker/contract.ts";
 
 import {
@@ -83,7 +84,7 @@ function openLedger(file) {
   if (existsSync(file) && lstatSync(file).isSymbolicLink()) throw failure("MANAGED_CONFIG_ERROR");
   const db = new DatabaseSync(file);
   db.exec(
-    "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA busy_timeout=5000; CREATE TABLE IF NOT EXISTS requests(run_id TEXT PRIMARY KEY, goal_id TEXT NOT NULL, request_id TEXT NOT NULL, state TEXT NOT NULL, result TEXT); CREATE TABLE IF NOT EXISTS receipt_blocks(run_id TEXT PRIMARY KEY, goal_id TEXT NOT NULL);",
+    "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA busy_timeout=5000; CREATE TABLE IF NOT EXISTS requests(run_id TEXT PRIMARY KEY, goal_id TEXT NOT NULL, request_id TEXT NOT NULL, state TEXT NOT NULL, result TEXT); CREATE TABLE IF NOT EXISTS receipt_blocks(run_id TEXT PRIMARY KEY, goal_id TEXT NOT NULL); CREATE TABLE IF NOT EXISTS bound_routes(goal_id TEXT PRIMARY KEY,binding TEXT NOT NULL);",
   );
   for (const suffix of ["", "-wal", "-shm"]) if (existsSync(file + suffix)) chmodSync(file + suffix, 0o600);
   return db;
@@ -91,7 +92,7 @@ function openLedger(file) {
 
 // The upstream hub schedules. This wrapper guards one attempt; only a confirmed failure permits the next one.
 export async function runManagedWorker(
-  { config, projectKey, prompt, runId, attempt = 1, contextFile },
+  { config, configFile, projectKey, prompt, runId, attempt = 1, contextFile },
   dependencies = {},
 ) {
   const emit = dependencies.emit ?? emitLine;
@@ -167,6 +168,22 @@ export async function runManagedWorker(
         Boolean(goal.goalStartEvent) &&
         Array.isArray(options.coordinatorProjectKeys) &&
         options.coordinatorProjectKeys.includes(projectKey);
+      const bindings = options.boundChats;
+      if (bindings !== undefined && (!bindings || typeof bindings !== "object" || Array.isArray(bindings)))
+        throw failure("BOUND_ROUTE_INVALID");
+      const bound = bindings && Object.hasOwn(bindings, projectKey);
+      const binding = bound ? bindings[projectKey] : null;
+      if (
+        bound &&
+        (!coordinated ||
+          !binding ||
+          typeof binding.threadId !== "string" ||
+          !binding.threadId.trim() ||
+          binding.projectId !== project.nativeId ||
+          binding.root !== cwd)
+      )
+        throw failure("BOUND_ROUTE_INVALID");
+      const route = binding ? JSON.stringify([binding.threadId, binding.projectId, binding.root]) : null;
       const subject = subjectFor(projectKey);
       goalId = hash([projectKey, project.nativeId, cwd, goal.objective, ...(coordinated ? [goal.goalRevision] : [])]);
       directory = path.join(stateRoot, hash(projectKey));
@@ -196,7 +213,15 @@ export async function runManagedWorker(
             throw failure("MANAGED_PREVIOUS_UNCONFIRMED");
           if (ledger.prepare("SELECT 1 FROM receipt_blocks WHERE goal_id=? LIMIT 1").get(goalId))
             throw failure("MANAGED_RECEIPT_UNCONFIRMED");
-          const used = ledger.prepare("SELECT COUNT(*) AS n FROM requests WHERE goal_id=?").get(goalId).n;
+          const totals = ledger
+            .prepare(
+              "SELECT COUNT(*) AS rows, COUNT(CASE WHEN COALESCE(json_extract(result,'$.coordinator.role'),'')<>'bound-observe' THEN 1 END) AS used FROM requests WHERE goal_id=?",
+            )
+            .get(goalId);
+          const used = totals.used;
+          const pinned = ledger.prepare("SELECT binding FROM bound_routes WHERE goal_id=?").get(goalId)?.binding;
+          if (pinned !== undefined ? pinned !== route : bound && totals.rows > 0) throw failure("BOUND_ROUTE_CHANGED");
+          if (bound && pinned === undefined) ledger.prepare("INSERT INTO bound_routes VALUES(?,?)").run(goalId, route);
           if (coordinated) {
             const history = ledger
               .prepare(
@@ -209,7 +234,7 @@ export async function runManagedWorker(
             remaining = goal.maxSteps - used - 1;
             if (stage.role === "router" && remaining < 1) throw failure("COORDINATOR_BUDGET");
           }
-          if (used >= goal.maxSteps) throw failure("MANAGED_STEP_BUDGET");
+          if (stage?.role !== "bound-observe" && used >= goal.maxSteps) throw failure("MANAGED_STEP_BUDGET");
           ledger
             .prepare("INSERT INTO requests VALUES(?,?,?,?,NULL)")
             .run(executionKey, goalId, "native-run:" + executionKey, "intent");
@@ -238,6 +263,66 @@ export async function runManagedWorker(
             delete result.usage;
             delete result.cumulativeUsage;
           }
+        }
+      } else if (bound) {
+        const goalDir = path.join(directory, goalId);
+        privateDir(goalDir);
+        const guard = () => {
+          if (stopSignal?.aborted) throw failure("MANAGED_STOP_REQUESTED");
+          const liveOptions = configFile ? readConfig(configFile).managedCodex : config.managedCodex;
+          const current = liveOptions?.boundChats?.[projectKey];
+          if (
+            liveOptions?.enabled !== true ||
+            !liveOptions.coordinatorProjectKeys?.includes(projectKey) ||
+            current?.threadId !== binding.threadId ||
+            current.root !== cwd ||
+            current.projectId !== project.nativeId ||
+            liveOptions.stateDir !== options.stateDir ||
+            liveOptions.projectRoots?.[projectKey] !== configuredRoot ||
+            (configFile && liveOptions.command !== options.command)
+          )
+            throw failure("BOUND_ROUTE_CHANGED");
+          return controls.assertActive(projectKey, goal.revision);
+        };
+        result = await runBoundStage(
+          {
+            config,
+            projectKey,
+            projectId: project.nativeId,
+            cwd,
+            binding,
+            catalog,
+            stage,
+            goal,
+            goalId,
+            runId,
+            executionKey,
+            subject,
+            remaining,
+            file: path.join(goalDir, "progress-" + hash(executionKey) + ".json"),
+            guard,
+            signal: stopSignal,
+          },
+          dependencies,
+        );
+        // Retain the actual planner usage or the queued intent, but never schedule from a stale goal.
+        try {
+          guard();
+        } catch {
+          result = {
+            ...result,
+            text: "没事可做：控制状态已改变，本轮资料已保留。",
+            coordinator:
+              result.coordinator.action === "await-bound"
+                ? result.coordinator
+                : { ...result.coordinator, action: "superseded" },
+          };
+        }
+        if (result.state === "receipt-unconfirmed")
+          ledger.prepare("INSERT OR IGNORE INTO receipt_blocks VALUES(?,?)").run(executionKey, goalId);
+        if (receiptProblem(result.text)) {
+          result = receiptAttention(result, "BOUND_RECEIPT_INVALID");
+          ledger.prepare("INSERT OR IGNORE INTO receipt_blocks VALUES(?,?)").run(executionKey, goalId);
         }
       } else {
         const goalDir = path.join(directory, goalId);
@@ -404,8 +489,9 @@ export async function runManagedWorker(
     }
   } catch (error) {
     const code = safeError(error);
-    const message =
-      code === "MANAGED_REPLAY_GOAL_MISMATCH"
+    const message = code.startsWith("BOUND_")
+      ? "主对话绑定或交接状态无法核实，请检查指定的原对话。本轮未另开聊天。"
+      : code === "MANAGED_REPLAY_GOAL_MISMATCH"
         ? "目标或项目目录已改变，原执行记录不属于当前目标；请先核实，本轮不会返回旧结果或重新执行"
         : code === "MANAGED_RETRY_NOT_CONFIRMED"
           ? "上一次尝试不是同一目标下已确认的临时失败，已保留记录，不会自动重做"
@@ -499,6 +585,7 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
     await runManagedWorker(
       {
         config: readConfig(configPath),
+        configFile: configPath,
         projectKey,
         prompt,
         runId: process.env.AGENT_AUTOLOOP_RUN,

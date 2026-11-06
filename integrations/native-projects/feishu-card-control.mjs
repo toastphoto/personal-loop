@@ -235,7 +235,7 @@ export class ProjectCardController {
     p.objective = current.objective ?? "";
     p.maxSteps = current.maxSteps;
     p.draft = this.store.draft(actor, chat, alias);
-    const supported = !!key && ["managed-read-only", "native"].includes(p.execution);
+    const supported = !!key && ["bound-chat", "managed-read-only", "native"].includes(p.execution);
     p.canSetGoal = !!key;
     p.canPause = current.mode === "active";
     p.canStart = supported && current.mode !== "active" && validGoal(p.draft);
@@ -267,7 +267,10 @@ export class ProjectCardController {
     p.canSetGoal = !!native;
     p.canPause = current.mode === "active";
     let ready = false;
-    if (native && (native.capabilities?.startOwned || native.capabilities?.continue)) {
+    if (
+      native &&
+      (native.capabilities?.queueBound || native.capabilities?.startOwned || native.capabilities?.continue)
+    ) {
       try {
         const check = await this.runtime?.readiness(native);
         ready = check?.ready === true && check.rulesReady === true;

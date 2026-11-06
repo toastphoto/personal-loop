@@ -1,6 +1,7 @@
 const PROVIDERS = { codex: "Codex", multica: "Multica", dsh: "DeepSeek" };
 const MODES = { manual: "仅查看", active: "已启用", paused: "已暂停" };
 const EXECUTION = {
+  "bound-chat": "后续事项排到已绑定的原对话，按那条对话的权限处理",
   "managed-read-only": "可执行独立只读任务 不接管原聊天",
   native: "已连接原生控制 仍需明确目标后启用",
   "read-only": "可查看项目 自动推进尚未接通",
@@ -143,9 +144,15 @@ function activityView(value) {
       : "unavailable",
     observedAt: activityTime(value.observedAt),
     complete: value.complete === true,
-    selection: ["latest-updated", "trusted-active", "order-only", "explicit", "selected", "only-work"].includes(
-      value.selection,
-    )
+    selection: [
+      "bound-chat",
+      "latest-updated",
+      "trusted-active",
+      "order-only",
+      "explicit",
+      "selected",
+      "only-work",
+    ].includes(value.selection)
       ? value.selection
       : null,
     works,
@@ -238,7 +245,7 @@ function commandHelp(project) {
         `查看状态\n\`/loop 状态 ${project.alias}\``,
         ...(project.mode === "active" ? [`暂停后续推进\n\`/loop 暂停 ${project.alias}\``] : []),
         ...(project.mode === "paused" ? [`恢复原目标\n\`/loop 继续 ${project.alias}\``] : []),
-        ...(["managed-read-only", "native"].includes(project.execution) && project.mode !== "active"
+        ...(["bound-chat", "managed-read-only", "native"].includes(project.execution) && project.mode !== "active"
           ? [`启用新目标\n\`/loop 启用 ${project.alias} | 明确目标\``]
           : []),
         "暂停后续推进不会取消已开始的当前任务",
@@ -534,6 +541,7 @@ function activitySection(p, context) {
         md(concise ? escape(concise, 118) : reply ? "回复里是明细，可展开查看。" : "这条记录尚未读到回复。"),
       );
       info.push(md(`**${escape(name, 42)}**`), muted(`记录中的执行状态：${ACTIVITY_STATES[selected.state]}`));
+      if (a.selection === "bound-chat") elements.unshift(muted("主对话 · " + escape(name, 42)));
       if (a.selection === "latest-updated") info.push(muted("按更新时间选择的记录"));
       if (a.selection === "trusted-active") info.push(muted("优先显示已核实正在执行的记录"));
       if (selected.membership === "cwd-unassigned") info.push(muted("目录关联会话 原生项目归属尚未设置"));
@@ -604,7 +612,9 @@ function detail(v, navigation, context) {
   if (p.mode === "manual" && !p.draft?.objective) {
     brief.push(
       muted(
-        ["managed-read-only", "native"].includes(p.execution) ? "设置目标后，由你确认启动" : "目前可以查看项目进展",
+        ["bound-chat", "managed-read-only", "native"].includes(p.execution)
+          ? "设置目标后，由你确认启动"
+          : "目前可以查看项目进展",
       ),
     );
   }
