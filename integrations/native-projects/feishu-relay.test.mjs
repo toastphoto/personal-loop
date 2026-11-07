@@ -465,7 +465,7 @@ test("a named owner goal starts once, preserving pauses, opt-in scope and newer 
   assert.equal(dispatch, 1);
   assert.equal(reads, 1);
   assert.equal(controls.get(p.key).objective, goal);
-  assert.equal(controls.get(p.key).maxSteps, 3);
+  assert.equal(controls.get(p.key).maxSteps, null);
   send("om_echo");
   await relay.tick();
   assert.equal(dispatch, 1);

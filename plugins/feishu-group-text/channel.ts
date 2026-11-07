@@ -7,6 +7,14 @@ import type { Card, ChannelContext } from "../../host/channels.ts";
 
 const problem = (code: string) => Object.assign(new Error(code), { code });
 const messageId = (value: unknown): value is string => typeof value === "string" && /^om_[A-Za-z0-9_-]+$/.test(value);
+const personId = (value: unknown): value is string =>
+  typeof value === "string" && /^ou_[A-Za-z0-9_-]{1,160}$/.test(value);
+
+function ownerMention(card: Card, owner?: string): Record<string, unknown>[] {
+  if (owner === undefined) return [];
+  if (!personId(owner)) throw problem("FEISHU_OWNER_MENTION_CONFIG_INVALID");
+  return card.ref === null && card.state === "open" ? [{ tag: "markdown", content: `<at id=${owner}></at>` }] : [];
+}
 
 function clean(card: Card, value: string | null) {
   let text = value ?? "";
@@ -66,7 +74,7 @@ export function renderText(card: Card): string {
   return lines.filter(Boolean).join("\n");
 }
 
-export function renderDecisionCard(card: Card) {
+export function renderDecisionCard(card: Card, owner?: string) {
   if (
     card.kind !== "ask" ||
     !Number.isSafeInteger(card.id) ||
@@ -77,7 +85,7 @@ export function renderDecisionCard(card: Card) {
     throw problem("INVALID_DECISION_CARD");
   const plain = (content: string) => ({ tag: "plain_text", content });
   const block = (content: string) => ({ tag: "div", text: plain(content) });
-  const elements: Record<string, unknown>[] = [block(clean(card, card.title))];
+  const elements: Record<string, unknown>[] = [...ownerMention(card, owner), block(clean(card, card.title))];
   elements.push(...messageLines(card).map(block));
   if (card.state === "open") {
     if (card.options.length < 2 || card.options.length > 5) throw problem("CARD_OPTIONS_REQUIRED");
@@ -107,7 +115,7 @@ export function renderDecisionCard(card: Card) {
 }
 
 // Keep the submitted result intact, and lift only a short source sentence into the phone preview.
-export function renderResultCard(card: Card) {
+export function renderResultCard(card: Card, owner?: string) {
   if (
     card.kind !== "notice" ||
     !Number.isSafeInteger(card.id) ||
@@ -128,7 +136,7 @@ export function renderResultCard(card: Card) {
   ]
     .filter(Boolean)
     .join("\n");
-  const elements: Record<string, unknown>[] = [];
+  const elements: Record<string, unknown>[] = ownerMention(card, owner);
   const lines = body.trim().split(/\r?\n/);
   const technical =
     /[|｜`]|https?:\/\/|(?:^|[\s(])(?:~\/|\/|\.\/)|\b[\w.-]+\.(?:md|json|yaml|yml|ts|py|log)\b|[a-f\d]{32,}/iu;
@@ -183,6 +191,19 @@ function configuration(options: Record<string, unknown>) {
     (typeof resultCutoff !== "number" || !Number.isSafeInteger(resultCutoff) || resultCutoff < 1)
   )
     throw problem("FEISHU_INTERACTIVE_RESULT_CONFIG_INVALID");
+  const { mentionOwnerId, mentionFromId } = options;
+  if (
+    (mentionOwnerId !== undefined || mentionFromId !== undefined) &&
+    (!personId(mentionOwnerId) ||
+      typeof mentionFromId !== "number" ||
+      !Number.isSafeInteger(mentionFromId) ||
+      mentionFromId < 1 ||
+      !interactiveAsks ||
+      resultCutoff === undefined ||
+      mentionFromId < interactiveAsksFromId ||
+      mentionFromId < resultCutoff)
+  )
+    throw problem("FEISHU_OWNER_MENTION_CONFIG_INVALID");
   const deliveryPrefix = `pl-card-${createHash("sha256")
     .update(JSON.stringify([deliveryNamespace, chatId]))
     .digest("hex")
@@ -195,6 +216,8 @@ function configuration(options: Record<string, unknown>) {
     interactiveAsks,
     interactiveAsksFromId,
     resultCutoff,
+    mentionOwnerId,
+    mentionFromId,
   };
 }
 
@@ -222,8 +245,17 @@ function call(program: string, args: string[], body: string, signal: AbortSignal
 }
 
 export default async function groupText({ hub, options, log, signal }: ChannelContext) {
-  const { program, profile, chatId, deliveryPrefix, interactiveAsks, interactiveAsksFromId, resultCutoff } =
-    configuration(options);
+  const {
+    program,
+    profile,
+    chatId,
+    deliveryPrefix,
+    interactiveAsks,
+    interactiveAsksFromId,
+    resultCutoff,
+    mentionOwnerId,
+    mentionFromId,
+  } = configuration(options);
   while (!signal.aborted) {
     let card: Card | null;
     try {
@@ -241,8 +273,13 @@ export default async function groupText({ hub, options, log, signal }: ChannelCo
         card.kind === "ask"
           ? interactiveAsks && card.id >= interactiveAsksFromId
           : resultCutoff !== undefined && card.id >= resultCutoff;
+      // A committed original message is edited without pinging again. Lost send acknowledgements use the same key.
+      const owner =
+        typeof mentionFromId === "number" && card.id >= mentionFromId && personId(mentionOwnerId)
+          ? mentionOwnerId
+          : undefined;
       const content = interactive
-        ? JSON.stringify(card.kind === "ask" ? renderDecisionCard(card) : renderResultCard(card))
+        ? JSON.stringify(card.kind === "ask" ? renderDecisionCard(card, owner) : renderResultCard(card, owner))
         : null;
       const args = ["--profile", profile, "im"];
       let body: string;

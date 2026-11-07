@@ -40,6 +40,14 @@ export class LoopControls {
     if (!["manual", "active", "paused"].includes(mode) || typeof key !== "string" || !key || !actor)
       throw failure("INVALID_MODE_CHANGE");
     return this.withLock((data) => {
+      const budgetIntent =
+        maxSteps === undefined
+          ? mode === "active" && objective !== undefined
+            ? "until-done"
+            : "preserve"
+          : maxSteps === null
+            ? "until-done"
+            : maxSteps;
       let requestHash;
       if (requestId !== undefined) {
         if (typeof requestId !== "string" || !/^[A-Za-z0-9_.:-]{1,512}$/.test(requestId))
@@ -59,7 +67,11 @@ export class LoopControls {
           .digest("hex");
         const previous = data.requests?.[requestId];
         if (previous) {
-          if (previous.hash !== requestHash) throw failure("CONTROL_REQUEST_ID_REUSED");
+          if (
+            previous.hash !== requestHash ||
+            (Object.hasOwn(previous, "budgetIntent") && previous.budgetIntent !== budgetIntent)
+          )
+            throw failure("CONTROL_REQUEST_ID_REUSED");
           return previous.result;
         }
       }
@@ -90,10 +102,14 @@ export class LoopControls {
         if (objective !== undefined) next.goalStartEvent = next.goalControlEvent;
       }
       if (maxSteps !== undefined) next.maxSteps = maxSteps;
+      else if (mode === "active" && objective !== undefined) next.maxSteps = null;
       if (deadline !== undefined) next.deadline = deadline;
       if (mode === "active") {
         if (typeof next.objective !== "string" || !next.objective.trim()) throw failure("OBJECTIVE_REQUIRED");
-        if (!Number.isSafeInteger(next.maxSteps) || next.maxSteps < 1 || next.maxSteps > 100)
+        if (
+          next.maxSteps !== null &&
+          (!Number.isSafeInteger(next.maxSteps) || next.maxSteps < 1 || next.maxSteps > 100)
+        )
           throw failure("INVALID_STEP_BUDGET");
         if (next.deadline && (!Number.isFinite(Date.parse(next.deadline)) || Date.parse(next.deadline) <= Date.now()))
           throw failure("INVALID_DEADLINE");
@@ -101,7 +117,7 @@ export class LoopControls {
       data.projects[key] = next;
       if (requestId !== undefined) {
         data.requests ??= {};
-        data.requests[requestId] = { hash: requestHash, result: next };
+        data.requests[requestId] = { hash: requestHash, result: next, budgetIntent };
       }
       this.save(data);
       return next;

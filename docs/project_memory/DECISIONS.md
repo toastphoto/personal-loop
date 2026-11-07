@@ -29,3 +29,6 @@
 
 - 2026-11-06: The owner approved upstream-style execution: event/later/answer-driven continuation, quiet ordinary completion and no fixed hourly reporting. Keep project activation and access scope explicit.
 - Use upstream retry attempts as distinct bounded executions only after a verified failed predecessor; deduplicate the same attempt. Preserve attempt-1 legacy keys and count retries against the owner's round limit. Unknown results still require reconciliation.
+
+- On 2026-11-07 the owner replaced the trial round cap with until-done defaults. Use explicit stage evidence and exact goals, decide minor reversible details within authorization, and ask for consequential scope/permission decisions. Keep pause and optional numeric caps.
+- Observe message-level checkpoints before a whole turn completes. Mention the verified owner only for new meaningful notices/decisions. Own-run decisions and independent source questions have separate durable routes; use exact identity to avoid duplicate asks.

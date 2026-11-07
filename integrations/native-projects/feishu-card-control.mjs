@@ -34,9 +34,7 @@ const validGoal = (d) =>
   typeof d?.objective === "string" &&
   d.objective.trim() &&
   d.objective.length <= 1000 &&
-  Number.isSafeInteger(d.maxSteps) &&
-  d.maxSteps >= 1 &&
-  d.maxSteps <= 100;
+  (d.maxSteps === null || (Number.isSafeInteger(d.maxSteps) && d.maxSteps >= 1 && d.maxSteps <= 100));
 
 export class CardSessions {
   constructor(file, { now = Date.now } = {}) {
@@ -596,7 +594,7 @@ export class ProjectCardController {
       item,
       navigation,
       notice,
-      intent.objective ? { objective: intent.objective, maxSteps: 3, revision: 0 } : undefined,
+      intent.objective ? { objective: intent.objective, maxSteps: null, revision: 0 } : undefined,
       overview,
     );
     return {
@@ -653,7 +651,10 @@ export class ProjectCardController {
         throw failure("CARD_ACTION_NOT_ISSUED");
       const options =
         nodes(session.data.card).find((o) => o.tag === "select_static" && o.name === "max_steps")?.options ?? [];
-      const data = { objective: form.objective, maxSteps: Number(form.max_steps) };
+      const data = {
+        objective: form.objective,
+        maxSteps: form.max_steps === "until-done" ? null : Number(form.max_steps),
+      };
       if (!options.some((o) => o.value === form.max_steps) || !validGoal(data)) throw failure("CARD_GOAL_INVALID");
       return data;
     }

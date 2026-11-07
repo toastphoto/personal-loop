@@ -43,8 +43,8 @@ export async function patchProjectCard(config, response, execute) {
   return response.messageId;
 }
 export class FeishuCardRelay {
-  constructor(config, { queue, controller, execute, answerDecisionClick }) {
-    Object.assign(this, { config, queue, controller, execute, answerDecisionClick });
+  constructor(config, { queue, controller, execute, answerDecisionClick, checkpointCards }) {
+    Object.assign(this, { config, queue, controller, execute, answerDecisionClick, checkpointCards });
   }
   async tick() {
     const ingest = this.queue.ingest(this.config.queuePath, {
@@ -63,6 +63,28 @@ export class FeishuCardRelay {
           action = JSON.parse(data.actionValue);
         } catch {
           /* Navigation and form callbacks may have no value. */
+        }
+        if (action && Object.hasOwn(action, "personalLoopCheckpoint")) {
+          if (
+            !this.checkpointCards ||
+            action.personalLoopCheckpoint !== 1 ||
+            data.host !== "im_message" ||
+            data.actionTag !== "button"
+          )
+            throw failure("CARD_ACTION_INVALID");
+          const result = await this.checkpointCards.handle({
+            id: action.id,
+            version: action.version,
+            choice: action.choice,
+            actor: item.event.sender_id,
+            chat: item.event.chat_id,
+            messageId: data.cardMessageId,
+            requestId: item.requestId,
+            profile: this.config.profile,
+          });
+          if (!result?.ok) this.queue.discard(item.id, result?.code ?? "CARD_ACTION_INVALID");
+          else this.queue.saveResult(item.id, { ok: true }, { type: "checkpoint-handled" });
+          continue;
         }
         if (action && Object.hasOwn(action, "personalLoopDecision")) {
           if (
@@ -120,7 +142,7 @@ export class FeishuCardRelay {
         continue;
       }
       // The hub owns decision card revisions and delivers the chosen option and final result.
-      if (item.response?.type === "hub-decision") {
+      if (item.response?.type === "hub-decision" || item.response?.type === "checkpoint-handled") {
         this.queue.markReply(item.id, "handled-by-hub");
         continue;
       }

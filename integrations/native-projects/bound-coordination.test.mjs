@@ -38,7 +38,7 @@ function fixture(t, maxSteps = 2) {
   const subject = subjectFor(projectKey),
     prefix = "native.project." + subject.slice(0, 32),
     calls = [];
-  let planOverride;
+  let planOverride, afterQueue, afterPlan, afterClose;
   const queuedText = [];
   let originalReply = "建议先核对资料入口。";
   let inspectStatus = "queued",
@@ -55,7 +55,9 @@ function fixture(t, maxSteps = 2) {
           resolve() {
             return { project };
           },
-          async close() {},
+          async close() {
+            afterClose?.();
+          },
         },
         emit() {},
         executorFactory() {
@@ -71,6 +73,7 @@ function fixture(t, maxSteps = 2) {
           assert.match(prompt, /已将采集迁入工作台/);
           assert.match(prompt, /real capture client/);
           calls.push("plan");
+          afterPlan?.();
           return {
             text:
               planOverride ??
@@ -91,6 +94,7 @@ function fixture(t, maxSteps = 2) {
           assert.doesNotMatch(text, /agent-autoloop|expectedResult|纯 JSON/);
           calls.push("queue:" + requestId);
           queuedText.push(text);
+          afterQueue?.();
           return {
             status: queueStatus,
             threadId,
@@ -125,6 +129,9 @@ function fixture(t, maxSteps = 2) {
     setInspect: (v) => (inspectStatus = v),
     setQueue: (v) => (queueStatus = v),
     setPlan: (v) => (planOverride = v),
+    afterQueue: (fn) => (afterQueue = fn),
+    afterPlan: (fn) => (afterPlan = fn),
+    afterClose: (fn) => (afterClose = fn),
   };
 }
 test("ephemeral plan, a single queued handoff, and checked final reply at the original thread within a two-attempt budget", async (t) => {
@@ -345,4 +352,235 @@ test("repeated lost verification asks the owner to check once without treating a
   const changed = await observed(handoff, "unknown", "BOUND_SCOPE_MISMATCH");
   assert.equal(changed.coordinator.action, "attention");
   assert.equal(receipt(changed).later, undefined);
+});
+
+test("default continuous work can progress beyond three turns, then ends only on verified goal completion", async (t) => {
+  const f = fixture(t, null);
+  const initial = await f.run(1, [f.activeEvent]);
+  f.setQueue("completed");
+  f.setReply("入口已核对，需要补齐实际页面验收说明");
+  const next = (n, result) => f.run(n, [{ type: "timer.due", subject: f.subject }], { timers: result.parsed.later });
+  const completedStep = await next(2, initial);
+  assert.equal(completedStep.r.coordinator.action, "review-progress");
+  assert.equal(completedStep.parsed.notice, undefined);
+  f.setPlan(
+    JSON.stringify({
+      action: "dispatch",
+      progress: "入口已核对",
+      nextStep: "验证入口的验收说明",
+      expectedResult: "首件事清单",
+    }),
+  );
+  const review = await next(3, completedStep);
+  assert.equal(review.r.coordinator.action, "dispatch");
+  f.setReply("验收说明和各页面首件事清单已核齐");
+  const nextStep = await next(4, review);
+  assert.equal(nextStep.r.coordinator.action, "review-progress");
+  f.setPlan(
+    JSON.stringify({
+      action: "finish",
+      summary: "导航及页面首件事已核齐",
+      reason: "当前目标的入口清单和验收说明都有了",
+    }),
+  );
+  const final = await next(5, nextStep);
+  assert.equal(final.r.coordinator.action, "finish");
+  assert.equal(final.parsed.events, undefined);
+  assert.equal(final.parsed.later, undefined);
+  assert.equal(final.parsed.notice.length, 1);
+  const repeat = await f.run(6, [f.activeEvent]);
+  assert.equal(repeat.r.state, "not-running");
+  assert.equal(f.queuedText.length, 2);
+});
+
+test("a paused completed step is reviewed after an explicit same-goal resume instead of being dispatched again", async (t) => {
+  const f = fixture(t, null);
+  const next = (id, result) => f.run(id, [{ type: "timer.due", subject: f.subject }], { timers: result.parsed.later });
+  const start = await f.run(1, [f.activeEvent]);
+  f.setQueue("completed");
+  f.setReply("本轮入口已经核对完成。");
+  f.afterQueue(() => f.controls.set(f.projectKey, "paused", { actor: "owner", requestId: "pause-completion" }));
+  const paused = await next(2, start);
+  assert.equal(paused.r.coordinator.action, "suspended");
+  assert.equal(paused.parsed.later, undefined);
+  assert.equal(paused.r.coordinator.reply, "本轮入口已经核对完成。");
+  f.afterQueue(null);
+  const resume = f.controls.set(f.projectKey, "active", { actor: "owner", requestId: "resume-completion" });
+  f.setPlan(JSON.stringify({ action: "finish", summary: "目标已经完成", reason: "已确认的入口清单全部齐全" }));
+  const finish = await f.run(3, [{ type: f.prefix + ".changed", subject: f.subject, id: resume.goalControlEvent }]);
+  assert.equal(finish.r.coordinator.action, "finish");
+  assert.equal(f.queuedText.length, 1);
+  assert.equal(f.controls.get(f.projectKey).goalRevision, f.goal.goalRevision);
+});
+
+test("continuous plans reject repeating an older completed step even if punctuation or acceptance prose changes", async (t) => {
+  const f = fixture(t, null);
+  const next = (id, result) => f.run(id, [{ type: "timer.due", subject: f.subject }], { timers: result.parsed.later });
+  let r = await f.run(1, [f.activeEvent]);
+  f.setQueue("completed");
+  f.setReply("入口步骤A已完成。");
+  r = await next(2, r);
+  f.setPlan(
+    JSON.stringify({
+      action: "dispatch",
+      progress: "继续下一项",
+      nextStep: "验证入口的验收说明",
+      expectedResult: "步骤B",
+    }),
+  );
+  r = await next(3, r);
+  f.setReply("入口步骤B已完成。");
+  r = await next(4, r);
+  f.setPlan(
+    JSON.stringify({
+      action: "dispatch",
+      progress: "再试第一项",
+      nextStep: "验证入口 与 界面关系。",
+      expectedResult: "换个验收措辞",
+    }),
+  );
+  r = await next(5, r);
+  assert.equal(r.r.state, "receipt-unconfirmed");
+  assert.equal(r.parsed.events, undefined);
+  assert.equal(r.parsed.later, undefined);
+  assert.equal(f.queuedText.length, 2);
+});
+
+test("a pause while closing the catalogue suppresses continuation but keeps the completed reply for resume", async (t) => {
+  const f = fixture(t, null);
+  const start = await f.run(1, [f.activeEvent]);
+  f.setQueue("completed");
+  f.setReply("入口及验收结果已完成。");
+  f.afterClose(() => f.controls.set(f.projectKey, "paused", { actor: "owner", requestId: "pause-on-close" }));
+  const held = await f.run(2, [{ type: "timer.due" }], { timers: start.parsed.later });
+  assert.equal(held.r.coordinator.action, "suspended");
+  assert.equal(held.parsed.later, undefined);
+  assert.equal(held.r.coordinator.reply, "入口及验收结果已完成。");
+  f.afterClose(null);
+  const resumed = f.controls.set(f.projectKey, "active", { actor: "owner", requestId: "resume-on-close" });
+  f.setPlan(JSON.stringify({ action: "finish", summary: "目标已达到", reason: "入口和验收结果齐全" }));
+  const finished = await f.run(3, [{ type: f.prefix + ".changed", subject: f.subject, id: resumed.goalControlEvent }]);
+  assert.equal(finished.r.coordinator.action, "finish");
+  assert.equal(f.queuedText.length, 1);
+});
+
+test("a pause during review keeps its actual source instead of blindly sending the proposed next step", async (t) => {
+  const f = fixture(t, null);
+  const next = (id, result) => f.run(id, [{ type: "timer.due" }], { timers: result.parsed.later });
+  let r = await f.run(1, [f.activeEvent]);
+  f.setQueue("completed");
+  f.setReply("第一项入口已经完成。");
+  r = await next(2, r);
+  f.setPlan(
+    JSON.stringify({
+      action: "dispatch",
+      progress: "第一项已完成",
+      nextStep: "验证入口的另一份材料",
+      expectedResult: "第二项结论",
+    }),
+  );
+  f.afterPlan(() => f.controls.set(f.projectKey, "paused", { actor: "owner", requestId: "pause-review" }));
+  r = await next(3, r);
+  assert.equal(r.r.coordinator.action, "suspended");
+  assert.equal(r.parsed.later, undefined);
+  assert.equal(r.r.coordinator.reviewSource.reply, "第一项入口已经完成。");
+  f.afterPlan(null);
+  const resumed = f.controls.set(f.projectKey, "active", { actor: "owner", requestId: "resume-review" });
+  r = await f.run(4, [{ type: f.prefix + ".changed", subject: f.subject, id: resumed.goalControlEvent }]);
+  assert.equal(r.r.coordinator.action, "dispatch");
+  assert.equal(f.queuedText.length, 1, "resuming re-evaluates before queueing");
+  r = await next(5, r);
+  assert.equal(r.r.coordinator.action, "review-progress");
+  assert.equal(f.queuedText.length, 2);
+});
+
+test("a different generation cannot resume the paused result of a previous objective", async (t) => {
+  const f = fixture(t, null);
+  const r = await f.run(1, [f.activeEvent]);
+  f.setQueue("completed");
+  f.afterQueue(() => f.controls.set(f.projectKey, "paused", { actor: "owner" }));
+  const ended = await f.run(2, [{ type: "timer.due", subject: f.subject }], { timers: r.parsed.later });
+  assert.equal(ended.r.coordinator.action, "suspended");
+  f.afterQueue(null);
+  f.controls.set(f.projectKey, "active", {
+    actor: "owner",
+    objective: "完全不同的新目标",
+    maxSteps: null,
+    requestId: "another-goal",
+  });
+  const old = await f.run(3, [{ type: "timer.due", subject: f.subject }], { timers: r.parsed.later });
+  assert.equal(old.r.state, "not-running");
+  assert.equal(f.queuedText.length, 1);
+});
+
+test("continuous work keeps decision A across several steps, accepts a different decision B, and never asks A again", async (t) => {
+  const f = fixture(t, null);
+  f.setQueue("completed");
+  const A = {
+    action: "ask",
+    progress: "需要确定首个验收重点",
+    nextStep: "验证入口第一部分",
+    expectedResult: "核对记录",
+    question: "首轮先看什么？",
+    options: ["入口", "流程"],
+    recommend: 0,
+    reason: "入口更容易核对",
+  };
+  const B = "需要你拍板：先验哪类设备？\n1. 桌面端\n2. 移动端\n建议选第 1 项，因为现有同事用桌面更多。";
+  const answer = (ask, n, id) => ({
+    events: [{ type: "card.answered", id: "card:" + id }],
+    answers: [{ card: id, title: ask.title, about: ask.about, options: ask.options, choice: n }],
+  });
+  const next = async (num, prior) => f.run(num, [{ type: "timer.due" }], { timers: prior.parsed.later });
+  f.setPlan(JSON.stringify(A));
+  const first = await f.run(1, [f.activeEvent]);
+  const chosenA = answer(first.parsed.ask[0], 1, 11);
+  f.setReply("第一部分已完成。");
+  const doneA = await f.run(2, chosenA.events, { answers: chosenA.answers });
+  assert.deepEqual(doneA.r.coordinator.decisions, [{ question: A.question, options: A.options, chosen: "流程" }]);
+  f.setPlan(
+    JSON.stringify({
+      action: "dispatch",
+      progress: "第一部分有结果",
+      nextStep: "验证入口第二部分",
+      expectedResult: "第二份核对",
+    }),
+  );
+  const plan2 = await next(3, doneA);
+  f.setReply(B);
+  const second = await next(4, plan2);
+  assert.equal(second.parsed.ask.length, 1, "a previous chosen branch must not disable the next genuine decision");
+  assert.match(f.queuedText[1], /首轮先看什么.*流程/);
+  const askB = second.parsed.ask[0],
+    chosenB = answer(askB, 1, 12);
+  const forged = await f.run(5, chosenB.events, { answers: [{ ...chosenB.answers[0], about: "foreign-generation" }] });
+  assert.equal(forged.r.state, "not-running");
+  assert.equal(f.queuedText.length, 2);
+  f.setReply("第二部分已按移动端核对。");
+  const doneB = await f.run(6, chosenB.events, { answers: chosenB.answers });
+  assert.deepEqual(doneB.r.coordinator.decisions, [
+    { question: A.question, options: A.options, chosen: "流程" },
+    { question: "先验哪类设备？", options: ["桌面端", "移动端"], chosen: "移动端" },
+  ]);
+  assert.match(f.queuedText[2], /首轮先看什么.*流程/);
+  assert.match(f.queuedText[2], /先验哪类设备.*移动端/);
+  f.setPlan(
+    JSON.stringify({
+      action: "dispatch",
+      progress: "已有两份核对",
+      nextStep: "验证入口第三部分",
+      expectedResult: "第三份说明",
+    }),
+  );
+  const plan3 = await next(7, doneB);
+  f.setReply("第三部分也已完成。");
+  const done3 = await next(8, plan3);
+  assert.equal(done3.r.coordinator.decisions.length, 2);
+  assert.match(f.queuedText[3], /首轮先看什么.*流程/);
+  assert.match(f.queuedText[3], /先验哪类设备.*移动端/);
+  f.setPlan(JSON.stringify({ ...A, options: [...A.options].reverse() }));
+  const repeated = await next(9, done3);
+  assert.equal(repeated.r.state, "receipt-unconfirmed");
+  assert.equal(repeated.parsed.ask, undefined);
+  assert.equal(f.queuedText.length, 4);
 });

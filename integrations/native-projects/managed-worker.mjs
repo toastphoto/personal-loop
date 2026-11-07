@@ -84,7 +84,7 @@ function openLedger(file) {
   if (existsSync(file) && lstatSync(file).isSymbolicLink()) throw failure("MANAGED_CONFIG_ERROR");
   const db = new DatabaseSync(file);
   db.exec(
-    "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA busy_timeout=5000; CREATE TABLE IF NOT EXISTS requests(run_id TEXT PRIMARY KEY, goal_id TEXT NOT NULL, request_id TEXT NOT NULL, state TEXT NOT NULL, result TEXT); CREATE TABLE IF NOT EXISTS receipt_blocks(run_id TEXT PRIMARY KEY, goal_id TEXT NOT NULL); CREATE TABLE IF NOT EXISTS bound_routes(goal_id TEXT PRIMARY KEY,binding TEXT NOT NULL);",
+    "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA busy_timeout=5000; CREATE TABLE IF NOT EXISTS requests(run_id TEXT PRIMARY KEY, goal_id TEXT NOT NULL, request_id TEXT NOT NULL, state TEXT NOT NULL, result TEXT); CREATE TABLE IF NOT EXISTS receipt_blocks(run_id TEXT PRIMARY KEY, goal_id TEXT NOT NULL); CREATE TABLE IF NOT EXISTS bound_routes(goal_id TEXT PRIMARY KEY,binding TEXT NOT NULL); CREATE TABLE IF NOT EXISTS observed_steps(goal_id TEXT NOT NULL,fingerprint TEXT NOT NULL,turn_id TEXT NOT NULL,plan TEXT NOT NULL,reply TEXT NOT NULL,PRIMARY KEY(goal_id,fingerprint));",
   );
   for (const suffix of ["", "-wal", "-shm"]) if (existsSync(file + suffix)) chmodSync(file + suffix, 0o600);
   return db;
@@ -106,6 +106,7 @@ export async function runManagedWorker(
     session,
     turnId,
     replayRevision,
+    finalizeBoundResult,
     recoveredReceipt = false,
     reserved = false;
   const options = config?.managedCodex;
@@ -135,9 +136,7 @@ export async function runManagedWorker(
       if (
         typeof goal.objective !== "string" ||
         !goal.objective.trim() ||
-        !Number.isSafeInteger(goal.maxSteps) ||
-        goal.maxSteps < 1 ||
-        goal.maxSteps > 100
+        (goal.maxSteps !== null && (!Number.isSafeInteger(goal.maxSteps) || goal.maxSteps < 1 || goal.maxSteps > 100))
       )
         throw failure("MANAGED_CONFIG_ERROR");
       // This executor only accepts Codex projects. Its source reads must not connect to unrelated apps.
@@ -230,12 +229,30 @@ export async function runManagedWorker(
               )
               .all(goalId)
               .map((r) => JSON.parse(r.item));
-            stage = coordinatorStage({ history, context: readCoordinatorContext(contextFile), goal, subject });
+            const observed =
+              goal.maxSteps === null
+                ? ledger
+                    .prepare("SELECT fingerprint,plan,reply FROM observed_steps WHERE goal_id=? ORDER BY rowid DESC")
+                    .all(goalId)
+                : [];
+            const completedSteps = observed
+              .slice(0, 20)
+              .reverse()
+              .map((r) => ({ step: JSON.parse(r.plan).nextStep, reply: r.reply.slice(0, 240) }));
+            stage = coordinatorStage({
+              history,
+              context: readCoordinatorContext(contextFile),
+              goal,
+              subject,
+              completedSteps,
+              completedStepHashes: observed.map((r) => r.fingerprint),
+            });
             if (!stage) throw failure("COORDINATOR_UNRELATED_EVENT");
-            remaining = goal.maxSteps - used - 1;
-            if (stage.role === "router" && remaining < 1) throw failure("COORDINATOR_BUDGET");
+            remaining = goal.maxSteps === null ? Infinity : goal.maxSteps - used - 1;
+            if (["router", "router-review"].includes(stage.role) && remaining < 1) throw failure("COORDINATOR_BUDGET");
           }
-          if (stage?.role !== "bound-observe" && used >= goal.maxSteps) throw failure("MANAGED_STEP_BUDGET");
+          if (stage?.role !== "bound-observe" && goal.maxSteps !== null && used >= goal.maxSteps)
+            throw failure("MANAGED_STEP_BUDGET");
           ledger
             .prepare("INSERT INTO requests VALUES(?,?,?,?,NULL)")
             .run(executionKey, goalId, "native-run:" + executionKey, "intent");
@@ -306,19 +323,34 @@ export async function runManagedWorker(
           },
           dependencies,
         );
-        // Retain the actual planner usage or the queued intent, but never schedule from a stale goal.
-        try {
-          guard();
-        } catch {
-          result = {
-            ...result,
-            text: "没事可做：控制状态已改变，本轮资料已保留。",
-            coordinator:
-              result.coordinator.action === "await-bound"
-                ? result.coordinator
-                : { ...result.coordinator, action: "superseded" },
-          };
-        }
+        // Retain verified work across a pause, including a control change while the catalogue closes.
+        finalizeBoundResult = () => {
+          try {
+            guard();
+          } catch {
+            const current = controls.get(projectKey);
+            const pausedSameGoal =
+              goal.maxSteps === null &&
+              current.mode === "paused" &&
+              current.goalRevision === goal.goalRevision &&
+              current.objective === goal.objective;
+            const stageResult = result.coordinator;
+            result = {
+              ...result,
+              text: "没事可做：控制状态已改变，本轮资料已保留。",
+              ...(stageResult && {
+                coordinator: ["await-bound", "suspended", "superseded"].includes(stageResult.action)
+                  ? stageResult
+                  : {
+                      ...stageResult,
+                      resumeAction: stageResult.action,
+                      action: pausedSameGoal ? "suspended" : "superseded",
+                    },
+              }),
+            };
+          }
+        };
+        finalizeBoundResult();
         if (result.state === "receipt-unconfirmed")
           ledger.prepare("INSERT OR IGNORE INTO receipt_blocks VALUES(?,?)").run(executionKey, goalId);
         if (receiptProblem(result.text)) {
@@ -536,6 +568,7 @@ export async function runManagedWorker(
     }
     if (catalog) await catalog.close();
   }
+  finalizeBoundResult?.();
   if (replayRevision !== undefined) {
     // Closing the catalogue can yield; stale replays must not escape, but actual execution usage must survive pauses.
     try {
@@ -566,9 +599,31 @@ export async function runManagedWorker(
       chmodSync(artifact + ".tmp", 0o600);
       renameSync(artifact + ".tmp", artifact);
       result.artifact = artifact;
-      ledger
-        .prepare("UPDATE requests SET state=?,result=? WHERE run_id=?")
-        .run(result.state, JSON.stringify(result), executionKey);
+      ledger.exec("BEGIN IMMEDIATE");
+      try {
+        const step = result.coordinator;
+        if (
+          step?.completedStepFingerprint &&
+          step.turnId &&
+          step.plan &&
+          typeof step.reply === "string" &&
+          (step.action === "review-progress" ||
+            (step.action === "suspended" && step.resumeAction === "review-progress"))
+        ) {
+          ledger
+            .prepare(
+              "INSERT INTO observed_steps VALUES(?,?,?,?,?) ON CONFLICT(goal_id,fingerprint) DO UPDATE SET turn_id=excluded.turn_id,plan=excluded.plan,reply=excluded.reply",
+            )
+            .run(goalId, step.completedStepFingerprint, step.turnId, JSON.stringify(step.plan), step.reply);
+        }
+        ledger
+          .prepare("UPDATE requests SET state=?,result=? WHERE run_id=?")
+          .run(result.state, JSON.stringify(result), executionKey);
+        ledger.exec("COMMIT");
+      } catch (error) {
+        if (ledger.isTransaction) ledger.exec("ROLLBACK");
+        throw error;
+      }
     }
   } finally {
     ledger?.close();

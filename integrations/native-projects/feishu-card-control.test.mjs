@@ -511,3 +511,22 @@ test("owner can request a working chat card without remembering any title; openi
   assert.ok(JSON.stringify(res.response.card).includes(c.title));
   assert.equal(f.controls.get(project.key).mode, "manual");
 });
+
+test("until-done form selection persists explicit null and starts the same pinned objective", async (t) => {
+  const f = fixture(t);
+  let r = await detailed(f);
+  r = await f.controller.handle(event(r, action(r, "edit-goal")));
+  const submit = nodes(r.card).find((o) => o.form_action_type === "submit");
+  r = await f.controller.handle(
+    event(
+      r,
+      {},
+      { actionName: submit.name, formValue: JSON.stringify({ objective: "把导航目标完成", max_steps: "until-done" }) },
+    ),
+  );
+  assert.equal(f.store.draft("ou_owner", "oc_group", projectAlias(project)).maxSteps, null);
+  r = await f.controller.handle(event(r, action(r, "start")));
+  await f.controller.handle(event(r, action(r, "confirm-start")));
+  assert.equal(f.controls.get(project.key).maxSteps, null);
+  assert.equal(f.controls.get(project.key).mode, "active");
+});

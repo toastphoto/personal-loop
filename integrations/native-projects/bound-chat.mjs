@@ -7,6 +7,17 @@ import { ManagedCodexRpc } from "./managed-rpc.mjs";
 
 const uuid = /^[\da-f]{8}-[\da-f]{4}-[\da-f]{4}-[\da-f]{4}-[\da-f]{12}$/i;
 const digest = (obj) => createHash("sha256").update(JSON.stringify(obj)).digest("hex");
+// Stable public-message identity shared with read-only observers; this does not queue anything.
+export function boundChatClientId(projectKey, requestId) {
+  const hash = digest(["personal-loop-main-chat/v1", projectKey, requestId]);
+  return [
+    hash.slice(0, 8),
+    hash.slice(8, 12),
+    "5" + hash.slice(13, 16),
+    "8" + hash.slice(17, 20),
+    hash.slice(20, 32),
+  ].join("-");
+}
 const problem = (code) => Object.assign(new Error(code), { code });
 function binding(config, projectKey) {
   const managed = config?.managedCodex,
@@ -146,15 +157,8 @@ async function perform(op, args) {
       (op === "queue" && typeof beforeMutation !== "function")
     )
       throw problem("BOUND_INVALID_HANDOFF");
-    const hash = digest(["personal-loop-main-chat/v1", projectKey, requestId]),
-      fingerprint = digest([b, text]);
-    const id = [
-      hash.slice(0, 8),
-      hash.slice(8, 12),
-      "5" + hash.slice(13, 16),
-      "8" + hash.slice(17, 20),
-      hash.slice(20, 32),
-    ].join("-");
+    const fingerprint = digest([b, text]);
+    const id = boundChatClientId(projectKey, requestId);
     ids.clientUserMessageId = id;
     db = journal(config, b.root, op === "inspect");
     const prior = db?.prepare("SELECT fingerprint FROM intents WHERE id=?").get(id);

@@ -53,8 +53,8 @@ export function parseLoopCommand(text) {
   );
   if (enable) {
     const objective = enable[2].trim();
-    const maxSteps = enable[3] === undefined ? 3 : Number(enable[3]);
-    if (validTarget(enable[1]) && objective && maxSteps >= 1 && maxSteps <= 100)
+    const maxSteps = enable[3] === undefined ? null : Number(enable[3]);
+    if (validTarget(enable[1]) && objective && (maxSteps === null || (maxSteps >= 1 && maxSteps <= 100)))
       return { action: "enable", target: enable[1].trim(), objective, maxSteps };
   }
   throw usage();
@@ -154,7 +154,8 @@ function projectDisplayView(project, control, { available, providerStatus } = {}
     revision: Number.isSafeInteger(control?.revision) && control.revision >= 0 ? control.revision : 0,
     execution,
     ...(objective.trim() ? { objective } : {}),
-    ...(Number.isSafeInteger(control?.maxSteps) && control.maxSteps >= 1 && control.maxSteps <= 100
+    ...(control?.maxSteps === null ||
+    (Number.isSafeInteger(control?.maxSteps) && control.maxSteps >= 1 && control.maxSteps <= 100)
       ? { maxSteps: control.maxSteps }
       : {}),
   };
@@ -238,7 +239,7 @@ const ERRORS = {
   LOOP_RULES_NOT_READY: "自动推进规则尚未就绪，没有启用。",
   LOOP_READINESS_UNAVAILABLE: "暂时无法确认自动推进是否就绪，没有启用。",
   OBJECTIVE_REQUIRED: "请写清这次希望完成的目标，例如：/loop 启用 内容工作台 | 修复一个明确问题并验证。",
-  INVALID_STEP_BUDGET: "步数上限必须是 1 到 100 的整数；省略时为 3。",
+  INVALID_STEP_BUDGET: "默认持续到目标完成，也可选 1 到 100 轮的上限。",
   LOOP_ALREADY_ACTIVE: "该项目已经按原目标自动推进。修改目标前请先明确暂停，未覆盖原目标。",
   CONTROL_REVISION_CHANGED: "项目状态已被更新，这条旧指令没有覆盖新状态。请重新查看后再操作。",
   CONTROL_UPDATE_BUSY: "另一个项目控制操作正在保存，请稍后重试。",
@@ -255,7 +256,7 @@ function failed(action, code, extra = {}) {
   };
 }
 function statusText(project, control) {
-  return `${projectAlias(project)} · ${label(project.name)}\n当前：${MODES[control.mode] ?? "状态待核对"}${executionLabel(project) ? `\n执行方式：${executionLabel(project)}` : ""}${control.objective ? `\n目标：${label(control.objective, 500)}` : ""}${control.maxSteps ? `\n步数上限：${control.maxSteps}` : ""}\n暂停自动推进不会自行取消已经开始的当前任务。`;
+  return `${projectAlias(project)} · ${label(project.name)}\n当前：${MODES[control.mode] ?? "状态待核对"}${executionLabel(project) ? `\n执行方式：${executionLabel(project)}` : ""}${control.objective ? `\n目标：${label(control.objective, 500)}` : ""}${control.maxSteps === null ? "\n持续到目标完成，可随时暂停" : control.maxSteps ? `\n步数上限：${control.maxSteps}` : ""}\n暂停自动推进不会自行取消已经开始的当前任务。`;
 }
 
 export async function handleLoopCommand(
@@ -362,11 +363,22 @@ export async function handleLoopCommand(
           }),
         },
       };
+    let steps = command.maxSteps === undefined ? null : command.maxSteps;
+    const priorRequest = controls.read?.()?.requests?.[requestId];
+    if (
+      action === "enable" &&
+      steps === null &&
+      priorRequest &&
+      !Object.hasOwn(priorRequest, "budgetIntent") &&
+      priorRequest.result?.projectKey === project.key &&
+      priorRequest.result.objective === command.objective?.trim()
+    )
+      steps = priorRequest.result.maxSteps;
     if (action === "enable") {
       if (typeof command.objective !== "string" || !command.objective.trim() || command.objective.length > 5000)
         return failed(action, "OBJECTIVE_REQUIRED");
-      const steps = command.maxSteps ?? 3;
-      if (!Number.isSafeInteger(steps) || steps < 1 || steps > 100) return failed(action, "INVALID_STEP_BUDGET");
+      if (steps !== null && (!Number.isSafeInteger(steps) || steps < 1 || steps > 100))
+        return failed(action, "INVALID_STEP_BUDGET");
       if (before.mode === "active" && (before.objective !== command.objective.trim() || before.maxSteps !== steps))
         return failed(action, "LOOP_ALREADY_ACTIVE");
     }
@@ -377,7 +389,12 @@ export async function handleLoopCommand(
         project.capabilities?.queueBound !== true
       )
         return failed(action, "PROJECT_CONTROL_NOT_READY");
-      if (action === "resume" && (!before.objective || !Number.isSafeInteger(before.maxSteps)))
+      if (
+        action === "resume" &&
+        (!before.objective ||
+          (before.maxSteps !== null &&
+            (!Number.isSafeInteger(before.maxSteps) || before.maxSteps < 1 || before.maxSteps > 100)))
+      )
         return failed(action, "OBJECTIVE_REQUIRED");
       if (typeof readiness !== "function") return failed(action, "LOOP_READINESS_REQUIRED");
       const ready = await readiness(project, { command, control: before });
@@ -392,7 +409,7 @@ export async function handleLoopCommand(
       ...(action === "enable"
         ? {
             objective: command.objective.trim(),
-            maxSteps: command.maxSteps ?? 3,
+            maxSteps: steps,
             ...(command.expectedThreadId && { expectedThreadId: command.expectedThreadId }),
           }
         : {}),
@@ -461,7 +478,7 @@ export async function handleLoopCommand(
       text:
         action === "pause"
           ? `${projectAlias(project)} 已暂停自动推进，不再安排下一步。已经开始的当前任务不会因此被取消。`
-          : `${projectAlias(project)} 已${action === "resume" ? "恢复" : "启用"}自动推进。${executionLabel(project) ? `\n执行方式：${executionLabel(project)}` : ""}\n目标：${label(next.objective, 500)}\n步数上限：${next.maxSteps}。其他项目保持原状态。`,
+          : `${projectAlias(project)} 已${action === "resume" ? "恢复" : "启用"}自动推进。${executionLabel(project) ? `\n执行方式：${executionLabel(project)}` : ""}\n目标：${label(next.objective, 500)}\n${next.maxSteps === null ? "持续到目标完成，可随时暂停" : `步数上限：${next.maxSteps}`}。其他项目保持原状态。`,
     };
   } catch (error) {
     return failed(action, typeof error?.code === "string" ? error.code : "LOOP_COMMAND_FAILED");

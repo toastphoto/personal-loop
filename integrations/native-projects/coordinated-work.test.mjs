@@ -128,3 +128,92 @@ test("the private planning snapshot uses only approved project files and avoids 
     code: "EEXIST",
   });
 });
+
+test("continuous work reviews a real completed step, then advances or finishes without forcing a human choice", () => {
+  const goal = { objective: "做好导航", maxSteps: null };
+  const before = {
+    role: "worker",
+    action: "review-progress",
+    runId: "8",
+    plan: { progress: "已有入口", nextStep: "核对导航", expectedResult: "说明" },
+    reply: "导航已整理，还缺每页首件事",
+    handoff: {},
+    turnId: "exact",
+  };
+  const context = ctx([{ type: kind + ".handoff", id: "review-8", subject }]);
+  const stage = coordinatorStage({ ...args, goal, history: [before], context });
+  assert.equal(stage.role, "router-review");
+  assert.equal(stage.reply, before.reply);
+  const next = coordinatedResult(
+    JSON.stringify({
+      action: "dispatch",
+      progress: "已核导航",
+      nextStep: "补齐每页首件事",
+      expectedResult: "每页一条",
+    }),
+    { ...args, stage, remaining: Infinity },
+  ).coordinator;
+  assert.equal(next.action, "dispatch");
+  const selected = { ...stage, chosen: "方案乙" };
+  const continued = coordinatedResult(
+    JSON.stringify({
+      action: "dispatch",
+      progress: "已核导航",
+      nextStep: "补齐页面首件事",
+      expectedResult: "逐页说明",
+    }),
+    { ...args, stage: selected, remaining: Infinity },
+  ).coordinator;
+  const resumed = coordinatorStage({
+    ...args,
+    goal,
+    history: [before, continued],
+    context: ctx([{ type: kind + ".handoff", id: "handoff-" + continued.runId, subject }]),
+  });
+  assert.equal(resumed.chosen, "方案乙");
+  assert.throws(() =>
+    coordinatedResult(JSON.stringify({ action: "dispatch", ...before.plan }), { ...args, stage, remaining: Infinity }),
+  );
+  const finish = coordinatedResult(
+    JSON.stringify({ action: "finish", summary: "每页首件事已核齐", reason: "导航7项和各自操作都有说明" }),
+    { ...args, stage, remaining: Infinity },
+  );
+  assert.equal(finish.coordinator.action, "finish");
+  const ended = JSON.parse(
+    finish.text.split("~~~")[0].match(/\x60\x60\x60agent-autoloop\n([\s\S]*?)\n\x60\x60\x60/)[1],
+  );
+  assert.equal(ended.events, undefined);
+  assert.equal(ended.later, undefined);
+  assert.ok(ended.notice[0].text.includes("7项"));
+  assert.equal(
+    coordinatorStage({
+      ...args,
+      goal,
+      history: [before],
+      context: ctx([{ type: kind + ".handoff", id: "wrong", subject }]),
+    }),
+    null,
+  );
+});
+
+test("continuous worker decisions keep earlier choices and reject duplicated questions while finite budgets retain their old rule", () => {
+  const remembered = { question: "先做哪项？", options: ["入口", "流程"], chosen: "流程" };
+  const stage = {
+    role: "worker",
+    plan: { nextStep: "验证入口" },
+    chosen: "流程",
+    chosenQuestion: remembered.question,
+    decisions: [remembered],
+  };
+  const different = { ...plan, question: "先验哪类设备？", options: ["桌面", "手机"], nextStep: "核对设备适配" };
+  const out = coordinatedResult(JSON.stringify(different), { ...args, stage, remaining: Infinity, untilDone: true });
+  assert.deepEqual(out.coordinator.decisions, [remembered]);
+  assert.equal(out.coordinator.ask.title, different.question);
+  assert.throws(() =>
+    coordinatedResult(
+      JSON.stringify({ ...different, question: remembered.question, options: [...remembered.options].reverse() }),
+      { ...args, stage, remaining: Infinity, untilDone: true },
+    ),
+  );
+  assert.throws(() => coordinatedResult(JSON.stringify(different), { ...args, stage, remaining: 2 }));
+});

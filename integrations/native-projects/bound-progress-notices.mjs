@@ -1,12 +1,13 @@
-// Observe only new completed turns in an explicitly opted-in main chat. No schedule, model, or independent IM consumer.
+// Observe one opted-in main chat. Legacy mode follows completed turns; checkpoint mode follows completed public messages.
 import { createHash } from "node:crypto";
 import { chmodSync, existsSync, lstatSync, readFileSync, realpathSync } from "node:fs";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { verifyBoundChat } from "./bound-chat.mjs";
+import { verifyBoundChat, boundChatClientId } from "./bound-chat.mjs";
 import { ManagedCodexRpc } from "./managed-rpc.mjs";
 import { readConfig } from "./factory.mjs";
 import { redact } from "./project-activity.mjs";
+import { pollCheckpointTarget } from "./checkpoint-monitor.mjs";
 
 const hash = (v) => createHash("sha256").update(JSON.stringify(v)).digest("hex");
 const load = (f) => JSON.parse(readFileSync(f, "utf8"));
@@ -145,6 +146,72 @@ function ownHandoff(native, clientId) {
     db.close();
   }
 }
+// Match the exact queued message to a normal worker request and its pinned route.
+// A manual or checkpoint-answer message does not inherit this decision channel.
+function hasManagedDecisionOwner(native, target, item) {
+  if (!Array.isArray(item.clientIds) || !item.clientIds.length) return false;
+  const binding = native.managedCodex.boundChats?.[target.projectKey];
+  if (binding?.threadId !== target.threadId) return false;
+  const workerFile = path.join(native.managedCodex.stateDir, hash(target.projectKey), "worker.db");
+  const queueFile = path.join(native.managedCodex.stateDir, "bound-chat.db");
+  if (!existsSync(workerFile) || !existsSync(queueFile)) return false;
+  privateFile(workerFile);
+  privateFile(queueFile);
+  const ledger = new DatabaseSync(workerFile, { readOnly: true });
+  const queue = new DatabaseSync(queueFile, { readOnly: true });
+  try {
+    ledger.exec("PRAGMA query_only=ON");
+    queue.exec("PRAGMA query_only=ON");
+    const route = JSON.stringify([binding.threadId, binding.projectId, binding.root]);
+    const rows = ledger
+      .prepare(
+        "SELECT r.run_id,r.request_id FROM requests r JOIN bound_routes b ON b.goal_id=r.goal_id WHERE b.binding=? AND r.request_id LIKE 'native-run:%'",
+      )
+      .all(route);
+    return rows.some((row) => {
+      if (row.request_id !== "native-run:" + row.run_id) return false;
+      const id = boundChatClientId(target.projectKey, row.request_id);
+      return item.clientIds.includes(id) && !!queue.prepare("SELECT 1 FROM intents WHERE id=?").get(id);
+    });
+  } finally {
+    queue.close();
+    ledger.close();
+  }
+}
+// Suppress only an exact final answer whose normal bound-worker receipt already created its own result notice.
+function hasResultNotice(native, target, item) {
+  const dir = path.join(native.managedCodex.stateDir, hash(target.projectKey));
+  const file = path.join(dir, "worker.db");
+  if (!existsSync(file)) return false;
+  privateFile(file);
+  const ledger = new DatabaseSync(file, { readOnly: true });
+  let matches;
+  try {
+    ledger.exec("PRAGMA query_only=ON");
+    matches = ledger
+      .prepare(
+        "SELECT run_id FROM requests WHERE json_extract(result,'$.coordinator.action')='deliver' AND json_extract(result,'$.coordinator.threadId')=? AND json_extract(result,'$.coordinator.turnId')=?",
+      )
+      .all(target.threadId, item.turnId);
+  } finally {
+    ledger.close();
+  }
+  if (!matches.length) return false;
+  const fileHub = path.join(path.dirname(native.loopHub.configFile), "hub.db");
+  if (!existsSync(fileHub)) return false;
+  privateFile(fileHub);
+  const hub = new DatabaseSync(fileHub, { readOnly: true });
+  try {
+    hub.exec("PRAGMA query_only=ON");
+    const key = "native-project:" + createHash("sha256").update(target.projectKey).digest("hex");
+    const query = hub.prepare(
+      "SELECT 1 FROM projections WHERE collection='cards' AND json_extract(data,'$.rule')=? AND json_extract(data,'$.run_id')=? AND json_extract(data,'$.kind')='notice' AND json_extract(data,'$.key') LIKE '%:bound-result-%' LIMIT 1",
+    );
+    return matches.some((row) => query.get(key, Number(row.run_id.split(":")[0])));
+  } finally {
+    hub.close();
+  }
+}
 async function recent(native, target, cursor) {
   const client = new ManagedCodexRpc({ command: native.managedCodex.command, timeoutMs: 4000 });
   const verify = async () => {
@@ -191,8 +258,29 @@ function store(file) {
   }
 }
 export class BoundProgressNotices {
-  constructor({ configFile, config, nativeConfig, runtime, now = Date.now, readRecent = recent }) {
-    Object.assign(this, { configFile, config, nativeConfig, runtime, now, readRecent });
+  constructor({
+    configFile,
+    config,
+    nativeConfig,
+    runtime,
+    now = Date.now,
+    readRecent = recent,
+    readItems,
+    classifyCheckpoint,
+    onCheckpoint,
+  }) {
+    Object.assign(this, {
+      configFile,
+      config,
+      nativeConfig,
+      runtime,
+      now,
+      readRecent,
+      readItems,
+      classifyCheckpoint,
+      onCheckpoint,
+    });
+    this.abort = new AbortController();
     this.next = 0;
     this.stopped = false;
     this.flight = null;
@@ -207,6 +295,9 @@ export class BoundProgressNotices {
       JSON.stringify(c.allowedSenderIds) !== JSON.stringify(this.config.allowedSenderIds) ||
       !o ||
       o.enabled !== true ||
+      (o.checkpoints !== undefined && typeof o.checkpoints !== "boolean") ||
+      (o.checkpoints === true &&
+        (!Number.isFinite(Date.parse(o.checkpointEnabledAt)) || Date.parse(o.checkpointEnabledAt) > this.now())) ||
       !Number.isFinite(Date.parse(o.enabledAt)) ||
       Date.parse(o.enabledAt) > this.now() ||
       !Number.isInteger(o.intervalMs ?? 60000) ||
@@ -273,6 +364,43 @@ export class BoundProgressNotices {
       const scope = hash([this.config.profile, this.config.chatId, o.enabledAt, projectKey, b]);
       const db = store(o.stateFile);
       try {
+        if (o.checkpoints === true) {
+          const guard = () => {
+            const fresh = this.settings();
+            if (
+              this.stopped ||
+              !fresh ||
+              fresh.o.checkpoints !== true ||
+              fresh.o.checkpointEnabledAt !== o.checkpointEnabledAt ||
+              fresh.o.enabledAt !== o.enabledAt ||
+              fresh.o.stateFile !== o.stateFile ||
+              !fresh.o.targets.some(
+                (t) => t.projectKey === projectKey && t.threadId === threadId && t.projectName === projectName,
+              ) ||
+              JSON.stringify(fresh.n.managedCodex.boundChats?.[projectKey]) !== JSON.stringify(b)
+            )
+              throw Error("Checkpoint authority changed");
+          };
+          const result = await pollCheckpointTarget({
+            db,
+            o,
+            n,
+            target,
+            scope,
+            now: this.now,
+            guard,
+            runtime: this.runtime,
+            onCheckpoint: this.onCheckpoint,
+            readItems: this.readItems,
+            classify: this.classifyCheckpoint,
+            signal: this.abort.signal,
+            hasResultNotice,
+            hasManagedDecisionOwner,
+          });
+          baselined += result.baselined;
+          sent += result.sent;
+          continue;
+        }
         const cursor = db.prepare("SELECT last FROM checkpoints WHERE scope=?").get(scope)?.last ?? null;
         const turns = await this.readRecent(n, target, cursor);
         if (
@@ -355,6 +483,7 @@ export class BoundProgressNotices {
   }
   async stop() {
     this.stopped = true;
+    this.abort.abort();
     if (this.flight) await this.flight;
   }
 }
@@ -369,7 +498,7 @@ export function verifiedNoticeProject({ configFile, config, nativeConfig, source
   if (typeof source !== "string" || typeof sourceKey !== "string" || !sourceKey.startsWith("source:" + source + ":"))
     return null;
   const key = sourceKey.slice(("source:" + source + ":").length);
-  if (!/^progress-[a-f0-9]{48}$/u.test(key)) return null;
+  if (!/^(?:progress|checkpoint)-[a-f0-9]{48}$/u.test(key)) return null;
   privateFile(o.stateFile);
   const db = new DatabaseSync(o.stateFile, { readOnly: true });
   try {

@@ -232,3 +232,21 @@ test("a current bound handoff stays visible while the hub is idle, without claim
   put("completed", { role: "bound-observe", action: "deliver" });
   assert.doesNotMatch(await report(), /已交给原对话|交接状态待核实/);
 });
+
+test("independent checkpoint questions are included in waiting queries and incomplete reads never imply no decisions", async (t) => {
+  const f = fixture(t);
+  const confirmed = await projectPortfolioStatus({
+    ...f,
+    focus: "waiting",
+    checkpointCards: { pending: async () => ({ projectKeys: [a.key], complete: true }) },
+  });
+  assert.match(confirmed.text, /活动工作台/);
+  assert.doesNotMatch(confirmed.text, /没有待/);
+  const unknown = await projectPortfolioStatus({
+    ...f,
+    focus: "waiting",
+    checkpointCards: { pending: async () => ({ projectKeys: [], complete: false }) },
+  });
+  assert.match(unknown.text, /暂未核实/);
+  assert.doesNotMatch(unknown.text, /没有待/);
+});

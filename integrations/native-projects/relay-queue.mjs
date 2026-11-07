@@ -1,6 +1,7 @@
 import { DatabaseSync } from "node:sqlite";
 import { createHash } from "node:crypto";
-import { mkdirSync, chmodSync, openSync, closeSync, fstatSync, statSync, readSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { mkdirSync, chmodSync, openSync, closeSync, fstatSync, statSync, readSync, realpathSync } from "node:fs";
 import path from "node:path";
 
 const fail = (code) => Object.assign(new Error(code), { code });
@@ -8,6 +9,44 @@ const digest = (value) => createHash("sha256").update(value).digest("hex");
 const text = (value) => typeof value === "string" && value.length > 0 && value.length <= 512;
 const decoder = new TextDecoder("utf-8", { fatal: true });
 const identity = (value) => `${value.dev}:${value.ino}`;
+
+const volumeCache = new Map();
+// APFS mount device numbers are process-lifetime identities. Pin the persistent volume UUID as well.
+function macVolume(file, stat) {
+  if (process.platform !== "darwin") return null;
+  try {
+    if (realpathSync(file) !== file || stat.uid !== BigInt(process.getuid()) || (stat.mode & 0o022n) !== 0n)
+      return null;
+    let mount = "/System/Volumes/Data";
+    if (statSync(mount, { bigint: true }).dev !== stat.dev) {
+      if (!file.startsWith("/Volumes/")) return null;
+      mount = file.split("/").slice(0, 3).join("/");
+    }
+    const mounted = statSync(mount, { bigint: true });
+    if (mounted.dev !== stat.dev) return null;
+    const key = String(stat.dev) + ":" + mount;
+    if (volumeCache.has(key)) return volumeCache.get(key);
+    const xml = execFileSync("/usr/sbin/diskutil", ["info", "-plist", mount], {
+      encoding: "utf8",
+      timeout: 2000,
+      maxBuffer: 131072,
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    if (!/<key>FilesystemType<\/key>\s*<string>apfs<\/string>/.test(xml)) return null;
+    const uuid = /<key>VolumeUUID<\/key>\s*<string>([a-fA-F0-9-]{36})<\/string>/.exec(xml)?.[1];
+    if (!uuid || statSync(mount, { bigint: true }).dev !== stat.dev) return null;
+    const volume = "apfs:" + uuid.toUpperCase();
+    volumeCache.set(key, volume);
+    return volume;
+  } catch {
+    return null;
+  }
+}
+function prefixHash(fd, end) {
+  const hash = createHash("sha256");
+  for (let at = 0; at < end; at += 65536) hash.update(readBytes(fd, at, Math.min(65536, end - at)));
+  return hash;
+}
 
 function readBytes(fd, position, length) {
   const bytes = Buffer.alloc(length);
@@ -36,8 +75,12 @@ function errorCode(value, fallback) {
 // Exclusive SQLite ownership lasts until close and is released by the OS after a crash.
 // It prevents two consumers from applying the same pending command concurrently.
 export class RelayQueue {
-  constructor(file, { now = Date.now, maxReadBytes = 4 * 1024 * 1024, maxLineBytes = 1024 * 1024 } = {}) {
+  constructor(
+    file,
+    { now = Date.now, maxReadBytes = 4 * 1024 * 1024, maxLineBytes = 1024 * 1024, stableVolume = macVolume } = {},
+  ) {
     if (
+      typeof stableVolume !== "function" ||
       !Number.isSafeInteger(maxReadBytes) ||
       maxReadBytes < 1 ||
       maxReadBytes > 16 * 1024 * 1024 ||
@@ -48,6 +91,8 @@ export class RelayQueue {
       throw fail("INVALID_QUEUE_LIMIT");
     mkdirSync(path.dirname(path.resolve(file)), { recursive: true, mode: 0o700 });
     this.now = now;
+    this.stableVolume = stableVolume;
+    this.prefixes = new Map();
     this.maxReadBytes = maxReadBytes;
     this.maxLineBytes = maxLineBytes;
     this.closed = false;
@@ -60,6 +105,10 @@ export class RelayQueue {
           path TEXT PRIMARY KEY, device TEXT NOT NULL, inode TEXT NOT NULL, offset INTEGER NOT NULL,
           anchor_start INTEGER NOT NULL, anchor_hash TEXT NOT NULL, discard_line INTEGER NOT NULL,
           last_size INTEGER NOT NULL, updated_at INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS relay_source_proofs(
+          path TEXT PRIMARY KEY, volume TEXT NOT NULL, device TEXT NOT NULL, inode TEXT NOT NULL,
+          owner TEXT NOT NULL, offset INTEGER NOT NULL, prefix_hash TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS relay_messages(
           seq INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT UNIQUE NOT NULL, sender TEXT NOT NULL,
@@ -133,9 +182,47 @@ export class RelayQueue {
       let discard = prior
         ? prior.discard_line === 1
         : initialOffset === "tail" && size > 0 && readBytes(fd, size - 1, 1)[0] !== 10;
+      let volume = null;
+      try {
+        volume = this.stableVolume(absolute, file);
+      } catch {
+        /* Unavailable identity preserves strict device checks. */
+      }
+      if (typeof volume !== "string" || !/^apfs:[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(volume))
+        volume = null;
+      const proof = this.db.prepare("SELECT * FROM relay_source_proofs WHERE path=?").get(absolute);
+      const remounted = prior && prior.device !== String(file.dev);
+      if (volume && proof && proof.volume !== volume) throw fail("RELAY_QUEUE_CHANGED");
       if (prior) {
-        if (`${prior.device}:${prior.inode}` !== identity(file) || size < offset) throw fail("RELAY_QUEUE_CHANGED");
+        if (prior.inode !== String(file.ino) || size < offset) throw fail("RELAY_QUEUE_CHANGED");
+        if (
+          remounted &&
+          (!volume ||
+            !proof ||
+            proof.volume !== volume ||
+            proof.device !== prior.device ||
+            proof.inode !== prior.inode ||
+            proof.owner !== String(file.uid) ||
+            proof.offset !== offset)
+        )
+          throw fail("RELAY_QUEUE_CHANGED");
         if (digest(readBytes(fd, prior.anchor_start, offset - prior.anchor_start)) !== prior.anchor_hash)
+          throw fail("RELAY_QUEUE_CHANGED");
+      }
+      const cached = this.prefixes.get(absolute);
+      let prefix;
+      if (volume) {
+        prefix =
+          !remounted && cached?.identity === identity(file) && cached.offset === offset
+            ? cached.hash.copy()
+            : prefixHash(fd, offset);
+        if (
+          proof &&
+          proof.device === prior?.device &&
+          proof.inode === prior?.inode &&
+          proof.offset === offset &&
+          proof.prefix_hash !== prefix.copy().digest("hex")
+        )
           throw fail("RELAY_QUEUE_CHANGED");
       }
       const bytes = readBytes(fd, offset, Math.min(size - offset, this.maxReadBytes));
@@ -199,6 +286,8 @@ export class RelayQueue {
       if (!readBytes(fd, offset, end).equals(bytes.subarray(0, end))) throw fail("RELAY_QUEUE_CHANGED");
       if (prior && digest(readBytes(fd, prior.anchor_start, offset - prior.anchor_start)) !== prior.anchor_hash)
         throw fail("RELAY_QUEUE_CHANGED");
+      if (remounted && prefixHash(fd, offset).digest("hex") !== proof.prefix_hash) throw fail("RELAY_QUEUE_CHANGED");
+      const nextPrefix = prefix?.copy().update(bytes.subarray(0, end));
       const nextAnchor = anchor(fd, nextOffset);
       let current;
       try {
@@ -206,8 +295,13 @@ export class RelayQueue {
       } catch {
         throw fail("RELAY_QUEUE_CHANGED");
       }
-      if (identity(current) !== identity(file) || current.size < BigInt(nextOffset)) throw fail("RELAY_QUEUE_CHANGED");
-      return this.transaction(() => {
+      if (
+        identity(current) !== identity(file) ||
+        current.size < BigInt(nextOffset) ||
+        (volume && (current.uid !== file.uid || (current.mode & 0o022n) !== 0n))
+      )
+        throw fail("RELAY_QUEUE_CHANGED");
+      const report = this.transaction(() => {
         let inserted = 0,
           duplicates = 0;
         for (const { event, semanticIdentity } of events) {
@@ -255,6 +349,21 @@ export class RelayQueue {
             size,
             this.now(),
           );
+        if (volume)
+          this.db
+            .prepare(
+              "INSERT INTO relay_source_proofs VALUES(?,?,?,?,?,?,?) ON CONFLICT(path) DO UPDATE SET volume=excluded.volume,device=excluded.device,inode=excluded.inode,owner=excluded.owner,offset=excluded.offset,prefix_hash=excluded.prefix_hash",
+            )
+            .run(
+              absolute,
+              volume,
+              String(file.dev),
+              String(file.ino),
+              String(file.uid),
+              nextOffset,
+              nextPrefix.copy().digest("hex"),
+            );
+        else this.db.prepare("DELETE FROM relay_source_proofs WHERE path=?").run(absolute);
         return {
           inserted,
           duplicates,
@@ -264,6 +373,9 @@ export class RelayQueue {
           initializedAtTail: !prior && initialOffset === "tail",
         };
       });
+      if (nextPrefix) this.prefixes.set(absolute, { identity: identity(file), offset: nextOffset, hash: nextPrefix });
+      else this.prefixes.delete(absolute);
+      return report;
     } finally {
       closeSync(fd);
     }

@@ -44,3 +44,5 @@
 - Show available working chats and mark the selected one in the project card. A person should not need to memorize a title. Selecting a destination, saving a draft, and starting a goal are distinct actions.
 
 - A missing exact project name is not evidence that a conversational question refers to a nonexistent project. Resolve global scope and user intent first, read actual state, and keep unknown native activity distinct from idle work. Route external operations independently of a read-only chat answer.
+
+- A completed public assistant message can establish a project checkpoint before its enclosing turn ends. A trial round count is not a default stopping rule. Use verified progress to continue, preserve decisions and completed-step identity, and close only an acknowledged overall finish.

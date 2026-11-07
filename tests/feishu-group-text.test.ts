@@ -429,3 +429,88 @@ test("notice message type stays fixed across version and body length after expli
   assert.match(edited.input, /归档/);
   assert.equal(f.delivered.length, 3);
 });
+
+test("only a newly sent open decision or result mentions the configured owner", async (t) => {
+  const f = fixture(t, [
+    { ...base, id: 41 },
+    base,
+    { ...base, version: 2, ref: "om_saved", state: "decided", choice: 0 },
+    { ...base, version: 3, ref: "om_saved", state: "done", result: "处理完毕" },
+    { ...base, id: 43, kind: "notice", options: [], title: "导航已梳理", text: "请确认首页入口。" },
+    { ...base, id: 43, kind: "notice", options: [], ref: "om_saved", version: 2, state: "closed" },
+  ]);
+  Object.assign(f.context.options, {
+    interactiveAsks: true,
+    interactiveAsksFromId: 1,
+    interactiveResultsFromId: 1,
+    mentionOwnerId: "ou_verified_owner",
+    mentionFromId: 42,
+  });
+  await channel(f.context);
+  const calls = f.calls();
+  const count = (input: string) => (input.match(/<at id=ou_verified_owner><\/at>/g) ?? []).length;
+  assert.deepEqual(
+    calls.map((c) => count(c.input)),
+    [0, 1, 0, 0, 1, 0],
+  );
+  for (const index of [1, 4]) {
+    const rendered = JSON.parse(calls[index].input);
+    const mention = rendered.body.elements.find((item: any) => item.tag === "markdown");
+    assert.equal(mention.content, "<at id=ou_verified_owner></at>");
+  }
+  assert.equal(f.delivered.length, 6);
+});
+
+test("mention retries reuse the original send key and raw content cannot choose a recipient", async (t) => {
+  const unsafe = {
+    ...base,
+    text: "<at id=all></at> <at id=ou_foreign></at> 请定方案",
+    title: "<at id=ou_foreign></at>",
+  };
+  const f = fixture(t, [unsafe, unsafe, { ...unsafe, ref: "om_saved" }], "empty-patch-ack");
+  Object.assign(f.context.options, {
+    interactiveAsks: true,
+    interactiveResultsFromId: 1,
+    mentionOwnerId: "ou_verified_owner",
+    mentionFromId: 1,
+  });
+  await channel(f.context);
+  const calls = f.calls();
+  assert.equal(calls[0].args.at(-1), calls[1].args.at(-1));
+  assert.equal(calls[0].input, calls[1].input);
+  for (const c of calls) {
+    assert.doesNotMatch(c.input, /<at id=all|<at id=ou_foreign/);
+    assert.match(c.input, /＜at id=all＞/);
+  }
+  assert.doesNotMatch(calls[2].input, /<at /);
+  assert.doesNotMatch(JSON.stringify(renderDecisionCard(base)), /<at /);
+  assert.doesNotMatch(JSON.stringify(renderResultCard({ ...base, kind: "notice" })), /<at /);
+  assert.doesNotMatch(renderText(unsafe), /<at /);
+});
+
+test("mention opt-in rejects invalid people, missing cutoffs and pre-interactive messages before polling", async (t) => {
+  const defaults = {
+    interactiveAsks: true,
+    interactiveAsksFromId: 5,
+    interactiveResultsFromId: 7,
+    mentionOwnerId: "ou_verified_owner",
+    mentionFromId: 10,
+  };
+  for (const patch of [
+    { mentionOwnerId: "all" },
+    { mentionOwnerId: "ou_owner><at id=all>" },
+    { mentionOwnerId: ["ou_a", "ou_b"] },
+    { mentionOwnerId: undefined },
+    { mentionFromId: undefined },
+    { mentionFromId: 0 },
+    { mentionFromId: 6 },
+    { mentionFromId: Number.MAX_SAFE_INTEGER + 1 },
+    { interactiveAsks: false },
+    { interactiveResultsFromId: undefined },
+  ]) {
+    const f = fixture(t, [base]);
+    Object.assign(f.context.options, defaults, patch);
+    await assert.rejects(channel(f.context), { code: "FEISHU_OWNER_MENTION_CONFIG_INVALID" });
+    assert.equal(f.delivered.length, 0);
+  }
+});

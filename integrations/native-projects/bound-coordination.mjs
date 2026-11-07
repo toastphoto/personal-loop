@@ -2,7 +2,14 @@
 import { readFileSync } from "node:fs";
 import { queueBoundChat, inspectBoundChat } from "./bound-chat.mjs";
 import { readBoundProgress, runEphemeralCoordinator } from "./ephemeral-coordinator.mjs";
-import { captureProgress, coordinatedPrompt, coordinatedResult } from "./coordinated-work.mjs";
+import {
+  captureProgress,
+  coordinatedPrompt,
+  coordinatedResult,
+  planFingerprint,
+  continuationTimer,
+  decisionAlreadyMade,
+} from "./coordinated-work.mjs";
 import { failure } from "./catalog.mjs";
 import { redact } from "./project-activity.mjs";
 const minute = 60000;
@@ -19,8 +26,16 @@ const readyText = (goal, stage, canAsk) =>
             "」。这只说明选择了这个办法，不代表资料已补齐、访问已恢复或权限已扩大；请先重新核实。",
         ]
       : []),
+    ...(stage.decisions?.length
+      ? [
+          "本目标此前已经确认的决定：" +
+            stage.decisions.map((d) => "关于「" + d.question + "」，选了「" + d.chosen + "」").join("；") +
+            "。这些选择继续有效，不重复询问同一问题；如需另一个重大取舍，说明新的问题。",
+        ]
+      : []),
     "请接着这条对话已有的进展，" + stage.plan.nextStep + "。预期交付：" + stage.plan.expectedResult + "。",
-    "这次先核对现有资料，简短回复结论和下一步。已有工作不用重做；涉及改文件、启动服务、联网或对外操作，请等本人另行确认。",
+    "按已明确目标自行决定可逆细节。本轮只完成本次已分派的一个可检查功能、页面或阶段，形成结果就用公开进展消息简短说明成果和下一步。遇到必须由本人决定的关键取舍，立即提出并结束当前阶段等待回答，不要等整项目完成才问。其它已明确且互不依赖的工作由大肥鱼继续安排。",
+    "按本目标与这条原对话已确认的范围推进。目标是讨论或核对时保持对应范围；本人已明确要求实施时，可逆的本地实现和测试由你自行完成。已有工作不用重做；重大方向或范围变更、外部发布或承诺、不可逆数据操作和缺少真实授权时再请本人决定。保持原对话的权限设置，不自行扩大权限。",
     "缺资料、权限、负责人或验收口径时，先在允许范围内查已有依据、试可行替代。正常执行和已有复查预约可以安静等待。只有本人的一个具体帮助才能解除阻塞时，请主动写「需要你协助：」加具体问题，下一行「已核对：」简述查过什么、哪一步因此做不了；需要找其他人时请本人协调，不自行联系，避免在群里索取密码或私密原件。",
     ...(canAsk
       ? [
@@ -98,7 +113,7 @@ export async function runBoundStage(
   deps,
 ) {
   guard();
-  if (stage.role === "router") {
+  if (stage.role === "router" || stage.role === "router-review") {
     if (config.providers?.codex?.allowConversationPreview !== true) throw failure("BOUND_PREVIEW_DISABLED");
     const primary = await (deps.readBoundProgress ?? readBoundProgress)({
       catalog,
@@ -127,7 +142,14 @@ export async function runBoundStage(
     });
     let parsed;
     try {
-      parsed = coordinatedResult(done.text, { stage, goalId, runId, remaining, subject });
+      parsed = coordinatedResult(done.text, {
+        stage,
+        goalId,
+        runId,
+        remaining,
+        subject,
+        untilDone: goal.maxSteps === null,
+      });
     } catch (e) {
       if (e.code !== "COORDINATOR_INVALID_RESULT") throw e;
       return {
@@ -150,6 +172,12 @@ export async function runBoundStage(
     }
     return {
       ...parsed,
+      ...(stage.role === "router-review" && {
+        coordinator: {
+          ...parsed.coordinator,
+          reviewSource: { plan: stage.plan, reply: stage.reply, turnId: stage.previousTurn },
+        },
+      }),
       state: "completed",
       evidence,
       originalText: done.text,
@@ -158,13 +186,19 @@ export async function runBoundStage(
     };
   }
   const inspect = stage.role === "bound-observe";
+  if (!inspect && !stage.answerCard && stage.completedStepHashes?.includes(planFingerprint(stage.plan)))
+    throw failure("COORDINATOR_REPEATED_STEP");
   const now = Date.now();
-  const canAsk = remaining > 0 && !stage.chosen;
+  const canAsk = remaining > 0 && (goal.maxSteps === null || !stage.chosen);
   const handoff = inspect
     ? stage.handoff
     : {
         requestId: "native-run:" + executionKey,
         text: readyText(goal, stage, canAsk),
+        plan: stage.plan,
+        ...(stage.chosen ? { chosen: stage.chosen } : {}),
+        ...(stage.chosenQuestion ? { chosenQuestion: stage.chosenQuestion } : {}),
+        ...(stage.decisions?.length ? { decisions: stage.decisions } : {}),
         canAsk,
         threadId: binding.threadId,
         checks: 0,
@@ -181,9 +215,13 @@ export async function runBoundStage(
   });
   const meta = {
     role: inspect ? "bound-observe" : "worker",
+    ...(stage.plan ? { plan: stage.plan } : {}),
     runId,
     threadId: binding.threadId,
     transportStatus: found.status,
+    ...(stage.chosen ? { chosen: stage.chosen } : {}),
+    ...(stage.chosenQuestion ? { chosenQuestion: stage.chosenQuestion } : {}),
+    ...(stage.decisions?.length ? { decisions: stage.decisions } : {}),
   };
   const summary = (text, body, extra) => ({
     state: "completed",
@@ -205,6 +243,25 @@ export async function runBoundStage(
     // An observation row does not use a model round. A genuine answer must still have budget to resume.
     const request = ownerRequest(raw);
     const hasBudget = remaining + (inspect ? 1 : 0) > 0;
+    if (
+      goal.maxSteps === null &&
+      request?.decision &&
+      decisionAlreadyMade(stage.decisions, request.decision.title, request.decision.options)
+    ) {
+      return summary(
+        "这个问题已记录本人的选择，等待核对继续方式。",
+        {
+          notice: [
+            {
+              key: "bound-repeat-" + handoff.requestId,
+              title: "原对话重复询问已决定的问题",
+              text: "已有选择已保留，请核对是否出现新的条件。",
+            },
+          ],
+        },
+        { action: "attention", turnId: found.turnId },
+      );
+    }
     if (handoff.canAsk === true && hasBudget && request?.decision) {
       const ask = {
         ...request.decision,
@@ -233,6 +290,22 @@ export async function runBoundStage(
     }
     const chars = Array.from(raw);
     const text = chars.length <= 1600 ? raw : chars.slice(0, 1560).join("") + "…\n其余内容可在原对话查看。";
+    if (goal.maxSteps === null) {
+      const timer = continuationTimer(goalId, runId, "review");
+      return summary(
+        "原对话已完成一个步骤，正在核对目标下一步。",
+        { later: [timer] },
+        {
+          action: "review-progress",
+          timer,
+          completedStepFingerprint: planFingerprint(stage.plan),
+          turnId: found.turnId,
+          reply: text,
+          plan: stage.plan,
+          ...(stage.chosen ? { chosen: stage.chosen } : {}),
+        },
+      );
+    }
     return summary(
       "原对话已回复这次交接。",
       { notice: [{ key: "bound-result-" + handoff.requestId, title: "原对话的处理结果", text }] },

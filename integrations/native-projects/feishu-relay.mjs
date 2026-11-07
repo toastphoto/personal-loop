@@ -23,6 +23,8 @@ import { interpretSemanticQuery, answerSemanticChat } from "./semantic-query.mjs
 import { projectPortfolioStatus } from "./portfolio-status.mjs";
 import { conversationContext } from "./conversation-context.mjs";
 import { BoundProgressNotices } from "./bound-progress-notices.mjs";
+import { CheckpointDecisionCards } from "./checkpoint-decision-card.mjs";
+import { settleCompletedGoals } from "./goal-completion.mjs";
 
 export function acceptsCommand(event, config) {
   return (
@@ -187,7 +189,7 @@ export class FeishuLoopRelay {
         action: "enable",
         target: projectKey,
         objective,
-        maxSteps: 3,
+        maxSteps: prior && prior.objective === objective ? prior.maxSteps : null,
         expectedRevision: before.revision,
         ...(threadId && { expectedThreadId: threadId }),
       },
@@ -422,6 +424,13 @@ async function main() {
   const native = readConfig(config.nativeConfigFile);
   const catalog = createCatalog(native);
   const controls = new LoopControls(native.controlsFile);
+  const checkpointCards =
+    config.proactiveNotices?.enabled &&
+    config.proactiveNotices?.checkpoints &&
+    config.proactiveNotices?.checkpointStateFile &&
+    !process.argv.includes("--once")
+      ? new CheckpointDecisionCards({ configFile: file, config, nativeConfig: native, execute: runProgram })
+      : null;
   const queue = new RelayQueue(config.databaseFile);
   const runtime = native.loopHub
     ? new NativeLoopRuntime({ nativeConfig: native, configFile: config.nativeConfigFile, controls })
@@ -443,7 +452,8 @@ async function main() {
         runtime,
         semanticQuery: (q, opts) => interpretSemanticQuery(q, { ...opts, command: native.managedCodex.command }),
         answerChat: (q, opts) => answerSemanticChat(q, { ...opts, command: native.managedCodex.command }),
-        portfolio: (opts) => projectPortfolioStatus({ ...opts, nativeConfig: native, controls, catalog }),
+        portfolio: (opts) =>
+          projectPortfolioStatus({ ...opts, nativeConfig: native, controls, catalog, checkpointCards }),
         activity:
           config.projectActivity?.enabled === true
             ? new ProjectActivity(catalog, { ...config.projectActivity, boundChats: native.managedCodex?.boundChats })
@@ -454,6 +464,7 @@ async function main() {
         queue: callbackQueue,
         controller: cards,
         execute: runProgram,
+        checkpointCards,
         answerDecisionClick: runtime ? (args) => runtime.answerDecisionClick(args) : undefined,
       });
     } catch (error) {
@@ -492,9 +503,18 @@ async function main() {
   const noReply = process.argv.includes("--no-reply");
   const notices =
     runtime && !once && !noReply && config.proactiveNotices?.enabled
-      ? new BoundProgressNotices({ configFile: file, config, nativeConfig: native, runtime })
+      ? new BoundProgressNotices({
+          configFile: file,
+          config,
+          nativeConfig: native,
+          runtime,
+          onCheckpoint: checkpointCards ? (event) => checkpointCards.deliver(event) : undefined,
+        })
       : null;
   const statusFile = config.statusFile;
+  let nextCompletionCheck = 0,
+    completionPending = false;
+  const settledControls = new Map();
   const record = (value) => {
     if (!statusFile) return;
     mkdirSync(path.dirname(statusFile), { recursive: true, mode: 0o700 });
@@ -513,6 +533,32 @@ async function main() {
     do {
       try {
         notices?.pulse();
+        if (
+          runtime &&
+          Date.now() >= nextCompletionCheck &&
+          (completionPending ||
+            controls
+              .list()
+              .some(
+                (c) =>
+                  c.maxSteps === null &&
+                  (c.mode === "active" ||
+                    (c.mode === "manual" &&
+                      c.actor === "goal-completion" &&
+                      settledControls.get(c.projectKey) !== c.revision)),
+              ))
+        ) {
+          const settled = await settleCompletedGoals({
+            nativeConfig: native,
+            configFile: config.nativeConfigFile,
+            controls,
+            runtime,
+          });
+          completionPending = settled.some((s) => s.status === "sync-pending");
+          for (const s of settled)
+            if (s.status === "completed") settledControls.set(s.projectKey, controls.get(s.projectKey).revision);
+          nextCompletionCheck = Date.now() + 5000;
+        }
         const callbackState = callbackRelay ? await callbackRelay.tick() : undefined;
         record({
           status: "ready",

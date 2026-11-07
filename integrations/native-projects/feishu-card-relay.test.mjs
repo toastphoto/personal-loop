@@ -148,3 +148,56 @@ test("owner decision clicks reach the hub once with actual message binding, sepa
   assert.equal(queue.get("cb_3").state, "ignored");
   assert.equal(queue.get("cb_4").state, "ignored");
 });
+
+test("checkpoint choices use the verified callback envelope and their own persistent service exactly once", async (t) => {
+  const dir = mkdtempSync(path.join(tmpdir(), "checkpoint-relay-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const file = path.join(dir, "events");
+  writeFileSync(file, "");
+  const queue = new RelayQueue(path.join(dir, "q.db"));
+  t.after(() => queue.close());
+  const called = [];
+  const relay = new FeishuCardRelay(
+    { ...config, queuePath: file },
+    {
+      queue,
+      controller: {
+        handle() {
+          throw Error("checkpoint sent to project controls");
+        },
+      },
+      execute() {
+        throw Error("checkpoint service owns its patch");
+      },
+      checkpointCards: {
+        async handle(args) {
+          called.push(args);
+          return { ok: true, status: "queued" };
+        },
+      },
+    },
+  );
+  const data = {
+    eventId: "checkpoint-event",
+    cardMessageId: "om_checkpoint",
+    host: "im_message",
+    actionTag: "button",
+    actionValue: JSON.stringify({ personalLoopCheckpoint: 1, id: "a".repeat(40), version: 1, choice: 1 }),
+  };
+  const e = {
+    message_id: "cb_checkpoint",
+    sender_id: "ou_owner",
+    sender_type: "user",
+    chat_id: "oc_group",
+    message_type: "card_action",
+    content: JSON.stringify(data),
+  };
+  appendFileSync(file, JSON.stringify(e) + "\n" + JSON.stringify(e) + "\n");
+  await relay.tick();
+  await relay.tick();
+  assert.equal(called.length, 1);
+  assert.equal(called[0].choice, 1);
+  assert.equal(called[0].messageId, "om_checkpoint");
+  assert.equal(called[0].actor, "ou_owner");
+  assert.equal(queue.get("cb_checkpoint").state, "replied");
+});

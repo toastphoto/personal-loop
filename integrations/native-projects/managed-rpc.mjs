@@ -18,6 +18,7 @@ const methods = new Set([
   "thread/queue/add",
   "thread/resume",
   "thread/turns/list",
+  "thread/items/list",
   "turn/start",
   "turn/interrupt",
 ]);

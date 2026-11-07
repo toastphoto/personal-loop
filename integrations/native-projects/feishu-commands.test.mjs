@@ -61,7 +61,7 @@ test("explicit Chinese commands parse without interpreting task text", () => {
     action: "enable",
     target: "C-abcd",
     objective: "检查 $(anything) 与原始资料",
-    maxSteps: 3,
+    maxSteps: null,
   });
   assert.deepEqual(parseLoopCommand("/loop 启用 C-abcd | 一个目标 | 步数 5"), {
     action: "enable",
@@ -132,7 +132,7 @@ test("same-name projects report ambiguity and allow a unique short ID", async (t
   assert.equal(selected.projectKey, b.key);
   assert.equal(ctx.controls.get(a.key).mode, "manual");
 });
-test("enable requires a goal, finite budget, native control and deployed rule readiness", async (t) => {
+test("enable requires a goal, an explicit valid limit when supplied, native control and deployed rule readiness", async (t) => {
   const ctx = setup(t);
   assert.equal((await handleLoopCommand({ action: "enable", target: a.key }, ctx)).code, "OBJECTIVE_REQUIRED");
   assert.equal(
@@ -675,4 +675,27 @@ test("an explicit card control revision cannot overwrite a newer owner decision"
   assert.equal(result.code, "CONTROL_REVISION_CHANGED");
   assert.equal(env.controls.get(a.key).mode, "paused");
   assert.equal(env.controls.get(a.key).revision, 1);
+});
+
+test("default completion mode survives status and resume, and old numbered request replay keeps its original limit", async (t) => {
+  const ctx = setup(t);
+  const out = await handleLoopCommand({ action: "enable", target: a.key, objective: "完成目标" }, ctx);
+  assert.equal(out.ok, true);
+  assert.equal(ctx.controls.get(a.key).maxSteps, null);
+  assert.match(out.text, /持续到目标完成，可随时暂停/);
+  const status = await handleLoopCommand({ action: "status", target: a.key }, ctx);
+  assert.equal(status.view.project.maxSteps, null);
+  assert.match(status.text, /持续到目标完成/);
+  await handleLoopCommand({ action: "pause", target: a.key }, { ...ctx, requestId: "pause-default" });
+  const resumed = await handleLoopCommand({ action: "resume", target: a.key }, { ...ctx, requestId: "resume-default" });
+  assert.equal(resumed.ok, true);
+  assert.equal(ctx.controls.get(a.key).maxSteps, null);
+  const old = setup(t);
+  await handleLoopCommand({ action: "enable", target: a.key, objective: "旧目标", maxSteps: 3 }, old);
+  const data = old.controls.read();
+  for (const r of Object.values(data.requests)) delete r.budgetIntent;
+  old.controls.save(data);
+  const replay = await handleLoopCommand({ action: "enable", target: a.key, objective: "旧目标", maxSteps: null }, old);
+  assert.equal(replay.ok, true);
+  assert.equal(old.controls.get(a.key).maxSteps, 3);
 });

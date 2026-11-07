@@ -313,7 +313,7 @@ test("goal draft form binds submit to the exact session and revision without a m
   assert.equal(steps.name, "max_steps");
   assert.deepEqual(
     steps.options.map((o) => o.value),
-    ["1", "3", "5", "10"],
+    ["until-done", "1", "3", "5", "10"],
   );
   assert.equal(steps.initial_option, "5");
   const submit = tagged(form, "button")[0];
@@ -672,4 +672,27 @@ test("saving a card suggestion leaves a single obvious next action to start that
   p.draft = { objective: "旧稿目标", maxSteps: 1, revision: 1 };
   assert.equal(intentButtons(show(), "start")[0].text.content, "检查已存草稿");
   assert.equal(intentButtons(show(), "use-goal-suggestion").length, 1);
+});
+
+test("new forms select goal completion by default and carry explicit null through review and resume", () => {
+  const fresh = controlledProject();
+  const form = renderProjectCard(view([fresh]), { screen: "goal", alias: fresh.alias }, mutationContext);
+  const select = tagged(form, "select_static")[0];
+  assert.equal(select.initial_option, "until-done");
+  assert.equal(select.options[0].value, "until-done");
+  assert.match(select.options[0].text.content, /持续到目标完成，可随时暂停/);
+  const p = controlledProject({
+    mode: "paused",
+    objective: "把选定目标做完",
+    maxSteps: null,
+    canResume: true,
+    canStart: true,
+    draft: { objective: "新的目标", maxSteps: null, revision: 1 },
+  });
+  for (const screen of ["confirm-start", "confirm-resume"]) {
+    const card = renderProjectCard(view([p]), { screen, alias: p.alias }, mutationContext);
+    assert.match(JSON.stringify(card), /持续到目标完成，可随时暂停/);
+    assert.doesNotMatch(JSON.stringify(card), /null 轮|最多 null|自动运行上限 null/);
+    assert.ok(actions(card).includes(screen === "confirm-start" ? "confirm-start" : "confirm-resume"));
+  }
 });

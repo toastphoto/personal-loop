@@ -357,6 +357,7 @@ export async function projectPortfolioStatus({
   provider,
   now = Date.now(),
   timeoutMs = 2400,
+  checkpointCards,
 }) {
   if (!supported.has(focus) || (provider && !Object.hasOwn(providers, provider)))
     throw Error("Unsupported portfolio query");
@@ -372,6 +373,17 @@ export async function projectPortfolioStatus({
     if (!["enabled", "paused"].includes(focus)) hub = hubStatus(nativeConfig, projects, now, focus);
   } catch {
     /* An unavailable state store cannot establish zero work. */
+  }
+  let checkpointIncomplete = false;
+  if (checkpointCards && ["waiting", "decisions", "overview"].includes(focus)) {
+    try {
+      const checkpoint = await checkpointCards.pending({ timeoutMs: Math.min(timeoutMs, 2500) });
+      checkpointIncomplete = checkpoint.complete !== true;
+      if (hub)
+        for (const key of checkpoint.projectKeys) if (projects.has(key)) hub.decisions.add(projects.get(key).label);
+    } catch {
+      checkpointIncomplete = true;
+    }
   }
   const show = (what, names) => {
     if (names.size) lines.push(what + "：" + list([...names]));
@@ -399,7 +411,7 @@ export async function projectPortfolioStatus({
     );
   } else if (focus === "decisions" || focus === "waiting") {
     if (hub.decisions.size) show("待你拍板", hub.decisions);
-    else lines.push("大肥鱼当前没有待你拍板的问题。");
+    else if (!checkpointIncomplete) lines.push("大肥鱼当前没有待你拍板的问题。");
   } else if (focus === "review") {
     const reviews = [...hub.review].sort((a, b) => a[1] - b[1]);
     lines.push(
@@ -421,6 +433,7 @@ export async function projectPortfolioStatus({
     }
     if (enabled.length) lines.push("已启用自动推进：" + list(enabled));
   }
+  if (checkpointIncomplete) lines.push("还有阶段确认卡的状态暂未核实完整。");
   if (["running", "queued", "overview"].includes(focus)) {
     const sources = Object.keys(nativeConfig?.providers ?? {}).filter(
       (s) =>

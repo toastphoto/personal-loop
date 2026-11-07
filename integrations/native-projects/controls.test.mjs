@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync, readFileSync } from "node:fs";
 import { execFileSync, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
@@ -38,7 +38,7 @@ test("resume is explicit and a stale decision cannot undo a newer pause", (t) =>
   );
   assert.equal(store.set("p", "active", { actor: "owner", expectedRevision: 2 }).mode, "active");
 });
-test("enable requires a goal and a finite step budget", (t) => {
+test("enable requires a goal and rejects an invalid explicit step budget", (t) => {
   const { store } = setup(t);
   assert.throws(() => store.set("p", "active", { actor: "owner" }), /OBJECTIVE_REQUIRED/);
   assert.throws(
@@ -116,4 +116,34 @@ test("a verified project display name is retained for offline pause lookup", (t)
   const { store } = setup(t);
   store.set("codex:local:p", "paused", { actor: "owner", projectName: "Example Project" });
   assert.equal(store.get("codex:local:p").projectName, "Example Project");
+});
+
+test("new goals explicitly default to completion-driven work while resume retains the existing limit", (t) => {
+  const { store, file } = setup(t);
+  const first = store.set("p", "active", {
+    actor: "owner",
+    objective: "Finish the selected goal",
+    requestId: "new-goal",
+  });
+  assert.equal(first.maxSteps, null);
+  assert.equal(JSON.parse(readFileSync(file, "utf8")).projects.p.maxSteps, null);
+  store.set("p", "paused", { actor: "owner" });
+  assert.equal(store.set("p", "active", { actor: "owner" }).maxSteps, null);
+  store.set("p", "manual", { actor: "owner" });
+  store.set("p", "active", { actor: "owner", objective: "Older bounded goal", maxSteps: 5 });
+  store.set("p", "paused", { actor: "owner" });
+  assert.equal(store.set("p", "active", { actor: "owner" }).maxSteps, 5);
+  store.set("p", "manual", { actor: "owner" });
+  assert.equal(store.set("p", "active", { actor: "owner", objective: "Another new goal" }).maxSteps, null);
+});
+
+test("omitting the limit while pausing preserves it, while explicit null is a distinct request", (t) => {
+  const { store } = setup(t);
+  store.set("p", "active", { actor: "owner", objective: "Existing goal", maxSteps: 5 });
+  const paused = store.set("p", "paused", { actor: "owner", requestId: "pause-one" });
+  assert.equal(paused.maxSteps, 5);
+  assert.throws(() => store.set("p", "paused", { actor: "owner", requestId: "pause-one", maxSteps: null }), {
+    code: "CONTROL_REQUEST_ID_REUSED",
+  });
+  assert.equal(store.set("p", "paused", { actor: "owner", requestId: "pause-one" }).revision, paused.revision);
 });

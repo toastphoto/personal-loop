@@ -29,9 +29,7 @@ const goalValid = (goal) =>
   typeof goal?.objective === "string" &&
   goal.objective.trim().length > 0 &&
   goal.objective.length <= 1000 &&
-  Number.isSafeInteger(goal.maxSteps) &&
-  goal.maxSteps >= 1 &&
-  goal.maxSteps <= 100;
+  (goal.maxSteps === null || (Number.isSafeInteger(goal.maxSteps) && goal.maxSteps >= 1 && goal.maxSteps <= 100));
 // Confirmation must preserve the full goal, including line breaks, without creating markup.
 const goalMarkdown = (value) => String(value).replace(/[&<>*~\[\]()#:_`!\\|./=+-]/g, (c) => `&#${c.charCodeAt(0)};`);
 const goalPlain = (value) =>
@@ -231,7 +229,7 @@ function normalize(view) {
       ...(p.activity ? { activity: activityView(p.activity) } : {}),
       ...(p.provider === "codex" && p.chatPicker ? { chatPicker: pickerView(p.chatPicker) } : {}),
       ...(typeof p.objective === "string" && p.objective ? { objective: p.objective } : {}),
-      ...(Number.isSafeInteger(p.maxSteps) && p.maxSteps > 0 ? { maxSteps: p.maxSteps } : {}),
+      ...(p.maxSteps === null || (Number.isSafeInteger(p.maxSteps) && p.maxSteps > 0) ? { maxSteps: p.maxSteps } : {}),
       controlRevision: p.controlRevision ?? p.revision,
       ...(goalValid(p.goalSuggestion)
         ? { goalSuggestion: { objective: p.goalSuggestion.objective, maxSteps: p.goalSuggestion.maxSteps } }
@@ -772,9 +770,17 @@ function detail(v, navigation, context) {
 
   const details = [
     ...(p.objective ? [md(`**${p.mode === "manual" ? "上次目标" : "已设目标"}**\n${goalMarkdown(p.objective)}`)] : []),
-    ...(p.maxSteps ? [muted(`自动运行上限 ${p.maxSteps} 轮`)] : []),
+    ...(p.maxSteps === null
+      ? [muted("持续到目标完成，可随时暂停")]
+      : p.maxSteps
+        ? [muted(`自动运行上限 ${p.maxSteps} 轮`)]
+        : []),
     ...(p.draft?.objective ? [md(`**未启动的草稿**\n${goalMarkdown(p.draft.objective)}`)] : []),
-    ...(p.draft?.maxSteps ? [muted(`草稿上限 ${p.draft.maxSteps} 轮`)] : []),
+    ...(p.draft?.maxSteps === null
+      ? [muted("草稿将持续到目标完成，可随时暂停")]
+      : p.draft?.maxSteps
+        ? [muted(`草稿上限 ${p.draft.maxSteps} 轮`)]
+        : []),
     muted(escape(capability(p))),
     ...(p.controlReason ? [muted(escape(p.controlReason))] : []),
     ...commandHelp(p).elements,
@@ -800,7 +806,7 @@ function goalForm(v, navigation, context) {
     return detail(v, navigation, context);
   const validDraft = goalValid(p.draft);
   const choices = [1, 3, 5, 10];
-  if (validDraft && !choices.includes(p.draft.maxSteps)) choices.push(p.draft.maxSteps);
+  if (validDraft && p.draft.maxSteps !== null && !choices.includes(p.draft.maxSteps)) choices.push(p.draft.maxSteps);
   return rootCard("设置项目目标", plain(p.name, 80), [
     block(
       [
@@ -841,14 +847,17 @@ function goalForm(v, navigation, context) {
         {
           tag: "select_static",
           name: "max_steps",
-          placeholder: text("最多自动运行几轮"),
+          placeholder: text("推进方式"),
           required: true,
           width: "fill",
-          initial_option: String(validDraft ? p.draft.maxSteps : 3),
-          options: choices.map((n) => ({
-            text: text(`${n} 轮${[1, 3, 5, 10].includes(n) ? "" : "（当前）"}`),
-            value: String(n),
-          })),
+          initial_option: validDraft && p.draft.maxSteps !== null ? String(p.draft.maxSteps) : "until-done",
+          options: [
+            { text: text("持续到目标完成，可随时暂停"), value: "until-done" },
+            ...choices.map((n) => ({
+              text: text(`最多 ${n} 轮${[1, 3, 5, 10].includes(n) ? "" : "（当前）"}`),
+              value: String(n),
+            })),
+          ],
         },
         {
           tag: "button",
@@ -877,7 +886,7 @@ function confirmGoal(v, navigation, context, resume) {
       block(
         [
           md("**暂时不能确认启动**"),
-          muted(!permitted ? "项目控制未就绪 请返回项目刷新状态" : "请先保存完整目标和有效轮数 目标最多1000字"),
+          muted(!permitted ? "项目控制未就绪 请返回项目刷新状态" : "请先保存完整目标和推进方式 目标最多1000字"),
         ],
         true,
       ),
@@ -894,7 +903,7 @@ function confirmGoal(v, navigation, context, resume) {
   confirm.confirm = {
     title: text(resume ? "确认恢复原目标" : "确认启动这个目标"),
     text: text(
-      `${p.chatPicker?.current ? "工作对话 · " + plain(chatName(p.chatPicker.current), 140) + "\n\n" : ""}${goalPlain(goal.objective)}\n\n最多 ${goal.maxSteps} 轮${resume ? " · 不会重置已使用轮数" : ""}\n${capability(p)}`,
+      `${p.chatPicker?.current ? "工作对话 · " + plain(chatName(p.chatPicker.current), 140) + "\n\n" : ""}${goalPlain(goal.objective)}\n\n${goal.maxSteps === null ? "持续到目标完成，可随时暂停" : `最多 ${goal.maxSteps} 轮${resume ? " · 不会重置已使用轮数" : ""}`}\n${capability(p)}`,
     ),
   };
   return rootCard(resume ? "恢复前确认" : "启动前确认", plain(p.name, 80), [
@@ -908,8 +917,14 @@ function confirmGoal(v, navigation, context, resume) {
     ),
     block([
       md(goalMarkdown(goal.objective)),
-      md(`最多 ${goal.maxSteps} 轮`),
-      ...(resume ? [muted("恢复不会重置已使用轮数 不采用另存的新草稿")] : [muted("确认后才开始自动推进")]),
+      md(goal.maxSteps === null ? "持续到目标完成，可随时暂停" : `最多 ${goal.maxSteps} 轮`),
+      ...(resume
+        ? [
+            muted(
+              goal.maxSteps === null ? "继续原目标，不采用另存的新草稿" : "恢复不会重置已使用轮数 不采用另存的新草稿",
+            ),
+          ]
+        : [muted("确认后才开始自动推进")]),
     ]),
     row([column([confirm]), column([button(context, "返回项目", "detail", { alias: p.alias })])]),
   ]);

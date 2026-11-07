@@ -16,13 +16,13 @@ const event = (id, content = "/loop 项目", extra = {}) => ({
 });
 const line = (value) => JSON.stringify(value) + "\n";
 const filter = (value) => typeof value?.content === "string" && value.content.startsWith("/loop ");
-function setup(t, initial = "") {
+function setup(t, initial = "", options = {}) {
   const folder = mkdtempSync(path.join(tmpdir(), "relay-queue-"));
   const file = path.join(folder, "queue.ndjson");
   const dbFile = path.join(folder, "relay.db");
   writeFileSync(file, initial);
   let now = 1000;
-  const queue = new RelayQueue(dbFile, { now: () => now });
+  const queue = new RelayQueue(dbFile, { now: () => now, ...options });
   t.after(() => {
     queue.close();
     rmSync(folder, { recursive: true, force: true });
@@ -277,4 +277,99 @@ test("reply idempotency keys fit the platform limit even for a long message ID",
   const key = queue.pending()[0].deliveryKey;
   assert.match(key, /^plr-[0-9a-f]{40}$/);
   assert.ok(key.length <= 50);
+});
+
+// st_dev can change after an APFS remount. Only a previously recorded stable volume and full prefix can authorize recovery.
+const stableVolume = () => "apfs:11111111-2222-3333-4444-555555555555";
+function previousMount(queue) {
+  queue.db.exec("UPDATE relay_sources SET device='111'; UPDATE relay_source_proofs SET device='111'");
+}
+test("a verified remount continues from the old byte offset and preserves replies, including after restart", (t) => {
+  const f = setup(t, line(event("one")), { stableVolume });
+  f.queue.ingest(f.file, { initialOffset: 0, filter });
+  f.queue.saveResult("one", { ok: true }, "done");
+  f.queue.markReply("one", "om_result");
+  const old = f.queue.cursor(f.file).offset;
+  previousMount(f.queue);
+  f.queue.close();
+  appendFileSync(f.file, line(event("two")));
+  const q = new RelayQueue(f.dbFile, { stableVolume });
+  t.after(() => q.close());
+  const result = q.ingest(f.file, { filter });
+  assert.equal(result.inserted, 1);
+  assert.equal(q.get("one").state, "replied");
+  assert.deepEqual(
+    q.pending().map((x) => x.id),
+    ["two"],
+  );
+  assert.equal(q.cursor(f.file).offset, statSync(f.file).size);
+  assert.ok(q.cursor(f.file).offset > old);
+  assert.equal(q.source(f.file).device, String(statSync(f.file).dev));
+  assert.equal(q.db.prepare("SELECT offset FROM relay_source_proofs").get().offset, q.cursor(f.file).offset);
+});
+test("unknown volume, foreign volume, and missing pre-remount proof refuse rebinding", (t) => {
+  for (const reason of ["missing", "unknown", "foreign"]) {
+    const f = setup(t, line(event("one")), { stableVolume });
+    f.queue.ingest(f.file, { initialOffset: 0, filter });
+    previousMount(f.queue);
+    if (reason === "missing") f.queue.db.exec("DELETE FROM relay_source_proofs");
+    f.queue.close();
+    const q = new RelayQueue(f.dbFile, {
+      stableVolume:
+        reason === "unknown"
+          ? () => null
+          : reason === "foreign"
+            ? () => "apfs:99999999-2222-3333-4444-555555555555"
+            : stableVolume,
+    });
+    t.after(() => q.close());
+    const prior = q.cursor(f.file);
+    appendFileSync(f.file, line(event("two")));
+    assert.throws(() => q.ingest(f.file, { filter }), /RELAY_QUEUE_CHANGED/);
+    assert.deepEqual(q.cursor(f.file), prior);
+    assert.equal(q.get("two"), null);
+  }
+});
+test("remount proof checks the complete consumed prefix, not only the tail anchor", (t) => {
+  const original = line(event("old", "ordinary " + "x".repeat(800))) + line(event("one"));
+  const f = setup(t, original, { stableVolume });
+  f.queue.ingest(f.file, { initialOffset: 0, filter });
+  previousMount(f.queue);
+  writeFileSync(f.file, original.replace("ordinary", "Ordinary") + line(event("two")));
+  assert.throws(() => f.queue.ingest(f.file, { filter }), /RELAY_QUEUE_CHANGED/);
+  assert.equal(f.queue.get("two"), null);
+});
+test("a recovered device and proof roll back together when a new event conflicts", (t) => {
+  const f = setup(t, line(event("one")), { stableVolume });
+  f.queue.ingest(f.file, { initialOffset: 0, filter });
+  previousMount(f.queue);
+  const before = f.queue.cursor(f.file);
+  appendFileSync(f.file, line(event("one", "/loop 项目", { sender_id: "different" })));
+  assert.throws(() => f.queue.ingest(f.file, { filter }), /MESSAGE_ID_CONFLICT/);
+  assert.deepEqual(f.queue.cursor(f.file), before);
+  assert.equal(f.queue.db.prepare("SELECT device FROM relay_source_proofs").get().device, "111");
+});
+
+test("remount recovery rechecks the old prefix after parsing and will not adopt a changed volume without a remount", (t) => {
+  const original = line(event("old", "ignored " + "x".repeat(800))) + line(event("one"));
+  const f = setup(t, original, { stableVolume });
+  f.queue.ingest(f.file, { initialOffset: 0, filter });
+  previousMount(f.queue);
+  const cursor = f.queue.cursor(f.file);
+  appendFileSync(f.file, line(event("two")));
+  assert.throws(
+    () =>
+      f.queue.ingest(f.file, {
+        filter: (e) => {
+          writeFileSync(f.file, (original + line(event("two"))).replace("ignored", "Ignored"));
+          return filter(e);
+        },
+      }),
+    /RELAY_QUEUE_CHANGED/,
+  );
+  assert.deepEqual(f.queue.cursor(f.file), cursor);
+  const g = setup(t, line(event("one")), { stableVolume });
+  g.queue.ingest(g.file, { initialOffset: 0, filter });
+  g.queue.stableVolume = () => "apfs:99999999-2222-3333-4444-555555555555";
+  assert.throws(() => g.queue.ingest(g.file, { filter }), /RELAY_QUEUE_CHANGED/);
 });
