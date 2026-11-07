@@ -251,3 +251,7 @@ Apple M5 Pro、24 GB、Node 24.21.0。写入逐条提交，事务落盘后才应
 </details>
 
 [MIT License](LICENSE)
+
+## Personal Loop 原生项目接入
+
+本 fork 新增 [Codex / Multica / DeepSeek 原生连接器](integrations/native-projects/README.md)与项目级选择、暂停机制。所有项目默认仅查看；当前可用读接口、控制能力限制和真实验收状态均在该说明中区分。未自动部署飞书改造或启用无人值守业务。

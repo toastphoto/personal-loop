@@ -16,15 +16,16 @@
     "agent-autoloop": "bin/agent-autoloop.ts"
   },
   "scripts": {
-    "test": "node --disable-warning=ExperimentalWarning --test tests/*.test.ts",
-    "test:quick": "node --disable-warning=ExperimentalWarning --test $(ls tests/*.test.ts | grep -v /simulation.test.ts)",
+    "test": "node --disable-warning=ExperimentalWarning --test tests/*.test.ts integrations/*/*.test.mjs",
+    "test:quick": "node --disable-warning=ExperimentalWarning --test $(ls tests/*.test.ts | grep -v /simulation.test.ts) integrations/*/*.test.mjs",
     "typecheck": "tsc -p .",
-    "format": "prettier --write \"**/*.{ts,json,yml}\"",
-    "format:check": "prettier --check \"**/*.{ts,json,yml}\"",
+    "format": "prettier --write \"**/*.{ts,mjs,json,yml}\"",
+    "format:check": "prettier --check \"**/*.{ts,mjs,json,yml}\"",
     "test:sim": "node --disable-warning=ExperimentalWarning sim/random.ts 24301 20000",
     "test:deep": "node --disable-warning=ExperimentalWarning --test --test-concurrency=1 sim/*.test.ts",
     "test:nightly": "npm run test:deep && node --disable-warning=ExperimentalWarning scripts/benchmark.ts --check",
-    "benchmark": "node --disable-warning=ExperimentalWarning scripts/benchmark.ts --check"
+    "benchmark": "node --disable-warning=ExperimentalWarning scripts/benchmark.ts --check",
+    "test:native": "node --disable-warning=ExperimentalWarning --test integrations/*/*.test.mjs"
   },
   "devDependencies": {
     "@types/node": "26.6.4",

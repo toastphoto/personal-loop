@@ -62,6 +62,7 @@ for (const [files, expected] of [
   [["README.en.md", "INSTALL.md", "SECURITY.md", "CONTRIBUTING.md", "AGENTS.md", "LICENSE"], "docs"],
   [["docs/protocol.md", ".github/pull_request_template.md"], "docs"],
   [["docs/plugins.md"], "normal"],
+  [["integrations/native-projects/catalog.mjs"], "normal"],
   [["worker/worker.ts", "cli/main.ts", "host/up.ts", "plugins/feishu/channel.ts", "tests/http.test.ts"], "normal"],
   [
     ["examples/recipes/x/README.md", "skills/agent-autoloop/SKILL.md", "scripts/x.sh", "install.sh", "bin/x.ts"],

@@ -1,0 +1,10 @@
+# This bundle adds one service inside the existing Desktop Host; it never boots a second Host.
+- insert:
+    - id: personal-loop-native-metadata
+      name: "@personal-loop/dsh-native-bridge"
+      config:
+        socketPath: !!js process.env.HOME + '/.local/run/personal-loop-dsh/native.sock'
+        requestTimeoutMs: 3000
+        maxMessageBytes: 16384
+        maxResponseBytes: 2097152
+        maxClients: 8

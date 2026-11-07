@@ -105,6 +105,7 @@ function agentEnvironment(entry: Entry) {
     ...env,
     AGENT_AUTOLOOP_HOME: HOME,
     AGENT_AUTOLOOP_RUN: String(entry.run),
+    AGENT_AUTOLOOP_ATTEMPT: String(entry.attempt),
     AGENT_AUTOLOOP_CONTEXT: path.join(entry.dir, "context.json"),
   };
 }
