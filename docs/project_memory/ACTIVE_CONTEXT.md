@@ -26,4 +26,7 @@ Handoffs are now incremental: only the initial message repeats the goal and comm
 
 The actual owner form submission is now verified: one real callback, matching saved/native input, completed original reply. The temporary trial hold has been released through the normal resume control, preserving the original goal; a new step is actually running in the same chat with a 275-character handoff. Cold start was explicitly deferred and is not accepted based merely on a wake request. Parent private evidence: work/form-cold-live-20261108/verified-result.json.
 
-新的交付要求（2026-11-08）：本人要在飞书打开实际成果，不能只有一两句卡片摘要。网页阶段需可访问测试预览，桌面阶段需真实截图/短录屏，文档需可阅读成品；说明能做什么、请看哪里、已接通/示例/未验、必要选择与推荐、下一步。以完整用户流程为汇报节点。当前通知实现仍主要是短摘要，自动产物收集、授权目标发布/上传和手机可访问验证尚未补齐，不能把本条规则写入记忆当作链路已上线。公司项目最新桥接记录仍是离线工程证据；新功能未见真实画面时应如实说明，不用旧图或概念图替代。
+新的交付要求（2026-11-08）：本人要在飞书打开实际成果，不能只有一两句卡片摘要。网页阶段需可访问测试预览，桌面阶段需真实截图/短录屏，文档需可阅读成品；说明能做什么、请看哪里、已接通/示例/未验、必要选择与推荐、下一步。以完整用户流程为汇报节点。第一轮预览交付实测结果见下段；自动调度集成与手机实测仍分别验收。
+
+
+2026-11-08 预览交付实测：沿公司项目原对话完成共享卡→本人草稿→执行前检查的合成连续预览；最终版本13项程序检查通过，协调者在本机主Chrome实点正常链路、核默认折叠与真实截图。前版缺项拦截/补齐重试及400px布局有浏览器记录。本版发布到独立owner-private测试Site，已将链接、2张真实截图、能力边界和@本人作为富文本发原飞书群，并官方读回。线上浏览器复核连接超时，真实手机与登录访问尚待验；不称真实后端/模型/安装版已接通。临时派发暂停已正常恢复，原目标/原聊天保持，控制revision14、goalRevision9；状态易变须重查。私有证据work/preview-delivery-20261108/。可复用发送器已补，但本轮托管、浏览器QA由协调者完成，不等于无人值守自动发布已接通。
