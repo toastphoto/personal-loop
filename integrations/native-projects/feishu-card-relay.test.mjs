@@ -201,3 +201,60 @@ test("checkpoint choices use the verified callback envelope and their own persis
   assert.equal(called[0].actor, "ou_owner");
   assert.equal(queue.get("cb_checkpoint").state, "replied");
 });
+
+test("decision form submits actual reply once; empty help and wrong actors never reach the hub", async (t) => {
+  const dir = mkdtempSync(path.join(tmpdir(), "help-form-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const queuePath = path.join(dir, "events");
+  const queue = new RelayQueue(path.join(dir, "q.db"));
+  t.after(() => queue.close());
+  const received = [];
+  const relay = new FeishuCardRelay(
+    { ...config, queuePath },
+    {
+      queue,
+      controller: {
+        handle() {
+          throw Error("unexpected navigation");
+        },
+      },
+      answerDecisionClick: async (a) => {
+        received.push(a);
+        return { ok: true };
+      },
+    },
+  );
+  const event = (id, reply, actor = "ou_owner") =>
+    JSON.stringify({
+      message_id: id,
+      sender_id: actor,
+      sender_type: "user",
+      chat_id: "oc_group",
+      message_type: "card_action",
+      content: JSON.stringify({
+        eventId: id,
+        host: "im_message",
+        cardMessageId: "om_actual",
+        actionTag: "button",
+        actionName: "pldecision_10_1_help",
+        actionValue: "",
+        formValue: JSON.stringify({ reply }),
+      }),
+    });
+  writeFileSync(
+    queuePath,
+    [
+      event("form1", "请先排查现有环境"),
+      event("form1", "请先排查现有环境"),
+      event("form2", ""),
+      event("form3", "别人的内容", "ou_other"),
+    ].join("\n") + "\n",
+  );
+  await relay.tick();
+  await relay.tick();
+  assert.equal(received.length, 1);
+  assert.equal(received[0].answerText, "请先排查现有环境");
+  assert.equal(received[0].choice, 0);
+  assert.equal(received[0].cardId, 10);
+  assert.equal(queue.get("form2").state, "ignored");
+});

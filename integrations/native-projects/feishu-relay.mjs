@@ -5,7 +5,7 @@ import { fileURLToPath } from "node:url";
 import { createCatalog, readConfig } from "./factory.mjs";
 import { LoopControls } from "./controls.mjs";
 import { RelayQueue } from "./relay-queue.mjs";
-import { parseLoopCommand, handleLoopCommand } from "./feishu-commands.mjs";
+import { parseLoopCommand, handleLoopCommand, projectAlias } from "./feishu-commands.mjs";
 import { failure, safeError } from "./catalog.mjs";
 import { NativeLoopRuntime } from "./loop-runtime.mjs";
 import { startLoopHub } from "./hub-host.mjs";
@@ -259,6 +259,84 @@ export class FeishuLoopRelay {
       result.text = `收到，我先看「${name}」的进展，再按目标往下做。需要你决定时，我会在这里给选项和建议。`;
     return result;
   }
+  async continueProject(item, alias, guard) {
+    const routing = guard();
+    const native = readConfig(this.config.nativeConfigFile);
+    const directory = await this.catalog.readProvider("codex");
+    guard();
+    const matches = directory.projects.filter((p) => projectAlias(p) === alias);
+    if (directory.complete !== true || matches.length !== 1) throw failure("DIRECT_GOAL_SCOPE_CHANGED");
+    const project = matches[0],
+      binding = native.managedCodex?.boundChats?.[project.key];
+    const opted = routing.directGoalProjects?.find(
+      (p) => p.projectKey === project.key && Date.parse(p.enabledAt) <= Number(item.event.create_time),
+    );
+    if (
+      !opted ||
+      !binding ||
+      project.capabilities?.queueBound !== true ||
+      !this.canCoordinate(project.key, binding.threadId) ||
+      !this.cards?.enabled?.()
+    )
+      throw failure("DIRECT_GOAL_SCOPE_CHANGED");
+    const before = this.controls.get(project.key);
+    if (before.mode === "active")
+      return {
+        ok: true,
+        action: "continue-project",
+        changed: false,
+        text: `「${project.name}」仍在按原目标推进，无需再确认目标。普通细节由大肥鱼处理；需要你的回复会留在原问题卡片中。`,
+        contextAlias: alias,
+        contextTopic: "project",
+      };
+    const action = before.mode === "paused" ? "resume" : "enable";
+    const check = () => {
+      guard();
+      const current = readConfig(this.config.nativeConfigFile).managedCodex?.boundChats?.[project.key];
+      if (JSON.stringify(current) !== JSON.stringify(binding)) throw failure("DIRECT_GOAL_SCOPE_CHANGED");
+    };
+    const result = await handleLoopCommand(
+      {
+        action,
+        target: project.key,
+        expectedRevision: before.revision,
+        expectedThreadId: binding.threadId,
+        ...(action === "enable"
+          ? {
+              objective:
+                commandText(item.event) +
+                "。沿原对话的最新进展和已授权范围接着推进，不重做已交付成果；普通可逆细节自行决定，重大取舍或确实需要本人补充的信息再问。",
+              maxSteps: null,
+            }
+          : {}),
+      },
+      {
+        catalog: {
+          refresh: async () => {
+            check();
+            return { complete: true, projects: [project] };
+          },
+        },
+        controls: this.controls,
+        actor: item.event.sender_id,
+        requestId: item.requestId,
+        readiness: async (p) => {
+          const ready = await this.readiness(p);
+          check();
+          return ready;
+        },
+        syncRules: this.syncRules,
+      },
+    );
+    return {
+      ...result,
+      contextAlias: alias,
+      contextTopic: "project",
+      ...(result.ok
+        ? { text: `收到，沿「${project.name}」的原对话继续。普通细节自行处理，阶段成果或重大决定再 @你。` }
+        : {}),
+    };
+  }
   // Read-only conversations can finish independently, including two questions about the same project.
   // Project control mutations still pass through the guarded command path.
   async handleConversation(item, routing, route) {
@@ -294,6 +372,7 @@ export class FeishuLoopRelay {
         guard,
         signal: this.naturalAbort.signal,
       });
+      if (result.action === "continue-project") result = await this.continueProject(item, result.targetAlias, guard);
       const current = guard();
       if (deferred) {
         const prior = readSemanticRoute(item.event, current);

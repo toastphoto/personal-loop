@@ -103,7 +103,7 @@ function requested(kind, action, target, projects, contextAlias, objective) {
 }
 
 function directoryRequest(text) {
-  const body = text.replace(/^(?:看看|看一下|查看|列出|列一下|显示)\s*/u, "");
+  const body = text.replace(/^(?:打开|看看|看一下|查看|列出|列一下|显示)\s*/u, "");
   return (
     /^(?:我(?:现在)?|现在|目前)?(?:有)?(?:哪些|什么)项目$/u.test(body) ||
     /^(?:我(?:的)?)?(?:所有|全部)?项目(?:列表|目录|清单)?$/u.test(body)

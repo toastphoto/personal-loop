@@ -77,3 +77,5 @@ For `integrations/native-projects/`, read [current context](docs/project_memory/
 Execution defaults follow upstream events, justified `later` checks and owner answers; do not add an hourly digest or a second scheduler. A confirmed-failure retry is a new bounded attempt, while retransmission of that attempt is idempotent. Preserve current goal/revision checks when replaying stored results.
 
 Default new goals to continuous advancement until verified overall completion. Preserve explicit numeric budgets and pause. Small authorized, reversible decisions belong to the coordinator; consequential decisions and genuine missing authority/input return to the owner. Treat message-level milestones as reported progress with source evidence, not proof of full business acceptance.
+
+Explicit continuation of an opted original project is authorization to proceed without another goal form. Missing information requires actual reply text; a selection never proves facts have changed. Preserve explicit submission, original-chat binding and separately verified queue, wake, execution and milestone states.

@@ -272,16 +272,16 @@ test("opt-in decision sends identify each option, keep the full label and omit c
   assert.equal(card.config.update_multi, true);
   assert.equal(card.config.enable_forward, false);
   for (const label of options) assert.ok(input.includes(label));
-  const buttons = card.body.elements.filter((element: { tag: string }) => element.tag === "button");
+  const form = card.body.elements.find((e: any) => e.tag === "form") as any;
+  const select = form.elements.find((e: any) => e.tag === "select_static");
+  assert.equal(select.initial_option, undefined);
   assert.deepEqual(
-    buttons.map((b: any) => b.behaviors),
-    options.map((_, choice) => [
-      { type: "callback", value: { personalLoopDecision: 1, card: 42, choice, version: 1 } },
-    ]),
+    select.options.map((v: any) => v.value),
+    ["0", "1", "2"],
   );
-  assert.equal(new Set(buttons.map((b: any) => b.text.content)).size, 3);
-  assert.ok(buttons.every((b: any) => b.text.content.length <= 100 && b.text.tag === "plain_text"));
-  assert.match(buttons[1].text.content, /建议/);
+  const submit = form.elements.find((e: any) => e.tag === "button");
+  assert.equal(submit.form_action_type, "submit");
+  assert.equal(submit.name, "pldecision_42_1_choice");
 });
 
 test("decided, done and closed decision cards patch the original and remove the choices", async (t) => {
@@ -349,11 +349,12 @@ test("recommendation names its actual option and explains why, while an opposite
   const suggestion = "建议选「前后端接口」：团队先约定数据格式，试用时更容易定位问题。";
   const opened = renderDecisionCard(question);
   const blocks = opened.body.elements.filter((e) => e.tag === "div").map((e: any) => e.text.content);
-  assert.deepEqual(blocks, [question.title, "两项准备都已梳理。", suggestion]);
+  assert.deepEqual(blocks, [question.title, "两项准备都已梳理。", suggestion, "1. 员工第一次使用", "2. 前后端接口"]);
   assert.ok(renderText(question).includes(suggestion));
-  const buttons = opened.body.elements.filter((e) => e.tag === "button");
-  assert.equal(buttons.length, 2);
-  assert.equal((buttons[0] as any).behaviors[0].value.choice, 0);
+  const form = opened.body.elements.find((e: any) => e.tag === "form") as any;
+  const select = form.elements.find((e: any) => e.tag === "select_static");
+  assert.equal(select.options.length, 2);
+  assert.equal(select.initial_option, undefined);
   for (const state of ["decided", "done"] as const) {
     const after = { ...question, state, choice: 0, result: state === "done" ? "首位员工上手清单已整理。" : null };
     for (const content of [JSON.stringify(renderDecisionCard(after)), renderText(after)]) {
@@ -513,4 +514,29 @@ test("mention opt-in rejects invalid people, missing cutoffs and pre-interactive
     await assert.rejects(channel(f.context), { code: "FEISHU_OWNER_MENTION_CONFIG_INVALID" });
     assert.equal(f.delivered.length, 0);
   }
+});
+
+test("help requests require typed information and explicit submission without recommending a false confirmation", () => {
+  const card = renderDecisionCard({ ...base, options: ["我已处理，重新核实", "先暂停此目标"], recommend: 0 });
+  const form = card.body.elements.find((v: any) => v.tag === "form") as any;
+  assert.ok(form);
+  assert.equal(form.elements.find((v: any) => v.tag === "input").required, true);
+  assert.match(form.elements.find((v: any) => v.tag === "button").name, /^pldecision_/);
+  assert.doesNotMatch(JSON.stringify(card), /建议选「我已处理|我已处理，重新核实（建议）/);
+});
+
+test("a new FYI checkpoint mentions the owner even though the hub marks it closed at creation", () => {
+  const c = {
+    ...base,
+    kind: "notice" as const,
+    state: "closed" as const,
+    options: [],
+    title: "本人项目指令",
+    text: "「示例项目」原对话报告：共享检查已完成。",
+    link: null,
+  };
+  const sent = JSON.stringify(renderResultCard(c, "ou_verified_owner"));
+  assert.match(sent, /<at id=ou_verified_owner>/);
+  assert.match(sent, /示例项目 · 阶段进展/);
+  assert.doesNotMatch(JSON.stringify(renderResultCard({ ...c, ref: "om_saved" }, "ou_verified_owner")), /<at /);
 });

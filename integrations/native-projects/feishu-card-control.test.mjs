@@ -530,3 +530,54 @@ test("until-done form selection persists explicit null and starts the same pinne
   assert.equal(f.controls.get(project.key).maxSteps, null);
   assert.equal(f.controls.get(project.key).mode, "active");
 });
+
+test("opening the project directory succeeds even when semantic inference is unavailable", async (t) => {
+  const f = fixture(t);
+  f.store.verifyCallback(f.controller.scope);
+  f.controller.semanticQuery = async () => {
+    throw Error("semantic must not block explicit directory browsing");
+  };
+  const result = await f.controller.natural(
+    { requestId: "open-directory", event: { sender_id: "ou_owner", chat_id: "oc_group" } },
+    "打开项目目录",
+    { deferred: true, guard() {} },
+  );
+  assert.ok(result.response.card);
+  assert.equal(f.controls.list().length, 0);
+});
+
+test("a semantic project request stays in its project card without dispatching or changing controls", async (t) => {
+  const f = fixture(t);
+  f.store.verifyCallback(f.controller.scope);
+  const text = "这个项目没有要我决定的就继续推进";
+  f.controller.semanticQuery = async () => ({
+    kind: "proposal",
+    action: "goal",
+    alias: projectAlias(project),
+    objective: text,
+  });
+  const r = await f.controller.natural(
+    { requestId: "project-request", event: { sender_id: "ou_owner", chat_id: "oc_group" } },
+    text,
+    { deferred: true, guard() {} },
+  );
+  assert.ok(r.response.card);
+  assert.equal(r.delegateLegacy, undefined);
+  assert.ok(JSON.stringify(r.response.card).includes(text));
+  assert.equal(f.controls.list().length, 0);
+});
+
+test("an explicit exact-project continue request bypasses both the model and the second confirmation card", async (t) => {
+  const f = fixture(t);
+  f.controller.semanticQuery = async () => {
+    throw Error("no model needed");
+  };
+  const result = await f.controller.natural(
+    { requestId: "continue-existing", event: { sender_id: "ou_owner", chat_id: "oc_group" } },
+    "继续 Demo",
+    { deferred: false, guard() {} },
+  );
+  assert.equal(result.action, "continue-project");
+  assert.equal(result.targetAlias, projectAlias(project));
+  assert.equal(result.response, undefined);
+});

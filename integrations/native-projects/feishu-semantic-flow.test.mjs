@@ -139,3 +139,65 @@ test("a slow question does not hold up another answer or start the same question
   await f.relay.tick();
   assert.equal(f.asked.length, 2);
 });
+
+test("an opted original project can continue without a goal card; active continuation never duplicates it", async (t) => {
+  const { LoopControls } = await import("./controls.mjs");
+  const { projectAlias } = await import("./feishu-commands.mjs");
+  const f = fixture(t, () => ({ kind: "query", action: "projects" }));
+  const dir = path.dirname(f.cfg.queuePath),
+    file = path.join(dir, "native.json"),
+    controls = new LoopControls(path.join(dir, "controls.json"));
+  const project = {
+    key: "codex:local:p",
+    provider: "codex",
+    host: "local",
+    nativeId: "p",
+    name: "公司项目",
+    capabilities: { queueBound: true },
+  };
+  const binding = { threadId: "original", projectId: "p", root: "/project" };
+  writeFileSync(
+    file,
+    JSON.stringify({
+      version: 1,
+      providers: {},
+      controlsFile: controls.file,
+      managedCodex: { boundChats: { [project.key]: binding } },
+    }),
+  );
+  f.cfg.nativeConfigFile = file;
+  f.relay.config.nativeConfigFile = file;
+  f.relay.controls = controls;
+  f.relay.catalog = { readProvider: async () => ({ complete: true, projects: [project] }) };
+  f.relay.cards.enabled = () => true;
+  f.relay.canCoordinate = (k, id) => k === project.key && id === "original";
+  f.relay.readiness = async () => ({ ready: true, rulesReady: true });
+  let syncs = 0;
+  f.relay.syncRules = async () => {
+    syncs++;
+    return { ok: true };
+  };
+  const routing = { directGoalProjects: [{ projectKey: project.key, enabledAt: new Date(0).toISOString() }] };
+  const item = {
+    requestId: "explicit-continue",
+    event: {
+      sender_id: "ou_owner",
+      create_time: String(Date.now()),
+      content: "@大肥鱼 公司项目没有重大选择就继续",
+      mentions: [{ name: "大肥鱼", id: "ou_bot" }],
+    },
+  };
+  const result = await f.relay.continueProject(item, projectAlias(project), () => routing);
+  assert.equal(result.ok, true);
+  assert.equal(controls.get(project.key).mode, "active");
+  assert.equal(controls.get(project.key).expectedThreadId, "original");
+  assert.equal(syncs, 1);
+  await f.relay.continueProject(item, projectAlias(project), () => routing);
+  assert.equal(syncs, 1);
+  await assert.rejects(
+    f.relay.continueProject({ ...item, requestId: "unapproved" }, projectAlias(project), () => ({
+      directGoalProjects: [],
+    })),
+    { code: "DIRECT_GOAL_SCOPE_CHANGED" },
+  );
+});

@@ -137,3 +137,29 @@ test("a conversation can compare multiple chosen projects, preserve duplicate-na
     aliases: [],
   });
 });
+
+test("conditional continuation of a named project becomes a scoped proposal, never legacy dispatch", async () => {
+  const text = "内部提效还有需要我判断的吗？没有就继续推进，有需要再问我";
+  const r = await interpretSemanticQuery(text, opts({ intent: "project-request", projects: [1] }));
+  assert.deepEqual(r, { kind: "proposal", action: "goal", alias: cd.alias, objective: text });
+  const forged = await interpretSemanticQuery(
+    text,
+    opts({ intent: "project-request", projects: [1], objective: "different work" }),
+  );
+  assert.equal(forged.kind, "unavailable");
+});
+
+test("explicit conditional continuation is distinct from a new-goal proposal", async () => {
+  const r = await interpretSemanticQuery(
+    "内部提效没需要我判断就继续",
+    opts({ intent: "continue-project", projects: [1] }),
+  );
+  assert.deepEqual(r, { kind: "continuation", action: "continue", alias: cd.alias });
+});
+
+test("an erroneous model continuation cannot reverse an explicit do-not-continue instruction", async () => {
+  assert.equal(
+    (await interpretSemanticQuery("内部提效先别继续", opts({ intent: "continue-project", projects: [1] }))).kind,
+    "clarify",
+  );
+});

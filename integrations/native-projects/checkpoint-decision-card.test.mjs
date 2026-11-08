@@ -365,3 +365,13 @@ test("pending returns only delivered open and current source projects, and expos
     complete: false,
   });
 });
+
+test("checkpoint form text survives delivery and later duplicate clicks cannot replace it", async (t) => {
+  const f = fixture(t);
+  const { id } = await f.service.deliver(f.event);
+  await f.click(id, { choice: 1, answerText: "我希望保留当前项目资料入口" });
+  assert.ok(f.queues[0].text.includes("我希望保留当前项目资料入口"));
+  await f.click(id, { choice: 0, answerText: "另一条未提交的内容" });
+  assert.equal(f.queues.length, 1);
+  assert.ok(!f.queues[0].text.includes("另一条未提交的内容"));
+});

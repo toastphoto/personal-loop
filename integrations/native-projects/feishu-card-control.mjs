@@ -471,7 +471,13 @@ export class ProjectCardController {
       throw failure("CARD_SCOPE_MISMATCH");
     const contextAlias = semantic ? semantic.contextAlias : this.store.context(actor, chat);
     let intent = interpretProjectRequest(text, { view, contextAlias });
-    if (semantic && (semantic.deferred || ["help", "clarify"].includes(intent.kind))) {
+    if (semantic && intent.kind === "proposal" && intent.action === "resume" && intent.alias)
+      return { ok: true, action: "continue-project", targetAlias: intent.alias };
+    if (
+      semantic &&
+      !(intent.kind === "query" && intent.action === "projects") &&
+      (semantic.deferred || ["help", "clarify"].includes(intent.kind))
+    ) {
       const options = {
         view,
         contextAlias,
@@ -541,6 +547,10 @@ export class ProjectCardController {
                 ? "project"
                 : (semantic.contextTopic ?? "chat"),
         };
+      } else if (understood.kind === "continuation" && understood.action === "continue" && understood.alias) {
+        return { ok: true, action: "continue-project", targetAlias: understood.alias };
+      } else if (understood.kind === "proposal" && understood.action === "goal" && understood.alias) {
+        intent = understood;
       } else if (
         understood.kind === "query" &&
         ["portfolio", "pick-chat", "projects", "status"].includes(understood.action)

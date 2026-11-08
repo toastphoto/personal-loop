@@ -28,7 +28,7 @@ const filters = new Set(["overview", "running", "queued", "waiting", "enabled", 
 const unavailable = () => ({
   kind: "unavailable",
   action: null,
-  text: "我还没能确认你想查的范围。可以先打开项目目录，或者告诉我要看正在做的事、待你决定的事，还是某个项目的进展。",
+  text: "这次语言理解服务暂时没能完成处理。你可以打开项目目录；这条请求尚未执行。",
 });
 const clarify = (candidates = []) => ({
   kind: "clarify",
@@ -76,7 +76,7 @@ function decode(raw, projects, shown, text) {
     return intent === "external" ? { kind: "external", action: null } : { kind: "query", action: "projects" };
   }
   if (
-    !["status", "pick-chat", "clarify", "chat"].includes(intent) ||
+    !["status", "pick-chat", "clarify", "chat", "project-request", "continue-project"].includes(intent) ||
     !allowedKeys(data, ["intent", "projects", "provider"])
   )
     return unavailable();
@@ -100,6 +100,11 @@ function decode(raw, projects, shown, text) {
     return { kind: "chat", action: "talk", aliases: matches.map((m) => m.alias) };
   }
   if (intent === "clarify" || candidates.length !== 1) return clarify(candidates.slice(0, 5));
+  if (intent === "continue-project" && /(?:不要|暂不|先别|别再)(?:再|自动)?(?:继续|推进|恢复|执行)/u.test(text))
+    return clarify(candidates.slice(0, 5));
+  if (intent === "continue-project") return { kind: "continuation", action: "continue", alias: candidates[0].alias };
+  if (intent === "project-request")
+    return { kind: "proposal", action: "goal", alias: candidates[0].alias, objective: text };
   return { kind: "query", action: intent, alias: candidates[0].alias };
 }
 
@@ -146,6 +151,8 @@ export async function interpretSemanticQuery(
     '所有项目中的工作概况 → {"intent":"portfolio","filter":"overview"}。filters: running=当前在做/正在跑/有动静，queued=已经排队正在等执行，waiting=等本人选/有阻塞需拍板，enabled=哪些开启自动推进，paused=搁置/暂停自动推进，recent=最近做了什么，review=下一次何时回来复查或正在等复查哪些事，overview=全局进度汇总。只说“我的/手上有哪些/还有谁”一般是在问整体，例如“我有哪些项目在跑”是 portfolio/running，“还有谁在等我选”是 portfolio/waiting，不能把这类短语当作项目名。只有明确说到来源才可附 provider:codex|multica|dsh。',
     '打开目录、问有哪些项目 → {"intent":"projects"}；具体项目进展、状态或最近回复 → {"intent":"status","projects":[序号]}；选择原对话 → {"intent":"pick-chat"}，如明确项目可附 projects:[序号]。明确指名来源时可附 provider。若用户明确就多个项目问近况或要比较/建议/分析，返回 chat 加上这些项目序号，不要让用户任选一个。',
     '简称有一个清楚的对应可返回其序号。多种对应或问句不清楚 → {"intent":"clarify","projects":[候选序号]}，不能确定候选时 projects 为空。聊天、普通问答、追问、讨论方案、给建议、草拟几句在群里直接回答的问题 → {"intent":"chat","projects":[]}；针对已指明项目的分析、比较和讨论可列多个明确序号。history 是本群同一人的先前交谈，仅用于理解指代。只有明确委托外部执行的任务（例如登记工单、制作交付文件、发送或修改外部资源、要求启动或暂停）→ {"intent":"external"}；提到这些行为但只是讨论怎么办并不算外部执行。不要输出其它字段、真实结论或虚构序号。',
+    '优先规则：对目录中已有项目提出工作、继续推进或“先看有无需要我决定，没有就继续”等条件式要求，返回 {"intent":"project-request","projects":[唯一项目序号]}，由原项目控制入口核对范围，不归入 external，不另外建立工单。只输出项目序号，不编写目标或代用户决定。有歧义则 clarify。仅询问待决事项、不要求推进时仍是 status 或 chat。',
+    '继续规则：本人明确要求对已有项目接着做，或“没有需我拍板的就继续，重大决定再问我”，返回 {"intent":"continue-project","projects":[唯一项目序号]}。这不是新目标草稿，程序会核对已经授权的项目和原对话后续办。仅咨询是否应该继续、引用别人的话、否定继续不能使用此意图。',
     JSON.stringify(payload),
   ].join("\n");
   try {

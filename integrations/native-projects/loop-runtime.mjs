@@ -1,3 +1,4 @@
+import { requiresReply, validReply } from "../../plugins/feishu-group-text/decision-response.ts";
 import { DatabaseSync } from "node:sqlite";
 import { createHash, randomUUID } from "node:crypto";
 import { readFileSync, writeFileSync, renameSync, unlinkSync, lstatSync, existsSync, chmodSync } from "node:fs";
@@ -385,6 +386,8 @@ export class NativeLoopRuntime {
       const options = JSON.parse(card.options);
       if (!Array.isArray(options) || !options.every((x) => typeof x === "string") || click.choice >= options.length)
         return deny("LOOP_CARD_INPUT_INVALID");
+      if (requiresReply(options) && click.choice === 0 && !validReply(click.answerText))
+        return deny("LOOP_CARD_REPLY_REQUIRED");
       const delivery = get("deliveries", click.cardId + ":" + channel.name);
       if (
         click.version > card.version ||
@@ -476,6 +479,7 @@ export class NativeLoopRuntime {
       click.version < 1 ||
       !Number.isSafeInteger(click.choice) ||
       click.choice < 0 ||
+      (click.answerText !== undefined && click.answerText !== "" && !validReply(click.answerText)) ||
       ![click.profile, click.chatId, click.actor].every(
         (s) => typeof s === "string" && s.length > 0 && s.length <= 500,
       ) ||
@@ -514,6 +518,7 @@ export class NativeLoopRuntime {
       this.guard(checked.control.projectKey, checked.control);
       const applied = await channel.client.answer(click.cardId, {
         choice: click.choice,
+        ...(click.answerText?.trim() ? { text: click.answerText.trim() } : {}),
         by: click.actor,
         ref: click.messageId,
       });

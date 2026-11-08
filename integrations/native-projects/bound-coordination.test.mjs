@@ -584,3 +584,54 @@ test("continuous work keeps decision A across several steps, accepts a different
   assert.equal(repeated.parsed.ask, undefined);
   assert.equal(f.queuedText.length, 4);
 });
+
+test("continuous review retains final coverage evidence beyond the phone notice limit", async (t) => {
+  const f = fixture(t, null);
+  const initial = await f.run(1, [f.activeEvent]);
+  f.setQueue("completed");
+  const reply = "已核对入口。".repeat(350) + "结案复盘和管理后台归属也已核齐，无需新增决定。";
+  f.setReply(reply);
+  const step = await f.run(2, [{ type: "timer.due", subject: f.subject }], { timers: initial.parsed.later });
+  assert.equal(step.r.coordinator.action, "review-progress");
+  assert.equal(step.r.coordinator.reply, reply);
+  assert.equal(step.parsed.notice, undefined);
+});
+
+test("owner text attached to a selection is delivered to the same original handoff", async (t) => {
+  const f = fixture(t, 3);
+  const first = await f.run(1, [f.activeEvent]);
+  const dispatched = await f.run(2, [first.parsed.events[0]]);
+  f.setReply(chooseEntry);
+  f.setInspect("completed");
+  const checked = await f.run(3, [{ type: "timer.due", subject: f.subject }], { timers: dispatched.parsed.later });
+  const response = eventAnswered(checked.parsed.ask[0], 1);
+  response.answers[0].text = "我想先看卡片库，并允许先用已有样例";
+  await f.run(4, response.events, { answers: response.answers });
+  assert.equal(f.queuedText.length, 2);
+  assert.ok(f.queuedText[1].includes(response.answers[0].text));
+});
+
+test("a genuine free-text help answer resumes the original without claiming missing resources now exist", async (t) => {
+  const f = fixture(t, 3);
+  const first = await f.run(1, [f.activeEvent]);
+  const dispatched = await f.run(2, [first.parsed.events[0]]);
+  f.setReply("需要你协助：请补充测试环境说明\n已核对：目前只有旧记录，尚无新的入口。");
+  f.setInspect("completed");
+  const checked = await f.run(3, [{ type: "timer.due", subject: f.subject }], { timers: dispatched.parsed.later });
+  const response = eventAnswered(checked.parsed.ask[0], null);
+  response.answers[0].text = "我没有额外环境，请你先自行排查普通技术问题";
+  await f.run(4, response.events, { answers: response.answers });
+  assert.equal(f.queuedText.length, 2);
+  assert.ok(f.queuedText[1].includes(response.answers[0].text));
+  assert.doesNotMatch(f.queuedText[1], /刚刚选定了「我已处理/);
+});
+
+test("checking a queued original does not back off for minutes before noticing a finished step", async (t) => {
+  const f = fixture(t, 3);
+  const first = await f.run(1, [f.activeEvent]);
+  const queued = await f.run(2, [first.parsed.events[0]]);
+  assert.ok(Date.parse(queued.parsed.later[0].at) - Date.now() <= 60000);
+  const checked = await f.run(3, [{ type: "timer.due", subject: f.subject }], { timers: queued.parsed.later });
+  assert.ok(Date.parse(checked.parsed.later[0].at) - Date.now() <= 60000);
+  assert.equal(f.queuedText.length, 1);
+});

@@ -235,3 +235,11 @@ test(
     }
   },
 );
+
+test("ephemeral inference avoids the failing websocket retries without changing login or tool permissions", async (t) => {
+  const command = executable(
+    t,
+    `const a=process.argv.slice(2);for(const x of ['model_providers.loop-https.supports_websockets=false','model_providers.loop-https.requires_openai_auth=true','--ephemeral','read-only'])if(!a.includes(x))process.exit(2);console.log(${JSON.stringify(events("ok", {}))});`,
+  );
+  assert.equal((await runEphemeralCoordinator({ command, prompt: "check", classificationOnly: true })).text, "ok");
+});

@@ -76,6 +76,16 @@ const args = [
   "--ephemeral",
   "--ignore-user-config",
   "--ignore-rules",
+  "-c",
+  'model_provider="loop-https"',
+  "-c",
+  'model_providers.loop-https.name="OpenAI"',
+  "-c",
+  'model_providers.loop-https.wire_api="responses"',
+  "-c",
+  "model_providers.loop-https.requires_openai_auth=true",
+  "-c",
+  "model_providers.loop-https.supports_websockets=false",
   "--skip-git-repo-check",
   "--sandbox",
   "read-only",
@@ -129,6 +139,7 @@ export async function runEphemeralCoordinator({
     if (signal?.aborted) throw failure("EPHEMERAL_COORDINATOR_ABORTED");
   };
   checkAbort();
+  const startedAt = Date.now();
   const dir = await mkdtemp(path.join(tmpdir(), "personal-loop-planning-"));
   try {
     if (beforeStart) await beforeStart();
@@ -222,6 +233,17 @@ export async function runEphemeralCoordinator({
       });
       child.stdin.end(prompt);
     });
+  } catch (error) {
+    // Persist only operational metadata, never prompts, model output or credentials.
+    process.stderr.write(
+      JSON.stringify({
+        event: "ephemeral-coordinator-failed",
+        code: /^EPHEMERAL_COORDINATOR_[A-Z_]+$/.test(error?.code ?? "") ? error.code : "COORDINATOR_UNAVAILABLE",
+        elapsedMs: Date.now() - startedAt,
+        classificationOnly,
+      }) + "\n",
+    );
+    throw error;
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

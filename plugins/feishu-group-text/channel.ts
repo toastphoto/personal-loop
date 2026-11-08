@@ -3,6 +3,7 @@ import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import path from "node:path";
 import { setTimeout as wait } from "node:timers/promises";
+import { requiresReply } from "./decision-response.ts";
 import type { Card, ChannelContext } from "../../host/channels.ts";
 
 const problem = (code: string) => Object.assign(new Error(code), { code });
@@ -13,7 +14,9 @@ const personId = (value: unknown): value is string =>
 function ownerMention(card: Card, owner?: string): Record<string, unknown>[] {
   if (owner === undefined) return [];
   if (!personId(owner)) throw problem("FEISHU_OWNER_MENTION_CONFIG_INVALID");
-  return card.ref === null && card.state === "open" ? [{ tag: "markdown", content: `<at id=${owner}></at>` }] : [];
+  return card.ref === null && (card.state === "open" || card.kind === "notice")
+    ? [{ tag: "markdown", content: `<at id=${owner}></at>` }]
+    : [];
 }
 
 function clean(card: Card, value: string | null) {
@@ -23,6 +26,8 @@ function clean(card: Card, value: string | null) {
 }
 
 function heading(card: Card) {
+  if (card.state === "done" && /^(?:已排到原对话|交接状态待核实|原对话已接收)/u.test(card.result ?? ""))
+    return "回复已接收，任务继续中";
   return card.state === "open"
     ? card.kind === "ask"
       ? "待你决定"
@@ -37,7 +42,10 @@ function heading(card: Card) {
 function outcome(card: Card) {
   const chosen = card.choice === null ? card.answer : card.options[card.choice];
   return [
-    chosen ? `你的选择：${clean(card, chosen)}` : "",
+    chosen && card.choice !== null && !(requiresReply(card.options) && card.choice === 0 && card.answer)
+      ? `你的选择：${clean(card, chosen)}`
+      : "",
+    card.answer ? `你的回复：${clean(card, card.answer)}` : "",
     card.state === "decided" ? "决定已收到，尚未确认执行完成" : card.result ? `结果：${clean(card, card.result)}` : "",
   ].filter(Boolean);
 }
@@ -46,6 +54,7 @@ function outcome(card: Card) {
 function messageLines(card: Card): string[] {
   const body = clean(card, card.text);
   if (!body) return [];
+  if (requiresReply(card.options)) return [body.replace(/(?:^|\r?\n)推荐理由[：:][^\r\n]*$/u, "").trim()];
   if (card.kind !== "ask" || card.recommend === null) return [body];
   const option = card.options[card.recommend];
   const match = /(?:^|\r?\n)推荐理由[：:][ \t]*([^\r\n]+)$/u.exec(body.trimEnd());
@@ -85,26 +94,77 @@ export function renderDecisionCard(card: Card, owner?: string) {
     throw problem("INVALID_DECISION_CARD");
   const plain = (content: string) => ({ tag: "plain_text", content });
   const block = (content: string) => ({ tag: "div", text: plain(content) });
-  const elements: Record<string, unknown>[] = [...ownerMention(card, owner), block(clean(card, card.title))];
-  elements.push(...messageLines(card).map(block));
+  const helpRequest = requiresReply(card.options);
+  const title = helpRequest
+    ? clean(card, card.title)
+        .replace(/(?:处理好|补充|补齐)后再(?:点|选择)[\s\S]*$/u, "")
+        .trim()
+    : clean(card, card.title);
+  const elements: Record<string, unknown>[] = [...ownerMention(card, owner), block(title)];
+  const details = messageLines(card).map(block);
+  if (helpRequest && card.state === "open" && details.length)
+    elements.push({
+      tag: "collapsible_panel",
+      expanded: false,
+      header: { title: plain("查看已核对的情况") },
+      elements: details,
+    });
+  else elements.push(...details);
   if (card.state === "open") {
     if (card.options.length < 2 || card.options.length > 5) throw problem("CARD_OPTIONS_REQUIRED");
-    card.options.forEach((option, index) => {
-      const label = clean(card, option);
-      const number = index + 1;
-      const recommended = index === card.recommend;
-      const long = label.length > 24 || /[\r\n]/.test(label);
-      if (long) elements.push(block(`${number}. ${label}`));
+    const help = requiresReply(card.options);
+    if (!help) card.options.forEach((option, i) => elements.push(block(`${i + 1}. ${clean(card, option)}`)));
+    elements.push({
+      tag: "form",
+      name: "decision_form",
+      direction: "vertical",
+      elements: [
+        ...(!help
+          ? [
+              {
+                tag: "select_static",
+                name: "choice",
+                required: true,
+                width: "fill",
+                placeholder: plain("请选择，再点击发送"),
+                options: card.options.map((option, i) => ({
+                  text: plain(`${i + 1}. ${clean(card, option).slice(0, 65)}`),
+                  value: String(i),
+                })),
+              },
+            ]
+          : []),
+        {
+          tag: "input",
+          name: "reply",
+          label: plain(help ? "请在这里回复" : "补充说明（可选）"),
+          placeholder: plain(help ? "填写资料、说明困难，或告诉大肥鱼希望怎样处理" : "补充你的要求或理由"),
+          input_type: "multiline_text",
+          rows: 3,
+          max_length: 1000,
+          required: help,
+          width: "fill",
+        },
+        {
+          tag: "button",
+          name: `pldecision_${card.id}_${card.version}_${help ? "help" : "choice"}`,
+          form_action_type: "submit",
+          text: plain("发送回复并继续"),
+          type: "primary_filled",
+          width: "fill",
+        },
+      ],
+    });
+    if (help)
       elements.push({
         tag: "button",
-        text: plain(`${long ? `选择第 ${number} 项` : `${number}. ${label}`}${recommended ? "（建议）" : ""}`),
-        type: recommended ? "primary_filled" : "default",
+        text: plain("暂停这个目标"),
+        type: "default",
         width: "fill",
         behaviors: [
-          { type: "callback", value: { personalLoopDecision: 1, card: card.id, choice: index, version: card.version } },
+          { type: "callback", value: { personalLoopDecision: 1, card: card.id, choice: 1, version: card.version } },
         ],
       });
-    });
   } else elements.push(...outcome(card).map(block));
   return {
     schema: "2.0",
@@ -126,7 +186,8 @@ export function renderResultCard(card: Card, owner?: string) {
     throw problem("INVALID_RESULT_CARD");
   const plain = (content: string) => ({ tag: "plain_text", content });
   const block = (content: string) => ({ tag: "div", text: plain(content) });
-  const fullTitle = clean(card, card.title);
+  const checkpoint = /^「([^」\n]{1,100})」原对话报告：/u.exec(card.text);
+  const fullTitle = clean(card, checkpoint ? `${checkpoint[1]} · 阶段进展` : card.title);
   const chars = [...fullTitle];
   const title = chars.length <= 72 ? fullTitle : chars.slice(0, 71).join("") + "…";
   const body = [

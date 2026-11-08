@@ -1,3 +1,4 @@
+import { validReply } from "../../plugins/feishu-group-text/decision-response.ts";
 import { failure, safeError } from "./catalog.mjs";
 export function acceptsCardEvent(event, config) {
   return (
@@ -64,6 +65,27 @@ export class FeishuCardRelay {
         } catch {
           /* Navigation and form callbacks may have no value. */
         }
+        const checkpointForm = /^personalLoopCheckpoint_([a-f0-9]{40})_1_(help|choice)$/.exec(data.actionName ?? "");
+        if (checkpointForm) {
+          const form = JSON.parse(data.formValue ?? "null");
+          if (
+            !form ||
+            typeof form !== "object" ||
+            Array.isArray(form) ||
+            Object.keys(form).some((k) => !["choice", "reply"].includes(k)) ||
+            (form.reply !== undefined && form.reply !== "" && !validReply(form.reply)) ||
+            (checkpointForm[2] === "help" && !validReply(form.reply)) ||
+            (checkpointForm[2] === "choice" && !/^[0-4]$/.test(form.choice ?? ""))
+          )
+            throw failure("CARD_ACTION_INVALID");
+          action = {
+            personalLoopCheckpoint: 1,
+            id: checkpointForm[1],
+            version: 1,
+            choice: checkpointForm[2] === "help" ? 0 : Number(form.choice),
+            answerText: (form.reply ?? "").trim(),
+          };
+        }
         if (action && Object.hasOwn(action, "personalLoopCheckpoint")) {
           if (
             !this.checkpointCards ||
@@ -76,6 +98,7 @@ export class FeishuCardRelay {
             id: action.id,
             version: action.version,
             choice: action.choice,
+            ...(checkpointForm ? { answerText: action.answerText } : {}),
             actor: item.event.sender_id,
             chat: item.event.chat_id,
             messageId: data.cardMessageId,
@@ -85,6 +108,27 @@ export class FeishuCardRelay {
           if (!result?.ok) this.queue.discard(item.id, result?.code ?? "CARD_ACTION_INVALID");
           else this.queue.saveResult(item.id, { ok: true }, { type: "checkpoint-handled" });
           continue;
+        }
+        const formSubmit = /^pldecision_([1-9][0-9]*)_([1-9][0-9]*)_(help|choice)$/.exec(data.actionName ?? "");
+        if (formSubmit) {
+          const form = JSON.parse(data.formValue ?? "null");
+          if (
+            !form ||
+            typeof form !== "object" ||
+            Array.isArray(form) ||
+            Object.keys(form).some((k) => !["choice", "reply"].includes(k)) ||
+            (form.reply !== undefined && form.reply !== "" && !validReply(form.reply)) ||
+            (formSubmit[3] === "help" && !validReply(form.reply)) ||
+            (formSubmit[3] === "choice" && !/^[0-4]$/.test(form.choice ?? ""))
+          )
+            throw failure("CARD_ACTION_INVALID");
+          action = {
+            personalLoopDecision: 1,
+            card: Number(formSubmit[1]),
+            version: Number(formSubmit[2]),
+            choice: formSubmit[3] === "help" ? 0 : Number(form.choice),
+            answerText: (form.reply ?? "").trim(),
+          };
         }
         if (action && Object.hasOwn(action, "personalLoopDecision")) {
           if (
@@ -104,6 +148,7 @@ export class FeishuCardRelay {
           const result = await this.answerDecisionClick({
             cardId: action.card,
             choice: action.choice,
+            ...(formSubmit ? { answerText: action.answerText } : {}),
             version: action.version,
             actor: item.event.sender_id,
             messageId: data.cardMessageId,

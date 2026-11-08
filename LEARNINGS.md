@@ -46,3 +46,11 @@
 - A missing exact project name is not evidence that a conversational question refers to a nonexistent project. Resolve global scope and user intent first, read actual state, and keep unknown native activity distinct from idle work. Route external operations independently of a read-only chat answer.
 
 - A completed public assistant message can establish a project checkpoint before its enclosing turn ends. A trial round count is not a default stopping rule. Use verified progress to continue, preserve decisions and completed-step identity, and close only an acknowledged overall finish.
+
+- 2026-11-07: Do not apply a phone notice length limit to private coordinator evidence. A real navigation run repeatedly requested sections present after character 1600. Preserve bounded full evidence separately; explicit omissions are not missing business work. Regression covers the lost trailing coverage statement.
+
+- 2026-11-07｜语义服务超时不应说用户范围不清。明确只读目录不依赖模型；复杂自然语句保留语义路由，按实测时延设置期限并保留安全错误诊断。对已有项目的继续/条件式推进必须回到项目控制，不能分流成新Multica任务。源消息经本人/原群核验后，只修复原回复，不假造点击或启动证据。
+
+- 2026-11-08｜“缺资料”固定生成“已处理/暂停”并推荐前者，导致真人点选后没有资料、反复再问。改为填写回复后发送，选择不等于资源存在，普通工程排障先自行处理。已验证真实文字接回原对话；手机新表单提交待实测。
+- 2026-11-08｜先前只把45秒改180秒，没有解决慢。逐事件计时证实WebSocket连续超时后才切HTTPS；隔离子进程直接HTTPS约6秒，保留登录和权限，全局设置未改。
+- 2026-11-08｜阶段通知经source.tell创建时为closed/FYI，原发送层只对open加@导致真实漏提醒。首次notice也应@；已发送后更新不重复@。回执核对不应指数退避到半小时而拖慢下一步，已用原Hub的短预约核对。

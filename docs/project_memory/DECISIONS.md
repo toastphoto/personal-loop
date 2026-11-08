@@ -32,3 +32,5 @@
 
 - On 2026-11-07 the owner replaced the trial round cap with until-done defaults. Use explicit stage evidence and exact goals, decide minor reversible details within authorization, and ask for consequential scope/permission decisions. Keep pause and optional numeric caps.
 - Observe message-level checkpoints before a whole turn completes. Mention the verified owner only for new meaningful notices/decisions. Own-run decisions and independent source questions have separate durable routes; use exact identity to avoid duplicate asks.
+
+| 2026-11-08 | 明确继续按既有项目授权直接续办；缺资料用实际输入表单，不默认推荐已处理；普通技术问题先自主排查和推进独立工作 | 语义入口、问题卡与原对话接续 | 真人反馈、项目权限或绑定变更时重查 |

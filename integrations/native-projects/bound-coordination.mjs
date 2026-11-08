@@ -1,5 +1,6 @@
 // An explicit binding keeps the router off the sidebar. Only the user's designated thread receives work.
 import { readFileSync } from "node:fs";
+import { wakeQueuedBoundChat } from "./bound-wake.mjs";
 import { queueBoundChat, inspectBoundChat } from "./bound-chat.mjs";
 import { readBoundProgress, runEphemeralCoordinator } from "./ephemeral-coordinator.mjs";
 import {
@@ -19,18 +20,32 @@ const readyText = (goal, stage, canAsk) =>
   [
     "大肥鱼从飞书接到这个目标：" + goal.objective,
     ...(stage.chosen
-      ? [
-          (stage.chosenQuestion ? "关于「" + stage.chosenQuestion + "」，" : "") +
-            "你刚刚选定了「" +
-            stage.chosen +
-            "」。这只说明选择了这个办法，不代表资料已补齐、访问已恢复或权限已扩大；请先重新核实。",
-        ]
+      ? stage.answerText && stage.chosen === "我已处理，重新核实"
+        ? ["本人已补充回复，尚待核实，不表示缺项已解决。"]
+        : [
+            (stage.chosenQuestion ? "关于「" + stage.chosenQuestion + "」，" : "") +
+              "你刚刚选定了「" +
+              stage.chosen +
+              "」。这只说明选择了这个办法，不代表资料已补齐、访问已恢复或权限已扩大；请先重新核实。",
+          ]
       : []),
     ...(stage.decisions?.length
       ? [
           "本目标此前已经确认的决定：" +
-            stage.decisions.map((d) => "关于「" + d.question + "」，选了「" + d.chosen + "」").join("；") +
+            stage.decisions
+              .map(
+                (d) =>
+                  "关于「" + d.question + "」，选了「" + d.chosen + "」" + (d.reply ? "；本人补充：" + d.reply : ""),
+              )
+              .join("；") +
             "。这些选择继续有效，不重复询问同一问题；如需另一个重大取舍，说明新的问题。",
+        ]
+      : []),
+    ...(stage.answerText
+      ? [
+          "本人在卡片中实际填写的回复：" +
+            stage.answerText +
+            "。本人的最新回复优先于旧的执行安排，保留项目权限边界。先理解并核对这段回复，不把选项当资料已存在的证明；如果本人表示没有这些资料或让你自行处理，先排查可行替代和其他可做工作，不重复索要同一缺项。",
         ]
       : []),
     "请接着这条对话已有的进展，" + stage.plan.nextStep + "。预期交付：" + stage.plan.expectedResult + "。",
@@ -199,6 +214,7 @@ export async function runBoundStage(
         ...(stage.chosen ? { chosen: stage.chosen } : {}),
         ...(stage.chosenQuestion ? { chosenQuestion: stage.chosenQuestion } : {}),
         ...(stage.decisions?.length ? { decisions: stage.decisions } : {}),
+        ...(stage.answerText ? { answerText: stage.answerText } : {}),
         canAsk,
         threadId: binding.threadId,
         checks: 0,
@@ -300,7 +316,13 @@ export async function runBoundStage(
           timer,
           completedStepFingerprint: planFingerprint(stage.plan),
           turnId: found.turnId,
-          reply: text,
+          // Review evidence is private; the phone notice limit must not erase completed work.
+          reply:
+            chars.length <= 24000
+              ? raw
+              : chars.slice(0, 12000).join("") +
+                "\n[中间内容因上下文容量省略，不能据此认定功能缺失或要求重复执行]\n" +
+                chars.slice(-12000).join(""),
           plan: stage.plan,
           ...(stage.chosen ? { chosen: stage.chosen } : {}),
         },
@@ -312,11 +334,19 @@ export async function runBoundStage(
       { action: "deliver", turnId: found.turnId },
     );
   }
+  if (found.status === "queued" && now - handoff.submittedAt >= 15000) {
+    await wakeQueuedBoundChat({
+      config,
+      projectKey,
+      requestId: handoff.requestId,
+      text: handoff.text,
+      beforeMutation: guard,
+    }).catch(() => {});
+  }
   const checks = inspect ? handoff.checks + 1 : 0;
   const mismatch =
     found.status === "unknown" && ["BOUND_SCOPE_MISMATCH", "BOUND_MESSAGE_CONFLICT"].includes(found.code);
-  const terminal =
-    mismatch || found.status === "missing" || checks >= 48 || now - handoff.submittedAt >= 24 * 60 * minute;
+  const terminal = mismatch || found.status === "missing" || now - handoff.submittedAt >= 24 * 60 * minute;
   if (terminal) {
     const text = mismatch
       ? "原聊天的归属或交接记录与本次任务不一致，请核对项目卡上的工作对话。"
@@ -339,7 +369,8 @@ export async function runBoundStage(
   }
   const timer = {
     key: "bound-check-" + handoff.requestId,
-    at: new Date(now + Math.min(2 ** (checks + 1), 30) * minute).toISOString(),
+    // These are cheap receipt checks, not new model attempts or business retries.
+    at: new Date(now + Math.min(15 * 2 ** Math.min(checks, 2), 60) * 1000).toISOString(),
     about: `核对同一条原对话交接的回执（第 ${checks + 1} 次）`,
   };
   const note =

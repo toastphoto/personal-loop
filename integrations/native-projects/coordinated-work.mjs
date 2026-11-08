@@ -2,6 +2,7 @@
 import { closeSync, constants, fstatSync, openSync, readSync, realpathSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { createHash } from "node:crypto";
+import { requiresReply, validReply } from "../../plugins/feishu-group-text/decision-response.ts";
 import { ProjectActivity } from "./project-activity.mjs";
 import { failure } from "./catalog.mjs";
 const invalid = () => {
@@ -107,9 +108,15 @@ function decisionHistory(history) {
     const previous = result.find((v) => decisionKey(v.question, v.options) === decisionKey(d.question, d.options));
     if (previous) {
       if (previous.chosen !== d.chosen) invalid();
+      if (typeof d.reply === "string" && d.reply.trim()) previous.reply = d.reply.slice(0, 2000);
       return;
     }
-    result.push({ question: d.question, ...(d.options ? { options: [...d.options] } : {}), chosen: d.chosen });
+    result.push({
+      question: d.question,
+      ...(d.options ? { options: [...d.options] } : {}),
+      chosen: d.chosen,
+      ...(typeof d.reply === "string" && d.reply.trim() ? { reply: d.reply.slice(0, 2000) } : {}),
+    });
   };
   for (const step of history) {
     for (const d of step.decisions ?? step.handoff?.decisions ?? []) keep(d);
@@ -119,7 +126,12 @@ function decisionHistory(history) {
       (!step.chosenQuestion || step.chosenQuestion === lastAsk.title) &&
       lastAsk.options.includes(step.chosen)
     )
-      keep({ question: lastAsk.title, options: lastAsk.options, chosen: step.chosen });
+      keep({
+        question: lastAsk.title,
+        options: lastAsk.options,
+        chosen: step.chosen,
+        ...(step.answerText ? { reply: step.answerText } : {}),
+      });
     if (step.action === "ask" && step.ask?.title && Array.isArray(step.ask.options)) lastAsk = step.ask;
   }
   return result;
@@ -220,22 +232,30 @@ export function coordinatorStage({ history, context, goal, subject, completedSte
         a.about === ask.about &&
         a.title === ask.title &&
         JSON.stringify(a.options) === JSON.stringify(ask.options) &&
-        Number.isInteger(a.choice) &&
-        a.choice >= 0 &&
-        a.choice < a.options.length &&
+        ((Number.isInteger(a.choice) && a.choice >= 0 && a.choice < a.options.length) ||
+          (a.choice == null && requiresReply(a.options) && validReply(a.text))) &&
         context.events.some((e) => e.type === "card.answered" && e.id === "card:" + a.card),
     );
-    if (answers.length !== 1 || (goal.maxSteps === null && decisionAlreadyMade(decisions, ask.title, ask.options)))
+    if (
+      answers.length !== 1 ||
+      (goal.maxSteps === null && decisionAlreadyMade(decisions, ask.title, ask.options) && !answers[0].text?.trim())
+    )
       return null;
     const selectedDecision = {
       question: ask.title,
       options: [...ask.options],
-      chosen: answers[0].options[answers[0].choice],
+      chosen: answers[0].options[answers[0].choice ?? 0],
+      ...(typeof answers[0].text === "string" && answers[0].text.trim()
+        ? { reply: answers[0].text.trim().slice(0, 2000) }
+        : {}),
     };
     return {
       role: "worker",
       plan: prior.plan ?? plan,
-      chosen: answers[0].options[answers[0].choice],
+      chosen: answers[0].options[answers[0].choice ?? 0],
+      ...(typeof answers[0].text === "string" && answers[0].text.trim()
+        ? { answerText: answers[0].text.trim().slice(0, 2000) }
+        : {}),
       ...(goal.maxSteps === null && {
         answerCard: answers[0].card,
         ...known,
@@ -300,6 +320,7 @@ export function coordinatedPrompt({ stage, goal, cwd, file, remaining, packet })
           ]
         : []),
       ...(stage.previousPlan ? ["暂停前留下的未执行安排（资料）：" + JSON.stringify(stage.previousPlan)] : []),
+      "普通编译、调试、运行环境兼容、失败定位由你自主处理。在现有授权边界内先查实际错误、尝试可行替代测试方式，同时推进互不依赖的工作。不要把普通技术排障变成要求本人准备独立测试机器的前置条件；只有证实必须由本人控制的外部资料或资源且无可行替代，才具体请求补充。",
       "权限范围内的可逆小决定由你做。不要为了凑轮数、等待下一次消息或得到无关紧要的确认而停下来。只有方向/范围的大变更、不可逆或外部承诺、缺少实际授权或必要资料才交本人决定。",
       ...(stage.role === "router-review"
         ? [

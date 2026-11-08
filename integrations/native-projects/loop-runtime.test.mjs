@@ -754,3 +754,13 @@ test("only the same coordinator goal can answer its question after pause and res
   assert.equal((await f.click()).code, "LOOP_CARD_GOAL_CHANGED");
   assert.equal(f.sent.length, 1);
 });
+
+test("typed help replies are required and preserved with the selected card and real message", async (t) => {
+  const f = await decisionClickFixture(t, { options: ["我已处理，重新核实", "先暂停此目标"] });
+  assert.equal((await f.click({ choice: 0 })).code, "LOOP_CARD_REPLY_REQUIRED");
+  assert.equal(f.sent.length, 0);
+  const r = await f.click({ choice: 0, answerText: "我没有额外环境，请先在现有授权范围排查" });
+  assert.equal(r.ok, true);
+  assert.equal(f.sent[0].body.text, "我没有额外环境，请先在现有授权范围排查");
+  assert.equal(f.sent[0].body.choice, 0);
+});

@@ -6,8 +6,10 @@ import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { readConfig } from "./factory.mjs";
 import { queueBoundChat, inspectBoundChat } from "./bound-chat.mjs";
+import { wakeQueuedBoundChat } from "./bound-wake.mjs";
 import { readCheckpointItems, checkpointItemFingerprint } from "./checkpoint-source.mjs";
 import { renderDecisionCard, renderResultCard } from "../../plugins/feishu-group-text/channel.ts";
+import { validReply, requiresReply } from "../../plugins/feishu-group-text/decision-response.ts";
 import { redact } from "./project-activity.mjs";
 
 const fail = (code) => Object.assign(new Error(code), { code });
@@ -88,6 +90,13 @@ function privateDatabase(file, readonly = false) {
       db.exec(
         "PRAGMA synchronous=FULL; PRAGMA busy_timeout=1000; CREATE TABLE IF NOT EXISTS checkpoint_cards(id TEXT PRIMARY KEY,fingerprint TEXT NOT NULL,event_json TEXT NOT NULL,created_at INTEGER NOT NULL,ref TEXT,send_attempts INTEGER NOT NULL DEFAULT 0,send_first_at INTEGER,send_lease INTEGER NOT NULL DEFAULT 0,choice INTEGER,native_status TEXT,answer_lease INTEGER NOT NULL DEFAULT 0,state TEXT NOT NULL DEFAULT 'open',display_version INTEGER NOT NULL DEFAULT 1)",
       );
+      if (
+        !db
+          .prepare("PRAGMA table_info(checkpoint_cards)")
+          .all()
+          .some((c) => c.name === "answer_text")
+      )
+        db.exec("ALTER TABLE checkpoint_cards ADD COLUMN answer_text TEXT");
       if (
         !db
           .prepare("PRAGMA table_info(checkpoint_cards)")
@@ -358,7 +367,7 @@ export class CheckpointDecisionCards {
       options: e.options ?? [],
       recommend: e.recommend ?? null,
       choice: row.choice ?? null,
-      answer: null,
+      answer: row.answer_text ?? null,
       result: null,
       link: null,
     };
@@ -382,6 +391,8 @@ export class CheckpointDecisionCards {
       });
     const visit = (o) => {
       if (!o || typeof o !== "object") return;
+      if (o.tag === "button" && /^pldecision_/.test(o.name ?? ""))
+        o.name = `personalLoopCheckpoint_${row.id}_1_${o.name.endsWith("_help") ? "help" : "choice"}`;
       for (const b of o.behaviors ?? [])
         if (b.type === "callback" && b.value?.personalLoopDecision)
           b.value = { personalLoopCheckpoint: 1, id: row.id, version: 1, choice: b.value.choice };
@@ -483,6 +494,7 @@ export class CheckpointDecisionCards {
       click.version !== 1 ||
       !Number.isSafeInteger(click.choice) ||
       click.choice < 0 ||
+      (click.answerText !== undefined && click.answerText !== "" && !validReply(click.answerText)) ||
       !refOK(click.messageId)
     )
       return denied("CHECKPOINT_INPUT_INVALID");
@@ -514,6 +526,8 @@ export class CheckpointDecisionCards {
       } catch {
         return denied("CHECKPOINT_SCOPE_REVOKED");
       }
+      if (requiresReply(row.event.options) && click.choice === 0 && !validReply(click.answerText))
+        return denied("CHECKPOINT_REPLY_REQUIRED");
       if (row.state === "expired") return denied("CHECKPOINT_STALE");
       let first = false;
       if (row.choice === null) {
@@ -531,9 +545,9 @@ export class CheckpointDecisionCards {
           () =>
             db
               .prepare(
-                "UPDATE checkpoint_cards SET choice=?,answer_lease=?,state='decided',display_version=2 WHERE id=? AND choice IS NULL AND state='open'",
+                "UPDATE checkpoint_cards SET choice=?,answer_text=?,answer_lease=?,state='decided',display_version=2 WHERE id=? AND choice IS NULL AND state='open'",
               )
-              .run(click.choice, this.now() + 31000, row.id).changes === 1,
+              .run(click.choice, click.answerText?.trim() || null, this.now() + 31000, row.id).changes === 1,
         );
         row = saved(db.prepare("SELECT * FROM checkpoint_cards WHERE id=?").get(row.id));
       }
@@ -555,11 +569,14 @@ export class CheckpointDecisionCards {
             row.event.question +
             "」，你选择了「" +
             row.event.options[row.choice] +
-            "」。\n请先核实这项选择仍适用于当前进展，再沿这个方向继续。此次选择只确认上述事项，其他操作仍遵照原对话的授权范围。",
+            "」。" +
+            (row.answer_text ? "\n本人实际填写的回复：" + row.answer_text : "") +
+            "\n请先核实这项选择仍适用于当前进展，再沿这个方向继续。此次选择只确认上述事项，其他操作仍遵照原对话的授权范围。",
           beforeMutation: guard,
         };
         const result = await (first ? this.queueBound : this.inspectBound)(input);
         guard();
+        if (result.status === "queued") await wakeQueuedBoundChat(input).catch(() => {});
         status =
           result.threadId === row.event.threadId &&
           ["queued", "in-thread", "completed", "failed", "interrupted", "missing", "unknown"].includes(result.status)
