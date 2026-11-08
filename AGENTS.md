@@ -79,3 +79,5 @@ Execution defaults follow upstream events, justified `later` checks and owner an
 Default new goals to continuous advancement until verified overall completion. Preserve explicit numeric budgets and pause. Small authorized, reversible decisions belong to the coordinator; consequential decisions and genuine missing authority/input return to the owner. Treat message-level milestones as reported progress with source evidence, not proof of full business acceptance.
 
 Explicit continuation of an opted original project is authorization to proceed without another goal form. Missing information requires actual reply text; a selection never proves facts have changed. Preserve explicit submission, original-chat binding and separately verified queue, wake, execution and milestone states.
+
+项目协调先读目标项目的 COORDINATOR_BRIEF、ACTIVE_CONTEXT、DECISIONS及原对话最新证据。接手说明缺失先核实补齐，不能只凭末条回复安排；找到项目不代表启用。用途索引只辅助候选定位，不作为权限或当前状态。公开预览仅限已获授权的合成材料，接真实后端后重新审视访问边界。

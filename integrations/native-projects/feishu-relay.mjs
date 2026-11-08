@@ -25,6 +25,7 @@ import { conversationContext } from "./conversation-context.mjs";
 import { BoundProgressNotices } from "./bound-progress-notices.mjs";
 import { CheckpointDecisionCards } from "./checkpoint-decision-card.mjs";
 import { settleCompletedGoals } from "./goal-completion.mjs";
+import { projectDiscoveryHints } from "./project-context.mjs";
 
 export function acceptsCommand(event, config) {
   return (
@@ -529,7 +530,14 @@ async function main() {
         catalog,
         controls,
         runtime,
-        semanticQuery: (q, opts) => interpretSemanticQuery(q, { ...opts, command: native.managedCodex.command }),
+        semanticQuery: (q, opts) =>
+          interpretSemanticQuery(q, {
+            ...opts,
+            command: native.managedCodex.command,
+            projectHints: projectDiscoveryHints(
+              [...catalog.projects.values()].map((p) => ({ alias: projectAlias(p), roots: p.roots })),
+            ),
+          }),
         answerChat: (q, opts) => answerSemanticChat(q, { ...opts, command: native.managedCodex.command }),
         portfolio: (opts) =>
           projectPortfolioStatus({ ...opts, nativeConfig: native, controls, catalog, checkpointCards }),

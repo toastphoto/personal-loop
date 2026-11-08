@@ -17,6 +17,33 @@ const opts = (reply, extra = {}) => ({
   ...extra,
 });
 
+test("purpose descriptions locate a differently named project and a changed brief invalidates cached interpretation", async () => {
+  const cache = new Map();
+  let calls = 0;
+  const run = async ({ prompt }) => {
+    calls++;
+    assert.match(prompt, /跨平台采集底座/);
+    assert.match(prompt, /不是现状证据或执行授权/);
+    return { text: '{"intent":"status","projects":[1]}' };
+  };
+  const options = {
+    view,
+    command: "/fixture/codex",
+    cache,
+    run,
+    projectHints: { [cd.alias]: "跨平台采集底座：公开来源任务" },
+  };
+  const first = await interpretSemanticQuery("采集底座做到哪了", options);
+  assert.equal(first.alias, cd.alias);
+  await interpretSemanticQuery("采集底座做到哪了", options);
+  assert.equal(calls, 1);
+  await interpretSemanticQuery("采集底座做到哪了", {
+    ...options,
+    projectHints: { [cd.alias]: "跨平台采集底座：现在是来源质量核验" },
+  });
+  assert.equal(calls, 2);
+});
+
 test("asking about active work yields a read plan, no invented project name or native data in the prompt", async () => {
   const r = await interpretSemanticQuery(
     "看一下我有哪些项目在跑",

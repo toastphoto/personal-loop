@@ -1,10 +1,11 @@
 // The hub owns dispatch. Models choose a next action; only this translator can address a hub event.
-import { closeSync, constants, fstatSync, openSync, readSync, realpathSync, writeFileSync } from "node:fs";
+import { closeSync, constants, fstatSync, openSync, readSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { createHash } from "node:crypto";
 import { requiresReply, validReply } from "../../plugins/feishu-group-text/decision-response.ts";
 import { ProjectActivity } from "./project-activity.mjs";
 import { failure } from "./catalog.mjs";
+import { readProjectContext } from "./project-context.mjs";
 const invalid = () => {
   throw failure("COORDINATOR_INVALID_RESULT");
 };
@@ -33,19 +34,7 @@ export function readCoordinatorContext(file) {
   return c;
 }
 export async function captureProgress({ cwd, catalog, config, projectKey, destination, boundProgress }) {
-  const root = realpathSync(cwd),
-    documents = [];
-  for (const relative of ["docs/project_memory/ACTIVE_CONTEXT.md", "AGENTS.md"]) {
-    try {
-      const real = realpathSync(path.join(root, relative));
-      if (real !== path.join(root, relative)) continue;
-      // Feed the model the paths of verified project documents; keep private evidence out of the group.
-      const doc = readPrefix(real, 6400);
-      documents.push({ file: relative, ...doc });
-    } catch (error) {
-      if (error.code !== "ENOENT") throw error;
-    }
-  }
+  const { documents, missingBrief } = readProjectContext(cwd);
   let native = { status: "preview-disabled" };
   if (boundProgress) {
     native = { status: "bound-chat", record: boundProgress };
@@ -66,7 +55,7 @@ export async function captureProgress({ cwd, catalog, config, projectKey, destin
       }),
     };
   }
-  const evidence = { readAt: new Date().toISOString(), documents, native };
+  const evidence = { readAt: new Date().toISOString(), documents, missingBrief, native };
   writeFileSync(destination, JSON.stringify(evidence), { mode: 0o600, flag: "wx" });
   return { documentCount: documents.length, nativeStatus: native.status };
 }
@@ -312,6 +301,7 @@ export function coordinatedPrompt({ stage, goal, cwd, file, remaining, packet })
     return [
       common,
       "你是大肥鱼，负责这个目标的协调判断。先读下面的项目快照，必要时只读少量相关资料，核实最新进展（过期/缺失要明确）。决定对目标最有用的一步，然后将具体工作交给已确认的执行者；你自己不使用工具做交付。按用户已授权的范围安排工作：讨论或核对目标只安排对应工作，明确实施目标可安排可逆本地实现和测试。保持原对话现有权限，不能把讨论当成实施授权。",
+      "先用COORDINATOR_BRIEF理解整体目标、当前主线、已交付与缺口，再对照当前记忆、既定决定及原对话新证据。brief也是可能过期的资料，冲突以更新且可核实的证据为准。文件truncated代表没读全，不得把未见内容当成缺失或重做理由。缺接手说明、主线不清或证据冲突时，先安排原对话核实已有产物并整理简短接手说明，授权允许写文件时保存到项目记忆，不能凭最后一句回复猜下一步；这是自主核实，不需本人重新确认已授权目标。每段可见成果后由原对话更新说明，后续只交接增量。",
       packet
         ? "下面是经绑定核对的只读资料（项目文档和主对话的可见回复），只根据这些资料判断，不使用任何工具，不向用户引用本段资料标签：\n" +
           JSON.stringify(packet)
