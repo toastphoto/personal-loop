@@ -59,13 +59,13 @@ function stillPending(item, event) {
     q.options.every((v, i) => norm(v) === norm(event.options[i]));
   if (Array.isArray(item.questions) && item.questions.some(sameQuestion)) return true;
   const asking =
-    /(?:需要你(?:拍板|决定|确认)|请(?:你|您)?(?:选|决定|确认)|待(?:你|您)(?:选|决定|确认)|等待(?:你|您)(?:选|决定|确认))/u.test(
+    /(?:需要你(?:拍板|决定|确认|协助|回复)|请(?:你|您)?(?:选|决定|确认|补充|填写|提供|回复)|待(?:你|您)(?:选|决定|确认)|等待(?:你|您)(?:选|决定|确认))/u.test(
       item.text,
     );
   return (
     asking &&
     norm(item.text).includes(norm(event.question)) &&
-    event.options?.every((o) => norm(item.text).includes(norm(o)))
+    (!event.options || event.options.every((o) => norm(item.text).includes(norm(o))))
   );
 }
 function saved(row) {
@@ -300,9 +300,8 @@ export class CheckpointDecisionCards {
         const row = saved(raw);
         if (
           !refOK(row.ref) ||
-          !Array.isArray(row.event.options) ||
-          row.event.options.length < 2 ||
-          row.event.options.length > 5 ||
+          (row.event.options !== undefined &&
+            (!Array.isArray(row.event.options) || row.event.options.length < 2 || row.event.options.length > 5)) ||
           this.now() - row.event.at > 24 * 60 * 60000
         )
           return;
@@ -373,6 +372,39 @@ export class CheckpointDecisionCards {
     };
     const out = decision ? renderDecisionCard(card, owner) : renderResultCard(card, owner);
     out.header.title.content = expired ? "问题已更新" : decided ? "选择已记录" : decision ? "需要你决定" : "需要你协助";
+    if (!decision) {
+      if (!JSON.stringify(out.body).includes(e.question))
+        out.body.elements.push({ tag: "div", text: { tag: "plain_text", content: e.question } });
+      out.header.title.content = expired ? "问题已更新" : decided ? "回复已收到" : "请补充说明";
+      if (!decided && !expired)
+        out.body.elements.push({
+          tag: "form",
+          name: "reply_form",
+          elements: [
+            {
+              tag: "input",
+              name: "reply",
+              label: { tag: "plain_text", content: "你的补充说明" },
+              placeholder: { tag: "plain_text", content: "填写后点击发送，内容会交回这条原对话" },
+              input_type: "multiline_text",
+              rows: 3,
+              max_length: 1000,
+              required: true,
+              width: "fill",
+            },
+            {
+              tag: "button",
+              name: `personalLoopCheckpoint_${row.id}_1_help`,
+              form_action_type: "submit",
+              text: { tag: "plain_text", content: "发送回复并继续" },
+              type: "primary_filled",
+              width: "fill",
+            },
+          ],
+        });
+      if (decided && row.answer_text)
+        out.body.elements.push({ tag: "div", text: { tag: "plain_text", content: "你的回复：" + row.answer_text } });
+    }
     if (decided) {
       const text =
         row.native_status === "queued"
@@ -517,8 +549,7 @@ export class CheckpointDecisionCards {
         !row ||
         !row.ref ||
         row.ref !== click.messageId ||
-        !Array.isArray(row.event.options) ||
-        click.choice >= row.event.options.length
+        (Array.isArray(row.event.options) ? click.choice >= row.event.options.length : click.choice !== 0)
       )
         return denied("CHECKPOINT_INPUT_INVALID");
       try {
@@ -526,7 +557,11 @@ export class CheckpointDecisionCards {
       } catch {
         return denied("CHECKPOINT_SCOPE_REVOKED");
       }
-      if (requiresReply(row.event.options) && click.choice === 0 && !validReply(click.answerText))
+      if (
+        (!row.event.options || requiresReply(row.event.options)) &&
+        click.choice === 0 &&
+        !validReply(click.answerText)
+      )
         return denied("CHECKPOINT_REPLY_REQUIRED");
       if (row.state === "expired") return denied("CHECKPOINT_STALE");
       let first = false;
@@ -565,13 +600,12 @@ export class CheckpointDecisionCards {
           projectKey: row.event.projectKey,
           requestId: "checkpoint-answer:" + row.id,
           text:
-            "大肥鱼转来你在飞书的选择。\n关于「" +
+            "大肥鱼转来你在飞书的回复。\n关于「" +
             row.event.question +
-            "」，你选择了「" +
-            row.event.options[row.choice] +
-            "」。" +
+            "」，" +
+            (row.event.options ? "你选择了「" + row.event.options[row.choice] + "」。" : "") +
             (row.answer_text ? "\n本人实际填写的回复：" + row.answer_text : "") +
-            "\n请先核实这项选择仍适用于当前进展，再沿这个方向继续。此次选择只确认上述事项，其他操作仍遵照原对话的授权范围。",
+            "\n请先核对真实回复，再沿这条原对话继续。不要把发送动作视为资料已存在；其他操作仍遵照原对话的授权范围。",
           beforeMutation: guard,
         };
         const result = await (first ? this.queueBound : this.inspectBound)(input);

@@ -1,3 +1,4 @@
+import { boundHandoffText } from "./bound-coordination.mjs";
 // A bound goal must never fork a project chat, count status reads as work, or publish the wrong turn.
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -89,8 +90,7 @@ function fixture(t, maxSteps = 2) {
         },
         queueBoundChat: async ({ text, beforeMutation, requestId }) => {
           beforeMutation();
-          assert.match(text, /核对工作台入口/);
-          assert.match(text, /验证入口/);
+          if (!queuedText.length) assert.match(text, /核对工作台入口/);
           assert.doesNotMatch(text, /agent-autoloop|expectedResult|纯 JSON/);
           calls.push("queue:" + requestId);
           queuedText.push(text);
@@ -550,7 +550,8 @@ test("continuous work keeps decision A across several steps, accepts a different
   f.setReply(B);
   const second = await next(4, plan2);
   assert.equal(second.parsed.ask.length, 1, "a previous chosen branch must not disable the next genuine decision");
-  assert.match(f.queuedText[1], /首轮先看什么.*流程/);
+  assert.doesNotMatch(f.queuedText[1], /首轮先看什么/);
+  assert.deepEqual(second.r.coordinator.decisions, [{ question: A.question, options: A.options, chosen: "流程" }]);
   const askB = second.parsed.ask[0],
     chosenB = answer(askB, 1, 12);
   const forged = await f.run(5, chosenB.events, { answers: [{ ...chosenB.answers[0], about: "foreign-generation" }] });
@@ -562,7 +563,7 @@ test("continuous work keeps decision A across several steps, accepts a different
     { question: A.question, options: A.options, chosen: "流程" },
     { question: "先验哪类设备？", options: ["桌面端", "移动端"], chosen: "移动端" },
   ]);
-  assert.match(f.queuedText[2], /首轮先看什么.*流程/);
+  assert.doesNotMatch(f.queuedText[2], /首轮先看什么/);
   assert.match(f.queuedText[2], /先验哪类设备.*移动端/);
   f.setPlan(
     JSON.stringify({
@@ -576,8 +577,8 @@ test("continuous work keeps decision A across several steps, accepts a different
   f.setReply("第三部分也已完成。");
   const done3 = await next(8, plan3);
   assert.equal(done3.r.coordinator.decisions.length, 2);
-  assert.match(f.queuedText[3], /首轮先看什么.*流程/);
-  assert.match(f.queuedText[3], /先验哪类设备.*移动端/);
+  assert.doesNotMatch(f.queuedText[3], /首轮先看什么/);
+  assert.doesNotMatch(f.queuedText[3], /先验哪类设备/);
   f.setPlan(JSON.stringify({ ...A, options: [...A.options].reverse() }));
   const repeated = await next(9, done3);
   assert.equal(repeated.r.state, "receipt-unconfirmed");
@@ -634,4 +635,27 @@ test("checking a queued original does not back off for minutes before noticing a
   const checked = await f.run(3, [{ type: "timer.due", subject: f.subject }], { timers: queued.parsed.later });
   assert.ok(Date.parse(checked.parsed.later[0].at) - Date.now() <= 60000);
   assert.equal(f.queuedText.length, 1);
+});
+
+test("continuation sends only the current step, not stale decisions or a repeated full goal", () => {
+  const goal = { objective: "完整目标不应每次复述" };
+  const plan = { nextStep: "接好桌面读取桥", expectedResult: "本人列表读回可核对" };
+  const first = boundHandoffText(goal, { plan, initialHandoff: true }, true);
+  assert.ok(first.includes(goal.objective));
+  assert.match(first, /需要你拍板/);
+  const later = boundHandoffText(
+    goal,
+    { plan, chosen: "我已处理，重新核实", decisions: [{ question: "过期的环境问题", chosen: "我已处理，重新核实" }] },
+    true,
+  );
+  assert.ok(later.includes(plan.nextStep) && later.includes(plan.expectedResult));
+  assert.doesNotMatch(later, /完整目标不应每次复述|刚刚|过期的环境问题|已处理|本目标此前/);
+  assert.ok(later.length < 220);
+  const answer = boundHandoffText(
+    goal,
+    { plan, freshAnswer: true, chosen: "卡片库", chosenQuestion: "先看哪一项", answerText: "先看共享权限边界" },
+    true,
+  );
+  assert.ok(answer.includes("先看共享权限边界"));
+  assert.doesNotMatch(answer, /刚刚选定|过期的环境/);
 });

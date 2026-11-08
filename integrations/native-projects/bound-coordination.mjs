@@ -16,48 +16,33 @@ import { redact } from "./project-activity.mjs";
 const minute = 60000;
 const jsonReceipt = (summary, body) =>
   summary + "\n```agent-autoloop\n" + JSON.stringify(body).replaceAll("`", "\\u0060") + "\n```";
-const readyText = (goal, stage, canAsk) =>
-  [
-    "大肥鱼从飞书接到这个目标：" + goal.objective,
-    ...(stage.chosen
-      ? stage.answerText && stage.chosen === "我已处理，重新核实"
-        ? ["本人已补充回复，尚待核实，不表示缺项已解决。"]
-        : [
-            (stage.chosenQuestion ? "关于「" + stage.chosenQuestion + "」，" : "") +
-              "你刚刚选定了「" +
-              stage.chosen +
-              "」。这只说明选择了这个办法，不代表资料已补齐、访问已恢复或权限已扩大；请先重新核实。",
-          ]
-      : []),
-    ...(stage.decisions?.length
-      ? [
-          "本目标此前已经确认的决定：" +
-            stage.decisions
-              .map(
-                (d) =>
-                  "关于「" + d.question + "」，选了「" + d.chosen + "」" + (d.reply ? "；本人补充：" + d.reply : ""),
-              )
-              .join("；") +
-            "。这些选择继续有效，不重复询问同一问题；如需另一个重大取舍，说明新的问题。",
-        ]
-      : []),
-    ...(stage.answerText
-      ? [
-          "本人在卡片中实际填写的回复：" +
-            stage.answerText +
-            "。本人的最新回复优先于旧的执行安排，保留项目权限边界。先理解并核对这段回复，不把选项当资料已存在的证明；如果本人表示没有这些资料或让你自行处理，先排查可行替代和其他可做工作，不重复索要同一缺项。",
-        ]
-      : []),
-    "请接着这条对话已有的进展，" + stage.plan.nextStep + "。预期交付：" + stage.plan.expectedResult + "。",
-    "按已明确目标自行决定可逆细节。本轮只完成本次已分派的一个可检查功能、页面或阶段，形成结果就用公开进展消息简短说明成果和下一步。遇到必须由本人决定的关键取舍，立即提出并结束当前阶段等待回答，不要等整项目完成才问。其它已明确且互不依赖的工作由大肥鱼继续安排。",
-    "按本目标与这条原对话已确认的范围推进。目标是讨论或核对时保持对应范围；本人已明确要求实施时，可逆的本地实现和测试由你自行完成。已有工作不用重做；重大方向或范围变更、外部发布或承诺、不可逆数据操作和缺少真实授权时再请本人决定。保持原对话的权限设置，不自行扩大权限。",
-    "缺资料、权限、负责人或验收口径时，先在允许范围内查已有依据、试可行替代。正常执行和已有复查预约可以安静等待。只有本人的一个具体帮助才能解除阻塞时，请主动写「需要你协助：」加具体问题，下一行「已核对：」简述查过什么、哪一步因此做不了；需要找其他人时请本人协调，不自行联系，避免在群里索取密码或私密原件。",
-    ...(canAsk
-      ? [
-          "确需本人选方向时用「需要你拍板：」开头。拍板或求助有两种以上可行做法时，逐行用 1.、2. 等列出两到五个具体动作，最后一句写「建议选第 1 项，因为……」（填实际推荐序号和原因）。如果只缺一件东西，直接说请本人去原对话补什么。其余情况直接交付结论。",
-        ]
-      : []),
-  ].join("\n\n");
+export function boundHandoffText(goal, stage, canAsk) {
+  const sentence = (text) => text.trim().replace(/[。]+$/u, "");
+  const lines = [stage.initialHandoff ? "大肥鱼接续目标：" + goal.objective : "大肥鱼续办"];
+  if (stage.freshAnswer) {
+    if (stage.answerText) lines.push("本人新补充：" + stage.answerText + "\n以这次真实回复为准，事实仍需核实。");
+    if (stage.chosen && stage.chosen !== "我已处理，重新核实")
+      lines.push(
+        (stage.chosenQuestion ? "关于「" + stage.chosenQuestion + "」，" : "") +
+          "本人本次选定了「" +
+          stage.chosen +
+          "」。请核实事实，选择不代表条件已具备。",
+      );
+    else if (stage.chosen && !stage.answerText) lines.push("本人请求重新核实缺项，尚未确认资料或权限已具备。");
+  }
+  lines.push(
+    "本次：" + sentence(stage.plan.nextStep) + "。",
+    "完成标准：" + sentence(stage.plan.expectedResult) + "。",
+  );
+  if (stage.initialHandoff) {
+    lines.push("沿原对话已确认的范围和权限处理可逆细节，不重做已完成的工作；形成阶段成果就简短说明。");
+    if (canAsk)
+      lines.push(
+        "确需本人取舍时，用‘需要你拍板：’提出一个问题、2–5个真实选项及一句推荐理由；只缺资料时，用‘需要你协助：’说明缺什么，并写‘已核对：’。不要替本人编造已处理的事实。",
+      );
+  } else lines.push("沿已确认的范围和权限推进；阶段成果简报，重大取舍再问本人。");
+  return lines.join("\n\n");
+}
 // Parse one complete, current-turn decision. Quotations, examples in longer answers and ordinary questions remain prose.
 function ownerRequest(text) {
   const lines = text
@@ -209,7 +194,7 @@ export async function runBoundStage(
     ? stage.handoff
     : {
         requestId: "native-run:" + executionKey,
-        text: readyText(goal, stage, canAsk),
+        text: boundHandoffText(goal, stage, canAsk),
         plan: stage.plan,
         ...(stage.chosen ? { chosen: stage.chosen } : {}),
         ...(stage.chosenQuestion ? { chosenQuestion: stage.chosenQuestion } : {}),

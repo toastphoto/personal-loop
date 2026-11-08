@@ -650,3 +650,11 @@ test("a queue intent or worker request alone cannot claim the managed decision c
     ["sent", "sent", "sent"],
   );
 });
+
+test("compact automatic handoffs do not duplicate legacy whole-turn notices", () => {
+  for (const text of ["大肥鱼续办\n\n本次：核对下一项。", "大肥鱼接续目标：核对入口"]) {
+    const own = turn("compact", stableText);
+    own.items[0].content[0].text = text;
+    assert.equal(noticeSignal(own), null);
+  }
+});

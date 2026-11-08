@@ -34,3 +34,5 @@
 - Observe message-level checkpoints before a whole turn completes. Mention the verified owner only for new meaningful notices/decisions. Own-run decisions and independent source questions have separate durable routes; use exact identity to avoid duplicate asks.
 
 | 2026-11-08 | 明确继续按既有项目授权直接续办；缺资料用实际输入表单，不默认推荐已处理；普通技术问题先自主排查和推进独立工作 | 语义入口、问题卡与原对话接续 | 真人反馈、项目权限或绑定变更时重查 |
+
+| 2026-11-08 | 同一原对话采用增量交接，完整目标及沟通约定仅首次发送，旧选择不再冒充刚刚作出的选择；无选项的真实问题直接收取文字回复 | 交接消息和填写卡 | 新目标、绑定变化或真人实测反馈时重评 |

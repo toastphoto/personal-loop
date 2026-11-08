@@ -158,6 +158,7 @@ export function coordinatorStage({ history, context, goal, subject, completedSte
       : null;
   let prior = history.at(-1);
   const plan = history[0].plan;
+  const initialHandoff = !history.some((s) => s.role === "worker" || s.role === "bound-observe" || s.handoff);
   const resumed =
     goal.revision !== goal.goalRevision &&
     context.events.some(
@@ -251,6 +252,8 @@ export function coordinatorStage({ history, context, goal, subject, completedSte
     };
     return {
       role: "worker",
+      initialHandoff,
+      freshAnswer: true,
       plan: prior.plan ?? plan,
       chosen: answers[0].options[answers[0].choice ?? 0],
       ...(typeof answers[0].text === "string" && answers[0].text.trim()
@@ -278,6 +281,7 @@ export function coordinatorStage({ history, context, goal, subject, completedSte
   )
     return {
       role: "worker",
+      initialHandoff,
       ...known,
       plan: prior.plan ?? plan,
       ...(prior.chosen ? { chosen: prior.chosen } : {}),
@@ -290,6 +294,7 @@ export function coordinatorStage({ history, context, goal, subject, completedSte
   )
     return {
       role: "worker",
+      initialHandoff,
       ...known,
       plan: prior.plan ?? plan,
       chosen: prior.chosen,
@@ -320,6 +325,7 @@ export function coordinatedPrompt({ stage, goal, cwd, file, remaining, packet })
           ]
         : []),
       ...(stage.previousPlan ? ["暂停前留下的未执行安排（资料）：" + JSON.stringify(stage.previousPlan)] : []),
+      "交给原对话的nextStep和expectedResult只写本次新增工作与完成标准，直接写做什么，不写‘交给原对话执行者’。不要反复复制完整目标、旧选择和整套既有边界；保留本次具体限制与变化，尊重原有权限和已确认范围。",
       "普通编译、调试、运行环境兼容、失败定位由你自主处理。在现有授权边界内先查实际错误、尝试可行替代测试方式，同时推进互不依赖的工作。不要把普通技术排障变成要求本人准备独立测试机器的前置条件；只有证实必须由本人控制的外部资料或资源且无可行替代，才具体请求补充。",
       "权限范围内的可逆小决定由你做。不要为了凑轮数、等待下一次消息或得到无关紧要的确认而停下来。只有方向/范围的大变更、不可逆或外部承诺、缺少实际授权或必要资料才交本人决定。",
       ...(stage.role === "router-review"

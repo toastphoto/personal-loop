@@ -81,7 +81,11 @@ test("choosing once carries the choice through a real review and blocks a second
   ).coordinator;
   const context = ctx([{ type: "timer.due" }], [], [review.timer]);
   const history = [router, review];
-  assert.deepEqual(coordinatorStage({ ...args, history, context }), { ...stage, review: review.timer.about });
+  assert.deepEqual(coordinatorStage({ ...args, history, context }), {
+    ...stage,
+    initialHandoff: false,
+    review: review.timer.about,
+  });
   assert.equal(
     coordinatorStage({ ...args, history, context: { ...context, timers: [{ ...review.timer, key: "other" }] } }),
     null,

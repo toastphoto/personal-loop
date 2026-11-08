@@ -213,7 +213,7 @@ test("send and patch acknowledgements may be lost, but restart keeps one message
   );
   assert.equal(f.queues.length, 1);
 });
-test("without actual options a blocker is an informational request, not an invented choice", async (t) => {
+test("a question without options accepts a typed reply without inventing choices", async (t) => {
   const f = fixture(t);
   delete f.event.options;
   delete f.event.recommend;
@@ -222,9 +222,13 @@ test("without actual options a blocker is an informational request, not an inven
   f.event.question = "请补充一份验收样例";
   const r = await f.service.deliver(f.event);
   assert(r.acknowledged);
-  assert.doesNotMatch(JSON.stringify(f.sends[0].input), /personalLoopCheckpoint|按钮/);
+  assert.match(JSON.stringify(f.sends[0].input), /personalLoopCheckpoint/);
+  assert.doesNotMatch(JSON.stringify(f.sends[0].input), /select_static|我已处理|先暂停/);
   assert.equal((await f.click(r.id)).ok, false);
   assert.equal(f.queues.length, 0);
+  assert.equal((await f.click(r.id, { answerText: "请继续核对已有样例的来源" })).ok, true);
+  assert.ok(f.queues[0].text.includes("请继续核对已有样例的来源"));
+  assert.doesNotMatch(f.queues[0].text, /选择了「|undefined/);
 });
 
 test("source identity and a later final answer invalidate a prior checkpoint choice", async (t) => {

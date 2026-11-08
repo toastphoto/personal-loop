@@ -139,7 +139,8 @@ test("the real hub drives more than eight bounded handoffs, preserves a nonrecom
     },
     queueBoundChat: async ({ requestId, text, beforeMutation }) => {
       beforeMutation();
-      assert.match(text, /数据/);
+      if (queueCount === 0) assert.match(text, /数据/);
+      else assert.doesNotMatch(text, /刚刚选定|本目标此前已经确认/);
       queueCount++;
       ids.push(requestId);
       queued.push(text);

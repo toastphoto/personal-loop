@@ -21,3 +21,5 @@ Core remains derived from upstream v1.1.1. Earlier chronology is archived. Funct
 本批功能快测1119通过、3跳过；强杀与变异检查通过（1000次强杀、31项变异全部检出）。nightly仍在原有空闲内存预算失败：112.4MB／60.4MB，不得宣称全部性能通过。
 
 The live original continued from its completed backend slice into desktop sharing integration without a new goal confirmation. Official group readback verifies new milestone mentions. Mobile form submission and a fresh unloaded wake remain distinct unobserved user-surface cases.
+
+Handoffs are now incremental: only the initial message repeats the goal and communication conventions; later messages carry the current step, expected result and genuinely fresh owner input. Previous decisions stay in coordinator state. No-option native questions now expose a required text form instead of inventing choices. The human form/cold trial currently holds future dispatch; the private parent trial folder records the restore baseline. Never mistake this temporary hold for a permanent user pause.

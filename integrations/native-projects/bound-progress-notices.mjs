@@ -83,7 +83,9 @@ export function noticeSignal(turn) {
     !users[0].content.some((i) => i.type === "text" && typeof i.text === "string" && i.text.trim()) ||
     users[0].content.some(
       (i) =>
-        typeof i?.text === "string" && /(?:大肥鱼从飞书接到这个目标|大肥鱼把.{0,120}交接回这条主对话)/u.test(i.text),
+        typeof i?.text === "string" &&
+        (/(?:大肥鱼从飞书接到这个目标|大肥鱼把.{0,120}交接回这条主对话)/u.test(i.text) ||
+          /^大肥鱼(?:续办(?:\n|$)|接续目标：)/u.test(i.text)),
     ) ||
     typeof finals[0].text !== "string"
   )
