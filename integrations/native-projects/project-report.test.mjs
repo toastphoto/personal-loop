@@ -226,3 +226,75 @@ test("an ended multi-input turn moves to project report review without claiming 
   assert.equal(r.coordinator.completedStepFingerprint, undefined);
   assert.match(r.coordinator.reply, /归属/);
 });
+
+test("project-authored choices survive reporting and the actual owner answer returns to the same project", async (t) => {
+  const f = fixture(t),
+    question = {
+      ...proposal,
+      action: "ask",
+      question: "先交付哪个完整闭环？",
+      options: ["完整项目工作桌", "先补团队共享"],
+      recommend: 0,
+      reason: "现有主App已具备大部分能力",
+    };
+  const bytes = JSON.stringify(question),
+    sha = createHash("sha256").update(bytes).digest("hex");
+  writeFileSync(f.file, bytes);
+  const args = {
+    config: {
+      providers: { codex: { allowConversationPreview: true } },
+      managedCodex: { coordinationMode: "project-led", command: "/fixture/codex" },
+    },
+    binding: { threadId: "original" },
+    catalog: {},
+    projectKey: "codex:local:p",
+    projectId: "p",
+    cwd: f.cwd,
+    stage: { role: "router" },
+    goal: { objective: "完成App主线", maxSteps: null },
+    goalId: "g",
+    runId: "choice",
+    executionKey: "choice",
+    subject: "subject",
+    remaining: 100,
+    file: path.join(f.cwd, "choice.json"),
+    guard() {},
+  };
+  const result = await runBoundStage(args, {
+    readBoundProgress: async () => ({ ...f.primary, excerpt: "PROJECT_REPORT_SHA256: " + sha }),
+    runEphemeralCoordinator: async () => ({
+      text: JSON.stringify({ summary: "项目需要本人确定交付先后", reportSha256: sha }),
+    }),
+  });
+  assert.deepEqual(result.coordinator.ask.options, question.options);
+  assert.equal(result.coordinator.ask.recommend, 0);
+  assert(result.coordinator.ask.text.includes(question.reason));
+  let text;
+  await runBoundStage(
+    {
+      ...args,
+      runId: "answer",
+      executionKey: "answer",
+      stage: {
+        role: "worker",
+        plan: result.coordinator.plan,
+        freshAnswer: true,
+        chosen: question.options[0],
+        chosenQuestion: question.question,
+        answerText: "先把主线做顺，保留已有成果",
+        answerCard: 7,
+      },
+    },
+    {
+      queueBoundChat: async (a) => {
+        a.beforeMutation();
+        text = a.text;
+        return { status: "queued", threadId: "original" };
+      },
+    },
+  );
+  assert(text.includes("先把主线做顺，保留已有成果"));
+  assert(text.includes(question.options[0]));
+  assert.match(text, /结合本人这次真实回答/);
+  assert.doesNotMatch(text, /资源已经具备。现在直接/);
+});
