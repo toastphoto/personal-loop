@@ -232,6 +232,30 @@ test("a job runs in its rule's folder with the prompt and context file, and with
   assert.equal(w.entries().length, 0, "handed in and let go");
 });
 
+test("a launch receives its trusted attempt number rather than an inherited value", async (t) => {
+  const previous = process.env.AGENT_AUTOLOOP_ATTEMPT;
+  process.env.AGENT_AUTOLOOP_ATTEMPT = "99";
+  t.after(() => {
+    if (previous === undefined) delete process.env.AGENT_AUTOLOOP_ATTEMPT;
+    else process.env.AGENT_AUTOLOOP_ATTEMPT = previous;
+  });
+  const hub = fakeHub();
+  const output = join(folder, "attempt-env.txt");
+  const command = [
+    process.execPath,
+    "-e",
+    "require('fs').appendFileSync(process.argv[1], (process.env.AGENT_AUTOLOOP_ATTEMPT ?? 'missing') + '\\n'); console.log('completed')",
+    output,
+  ];
+  const first = job({ command });
+  hub.jobs.push(first);
+  const w = worker(hub);
+  await until(w, () => hub.results.length === 1);
+  hub.jobs.push({ ...first, attempt: 2, token: "retry-token" });
+  await until(w, () => hub.results.length === 2);
+  assert.deepEqual(readFileSync(output, "utf8").trim().split("\n"), ["1", "2"]);
+});
+
 test("a bad exit code, or no last message, is a failure saying why", async () => {
   const hub = fakeHub();
   const bad = job({ command: ["/bin/sh", "-c", "echo boom >&2; exit 3"] });

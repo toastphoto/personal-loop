@@ -1,0 +1,709 @@
+import { execFile } from "node:child_process";
+import { readFileSync, writeFileSync, renameSync, mkdirSync } from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { createCatalog, readConfig } from "./factory.mjs";
+import { LoopControls } from "./controls.mjs";
+import { RelayQueue } from "./relay-queue.mjs";
+import { parseLoopCommand, handleLoopCommand, projectAlias } from "./feishu-commands.mjs";
+import { failure, safeError } from "./catalog.mjs";
+import { NativeLoopRuntime } from "./loop-runtime.mjs";
+import { startLoopHub } from "./hub-host.mjs";
+import { commandText, routeProjectMessage, readRouting } from "./feishu-route.mjs";
+import { directGoalRequest } from "./feishu-direct-goal.mjs";
+export { commandText } from "./feishu-route.mjs";
+import { ChatBindingStore } from "./chat-binding-store.mjs";
+import { CardSessions, ProjectCardController } from "./feishu-card-control.mjs";
+import { CardEventSubscriber } from "./callback-consumer.mjs";
+import { FeishuCardRelay } from "./feishu-card-relay.mjs";
+import { ProjectActivity } from "./project-activity.mjs";
+import { renderProjectCard } from "./feishu-project-card.mjs";
+import { eligibleSemanticRoute, readSemanticRoute, finishSemanticRoute } from "./semantic-route-store.mjs";
+import { interpretSemanticQuery, answerSemanticChat } from "./semantic-query.mjs";
+import { projectPortfolioStatus } from "./portfolio-status.mjs";
+import { conversationContext } from "./conversation-context.mjs";
+import { BoundProgressNotices } from "./bound-progress-notices.mjs";
+import { CheckpointDecisionCards } from "./checkpoint-decision-card.mjs";
+import { settleCompletedGoals } from "./goal-completion.mjs";
+import { projectDiscoveryHints } from "./project-context.mjs";
+import { ArtifactDelivery } from "./artifact-delivery.mjs";
+
+export function acceptsCommand(event, config) {
+  return (
+    event?.chat_id === config.chatId &&
+    config.allowedSenderIds?.includes(event.sender_id) &&
+    event.sender_type === "user" &&
+    event.message_type === "text" &&
+    typeof event.message_id === "string" &&
+    /^om_[A-Za-z0-9_-]{1,160}$/.test(event.message_id) &&
+    ["loop", "semantic"].includes(
+      routeProjectMessage(event, config.naturalRoutingFile ? readRouting(config.naturalRoutingFile) : {}),
+    )
+  );
+}
+export function runProgram(program, args, { input = "", timeoutMs = 30000 } = {}) {
+  return new Promise((resolve) => {
+    const child = execFile(
+      program,
+      args,
+      {
+        encoding: "utf8",
+        timeout: timeoutMs,
+        maxBuffer: 1024 * 1024,
+        env: { ...process.env, LARKSUITE_CLI_NO_UPDATE_NOTIFIER: "1", LARKSUITE_CLI_NO_SKILLS_NOTIFIER: "1" },
+      },
+      (error, stdout) => {
+        resolve({ exitCode: error ? (typeof error.code === "number" ? error.code : -1) : 0, stdout });
+      },
+    );
+    child.stdin.on("error", () => {});
+    child.stdin.end(input);
+  });
+}
+// Persist the final display payload with the command result, before any delivery attempt.
+export function projectReply(result, config) {
+  if (
+    config.projectCards?.enabled !== true ||
+    result.ok !== true ||
+    !["project-directory", "project-status"].includes(result.view?.kind)
+  )
+    return result.text;
+  // Native folding works without callbacks. Do not publish unverified server-side buttons.
+  return { type: "interactive", card: renderProjectCard(result.view, undefined, { interactive: false }) };
+}
+
+export async function larkReply(config, item, execute = runProgram) {
+  if (!acceptsCommand(item.event, config) || item.id !== item.event.message_id) throw failure("REPLY_SCOPE_MISMATCH");
+  const card = item.response?.type === "interactive" ? item.response.card : null;
+  let input;
+  if (typeof item.response === "string") {
+    if (Buffer.byteLength(item.response) > 24000) throw failure("INVALID_REPLY");
+    input = item.response;
+  } else {
+    if (!card || card.schema !== "2.0" || !Array.isArray(card.body?.elements)) throw failure("INVALID_REPLY");
+    input = JSON.stringify(card);
+    if (Buffer.byteLength(input) > 28000) throw failure("INVALID_REPLY");
+  }
+  if (!/^[A-Za-z0-9_-]{1,50}$/.test(item.deliveryKey)) throw failure("INVALID_REPLY");
+  const result = await execute(
+    config.larkCommand ?? "lark-cli",
+    [
+      "--profile",
+      config.profile,
+      "im",
+      "+messages-reply",
+      "--message-id",
+      item.id,
+      "--idempotency-key",
+      item.deliveryKey,
+      "--as",
+      "bot",
+      ...(card ? ["--msg-type", "interactive", "--content", "-"] : ["--text", "-"]),
+    ],
+    { input, timeoutMs: 30000 },
+  );
+  if (result.exitCode !== 0) throw failure("REPLY_UNCONFIRMED");
+  let body;
+  try {
+    body = JSON.parse(result.stdout);
+  } catch {
+    throw failure("REPLY_UNCONFIRMED");
+  }
+  const data = body.data ?? body;
+  if (body.ok === false || !data.message_id || (data.chat_id && data.chat_id !== config.chatId))
+    throw failure("REPLY_UNCONFIRMED");
+  return data.message_id;
+}
+
+export class FeishuLoopRelay {
+  constructor(
+    config,
+    {
+      queue,
+      catalog,
+      controls,
+      reply,
+      readiness,
+      syncRules,
+      answerCard,
+      cards,
+      canCoordinate,
+      nativeConfig,
+      configFile,
+    } = {},
+  ) {
+    if (
+      !config?.chatId ||
+      !Array.isArray(config.allowedSenderIds) ||
+      !config.allowedSenderIds.length ||
+      !config.profile
+    )
+      throw failure("RELAY_AUTHORIZATION_REQUIRED");
+    this.config = config;
+    this.queue = queue;
+    this.catalog = catalog;
+    this.controls = controls;
+    this.reply = reply ?? ((item) => larkReply(config, item));
+    this.readiness = readiness ?? (async () => ({ ready: false, rulesReady: false }));
+    this.syncRules = syncRules;
+    this.answerCard = answerCard;
+    this.cards = cards;
+    this.nativeConfig = nativeConfig;
+    this.configFile = configFile;
+    this.naturalJobs = new Map();
+    this.naturalAbort = new AbortController();
+    this.canCoordinate = canCoordinate ?? (() => false);
+    this.stopping = false;
+    this.editedCommandsIgnored = 0;
+  }
+  filter(event) {
+    if (!acceptsCommand(event, this.config)) return false;
+    const prior = this.queue.get(event.message_id) ?? this.batch?.get(event.message_id);
+    if (prior && prior.event.content !== event.content) {
+      this.editedCommandsIgnored++;
+      return false;
+    }
+    this.batch?.set(event.message_id, { event });
+    return true;
+  }
+  async acceptGoal(item, goal) {
+    const { projectKey, name, objective, threadId, chatTitle } = goal;
+    const before = this.controls.get(projectKey);
+    const prior = this.controls.read().requests?.[item.requestId]?.result;
+    const reply = (text) => ({ ok: false, action: "natural-goal", changed: false, text });
+    if (prior && (prior.projectKey !== projectKey || prior.revision !== before.revision))
+      return reply("这条消息已处理，项目保留你后来设置的状态。");
+    if (before.mode === "paused") return reply("这个项目已暂停。要继续时，请在项目卡里确认恢复或设置新目标。");
+    if (before.mode === "active" && !prior)
+      return reply("这个项目已有目标在推进。可在项目卡查看进展或暂停，再设置新目标。");
+    if (!this.canCoordinate(projectKey, threadId)) return reply("这个项目的协调入口还未就绪，这次没有启动。");
+    if (!this.cards?.enabled?.() || !this.syncRules) return reply("群里的决策按钮还未就绪，这次没有启动。");
+    const authorized = () => {
+      const current = directGoalRequest(
+        item.event,
+        readRouting(this.config.naturalRoutingFile),
+        commandText(item.event),
+      );
+      return current?.projectKey === projectKey && current.threadId === threadId && current.chatTitle === chatTitle;
+    };
+    const result = await handleLoopCommand(
+      {
+        action: "enable",
+        target: projectKey,
+        objective,
+        maxSteps: prior && prior.objective === objective ? prior.maxSteps : null,
+        expectedRevision: before.revision,
+        ...(threadId && { expectedThreadId: threadId }),
+      },
+      {
+        catalog: {
+          refresh: async () => {
+            const provider = projectKey.split(":", 1)[0];
+            const directory = this.catalog.readProvider
+              ? await this.catalog.readProvider(provider)
+              : await this.catalog.refresh();
+            // Cached identities can reject ambiguity, but only the selected provider can authorize a start.
+            const cachedConflict = Array.from(this.catalog.projects?.values() ?? []).some(
+              (p) => p.provider !== provider && p.name === name && p.key !== projectKey,
+            );
+            const storedConflict = this.controls
+              .list()
+              .some(
+                (c) =>
+                  !c.projectKey.startsWith(provider + ":") && c.projectName === name && c.projectKey !== projectKey,
+              );
+            const matches = directory.projects.filter((p) => p.name === name);
+            if (
+              directory.complete !== true ||
+              cachedConflict ||
+              storedConflict ||
+              matches.length !== 1 ||
+              matches[0].key !== projectKey ||
+              !(
+                (matches[0].capabilities?.startOwned === true &&
+                  matches[0].capabilities?.continuationMode === "managed-read-only") ||
+                (matches[0].capabilities?.queueBound === true &&
+                  matches[0].capabilities?.continuationMode === "bound-chat")
+              )
+            )
+              throw failure("DIRECT_GOAL_SCOPE_CHANGED");
+            if (threadId && chatTitle) {
+              const backend = this.catalog.connectors?.[provider];
+              const listed =
+                matches[0].capabilities?.queueBound && backend && (await backend.listWork(matches[0].nativeId));
+              const byTitle = listed?.items?.filter((row) => row.title === chatTitle);
+              if (
+                listed?.complete !== true ||
+                byTitle?.length !== 1 ||
+                byTitle[0].nativeId !== threadId ||
+                byTitle[0].projectId !== matches[0].nativeId
+              )
+                throw failure("DIRECT_GOAL_SCOPE_CHANGED");
+            }
+            return directory;
+          },
+        },
+        controls: this.controls,
+        actor: item.event.sender_id,
+        requestId: item.requestId,
+        readiness: async (...args) => {
+          const ready = await this.readiness(...args);
+          if (!authorized() || !this.cards.enabled() || !this.canCoordinate(projectKey, threadId))
+            return { ready: false };
+          return ready;
+        },
+        syncRules: this.syncRules,
+      },
+    );
+    if (result.code === "DIRECT_GOAL_SCOPE_CHANGED")
+      return reply("项目归属或目录还没核实，这次没有启动。请查看项目卡。");
+    if (result.ok && result.syncStatus === "confirmed")
+      result.text = `收到，我先看「${name}」的进展，再按目标往下做。需要你决定时，我会在这里给选项和建议。`;
+    return result;
+  }
+  async continueProject(item, alias, guard) {
+    const routing = guard();
+    const native = readConfig(this.config.nativeConfigFile);
+    const directory = await this.catalog.readProvider("codex");
+    guard();
+    const matches = directory.projects.filter((p) => projectAlias(p) === alias);
+    if (directory.complete !== true || matches.length !== 1) throw failure("DIRECT_GOAL_SCOPE_CHANGED");
+    const project = matches[0],
+      binding = native.managedCodex?.boundChats?.[project.key];
+    const opted = routing.directGoalProjects?.find(
+      (p) => p.projectKey === project.key && Date.parse(p.enabledAt) <= Number(item.event.create_time),
+    );
+    if (
+      !opted ||
+      !binding ||
+      project.capabilities?.queueBound !== true ||
+      !this.canCoordinate(project.key, binding.threadId) ||
+      !this.cards?.enabled?.()
+    )
+      throw failure("DIRECT_GOAL_SCOPE_CHANGED");
+    const before = this.controls.get(project.key);
+    if (before.mode === "active")
+      return {
+        ok: true,
+        action: "continue-project",
+        changed: false,
+        text: `「${project.name}」仍在按原目标推进，无需再确认目标。普通细节由大肥鱼处理；需要你的回复会留在原问题卡片中。`,
+        contextAlias: alias,
+        contextTopic: "project",
+      };
+    const action = before.mode === "paused" ? "resume" : "enable";
+    const check = () => {
+      guard();
+      const current = readConfig(this.config.nativeConfigFile).managedCodex?.boundChats?.[project.key];
+      if (JSON.stringify(current) !== JSON.stringify(binding)) throw failure("DIRECT_GOAL_SCOPE_CHANGED");
+    };
+    const result = await handleLoopCommand(
+      {
+        action,
+        target: project.key,
+        expectedRevision: before.revision,
+        expectedThreadId: binding.threadId,
+        ...(action === "enable"
+          ? {
+              objective:
+                commandText(item.event) +
+                "。沿原对话的最新进展和已授权范围接着推进，不重做已交付成果；普通可逆细节自行决定，重大取舍或确实需要本人补充的信息再问。",
+              maxSteps: null,
+            }
+          : {}),
+      },
+      {
+        catalog: {
+          refresh: async () => {
+            check();
+            return { complete: true, projects: [project] };
+          },
+        },
+        controls: this.controls,
+        actor: item.event.sender_id,
+        requestId: item.requestId,
+        readiness: async (p) => {
+          const ready = await this.readiness(p);
+          check();
+          return ready;
+        },
+        syncRules: this.syncRules,
+      },
+    );
+    return {
+      ...result,
+      contextAlias: alias,
+      contextTopic: "project",
+      ...(result.ok
+        ? { text: `收到，沿「${project.name}」的原对话继续。普通细节自行处理，阶段成果或重大决定再 @你。` }
+        : {}),
+    };
+  }
+  // Read-only conversations can finish independently, including two questions about the same project.
+  // Project control mutations still pass through the guarded command path.
+  async handleConversation(item, routing, route) {
+    const fresh = () => readRouting(this.config.naturalRoutingFile);
+    const guard = () => {
+      const current = fresh();
+      if (
+        this.stopping ||
+        !eligibleSemanticRoute(item.event, current) ||
+        routeProjectMessage(item.event, current) !== route ||
+        current.semanticQueries.enabledAt !== routing.semanticQueries.enabledAt ||
+        current.semanticQueries.decisionDir !== routing.semanticQueries.decisionDir
+      )
+        throw failure("SEMANTIC_SCOPE_CHANGED");
+      return current;
+    };
+    const deferred = route === "semantic";
+    try {
+      guard();
+      if (deferred && readSemanticRoute(item.event, routing) === "legacy") {
+        this.queue.discard(item.id, "LEGACY_ROUTE_CONFIRMED");
+        return;
+      }
+      const history = conversationContext(item, this.config, this.queue, {
+        nativeConfig: this.nativeConfig,
+        configFile: this.configFile,
+        controls: this.controls,
+        cardStore: this.cards.store,
+      });
+      let result = await this.cards.natural(item, commandText(item.event), {
+        ...history,
+        deferred,
+        guard,
+        signal: this.naturalAbort.signal,
+      });
+      if (result.action === "continue-project") result = await this.continueProject(item, result.targetAlias, guard);
+      const current = guard();
+      if (deferred) {
+        const prior = readSemanticRoute(item.event, current);
+        const owner = prior === "pending" ? (result.delegateLegacy ? "legacy" : "loop") : prior;
+        finishSemanticRoute(item.event, current, owner);
+        if (owner === "legacy") {
+          this.queue.discard(item.id, "LEGACY_ROUTE_CONFIRMED");
+          return;
+        }
+        if (result.delegateLegacy)
+          result = { ok: true, action: "natural-clarification", text: "要先看看项目进展，还是想安排具体工作？" };
+      }
+      const { response, ...saved } = result;
+      this.queue.saveResult(item.id, saved, response ?? projectReply(result, this.config));
+    } catch (error) {
+      if (!this.stopping) {
+        if (error.code === "SEMANTIC_SCOPE_CHANGED") this.queue.discard(item.id, "SCOPE_REVOKED");
+        else
+          this.queue.markFailure(item.id, "handling", safeError(error), { retryAfterMs: this.config.retryMs ?? 15000 });
+      }
+    }
+  }
+  drainNatural() {
+    return Promise.allSettled([...this.naturalJobs.values()]);
+  }
+  async tick({ sendReplies = true } = {}) {
+    this.batch = new Map();
+    const ingest = this.queue.ingest(this.config.queuePath, {
+      initialOffset: "tail",
+      filter: (event) => this.filter(event),
+    });
+    for (const item of this.queue.pending({ limit: 100 })) {
+      if (this.stopping) break;
+      if (this.naturalJobs.has(item.id)) continue;
+      if (!acceptsCommand(item.event, this.config)) {
+        this.queue.discard(item.id, "SCOPE_REVOKED");
+        continue;
+      }
+      try {
+        let command;
+        let result;
+        let directorySnapshot;
+        const requestCatalog = {
+          refresh: async () => {
+            directorySnapshot = await this.catalog.refresh();
+            return directorySnapshot;
+          },
+        };
+        try {
+          command = parseLoopCommand(commandText(item.event));
+        } catch (error) {
+          result = {
+            ok: false,
+            code: error.code ?? "LOOP_COMMAND_USAGE",
+            text: error.userMessage ?? "项目指令格式不正确，请使用 /loop 项目 查看说明。",
+          };
+        }
+        if (!result && !command && this.config.naturalRoutingFile) {
+          const routing = readRouting(this.config.naturalRoutingFile);
+          const goal = directGoalRequest(item.event, routing, commandText(item.event));
+          if (goal) result = await this.acceptGoal(item, goal);
+          else if (eligibleSemanticRoute(item.event, routing)) {
+            // Keep the item pending until its own result is durable. A fresh tick can service buttons immediately.
+            if (this.cards?.semanticQuery && this.naturalJobs.size < 3) {
+              const job = this.handleConversation(item, routing, routeProjectMessage(item.event, routing)).finally(() =>
+                this.naturalJobs.delete(item.id),
+              );
+              this.naturalJobs.set(item.id, job);
+            }
+            continue;
+          }
+        }
+        if (!result && !command && this.cards) result = await this.cards.natural(item, commandText(item.event));
+        if (!result)
+          result = await handleLoopCommand(command, {
+            catalog: requestCatalog,
+            controls: this.controls,
+            actor: item.event.sender_id,
+            requestId: item.requestId,
+            readiness: this.readiness,
+            syncRules: this.syncRules,
+            answerCard: this.answerCard,
+          });
+        const prepared =
+          result.response ?? (this.cards ? await this.cards.prepare(item, result, directorySnapshot) : null);
+        const { response: unused, ...savedResult } = result;
+        this.queue.saveResult(item.id, savedResult, prepared ?? projectReply(result, this.config));
+      } catch (error) {
+        this.queue.markFailure(item.id, "handling", safeError(error), { retryAfterMs: this.config.retryMs ?? 15000 });
+      }
+    }
+    if (sendReplies)
+      for (const item of this.queue.pendingReplies({ limit: 10 })) {
+        if (this.stopping) break;
+        if (!acceptsCommand(item.event, this.config)) {
+          this.queue.discard(item.id, "SCOPE_REVOKED");
+          continue;
+        }
+        if (item.replyAttempts >= (this.config.maxReplyAttempts ?? 3)) {
+          this.queue.markReplyAbandoned(item.id, "REPLY_RETRIES_EXHAUSTED");
+          continue;
+        }
+        try {
+          const ref = await this.reply(item);
+          if (item.response?.sessionId && this.cards) this.cards.bind(item.response.sessionId, ref);
+          this.queue.markReply(item.id, ref);
+        } catch (error) {
+          const failed = this.queue.markFailure(item.id, "reply", safeError(error), {
+            retryAfterMs: this.config.retryMs ?? Math.min(60000, 5000 * 2 ** item.replyAttempts),
+          });
+          if (failed.replyAttempts >= (this.config.maxReplyAttempts ?? 3))
+            this.queue.markReplyAbandoned(item.id, "REPLY_RETRIES_EXHAUSTED");
+        }
+      }
+    return {
+      observedAt: new Date().toISOString(),
+      ingest,
+      queue: this.queue.stats(),
+      editedCommandsIgnored: this.editedCommandsIgnored,
+    };
+  }
+}
+
+async function main() {
+  const file = process.argv[2];
+  if (!file) throw failure("RELAY_CONFIG_REQUIRED");
+  const config = JSON.parse(readFileSync(file, "utf8"));
+  const native = readConfig(config.nativeConfigFile);
+  const catalog = createCatalog(native);
+  const controls = new LoopControls(native.controlsFile);
+  const checkpointCards =
+    config.proactiveNotices?.enabled &&
+    config.proactiveNotices?.checkpoints &&
+    config.proactiveNotices?.checkpointStateFile &&
+    !process.argv.includes("--once")
+      ? new CheckpointDecisionCards({ configFile: file, config, nativeConfig: native, execute: runProgram })
+      : null;
+  const queue = new RelayQueue(config.databaseFile);
+  const runtime = native.loopHub
+    ? new NativeLoopRuntime({ nativeConfig: native, configFile: config.nativeConfigFile, controls })
+    : null;
+  const hub = !process.argv.includes("--once") ? await startLoopHub(native) : { stop: async () => {}, ready: false };
+  let subscriber, callbackQueue, callbackRelay, cards, cardStore, wake;
+  if (config.cardCallbacks?.enabled === true && !process.argv.includes("--once")) {
+    const c = { ...config, ...config.cardCallbacks };
+    try {
+      cardStore = new CardSessions(c.sessionsFile);
+      subscriber = new CardEventSubscriber(c, { onEvent: () => wake?.() });
+      await subscriber.start();
+      callbackQueue = new RelayQueue(c.databaseFile);
+      cards = new ProjectCardController(config, {
+        store: cardStore,
+        bindings: new ChatBindingStore({ configFile: config.nativeConfigFile, controls, catalog }),
+        catalog,
+        controls,
+        runtime,
+        semanticQuery: (q, opts) =>
+          interpretSemanticQuery(q, {
+            ...opts,
+            command: native.managedCodex.command,
+            projectHints: projectDiscoveryHints(
+              [...catalog.projects.values()].map((p) => ({ alias: projectAlias(p), roots: p.roots })),
+            ),
+          }),
+        answerChat: (q, opts) => answerSemanticChat(q, { ...opts, command: native.managedCodex.command }),
+        portfolio: (opts) =>
+          projectPortfolioStatus({ ...opts, nativeConfig: native, controls, catalog, checkpointCards }),
+        activity:
+          config.projectActivity?.enabled === true
+            ? new ProjectActivity(catalog, { ...config.projectActivity, boundChats: native.managedCodex?.boundChats })
+            : undefined,
+        transportReady: () => subscriber.status().ready,
+      });
+      callbackRelay = new FeishuCardRelay(c, {
+        queue: callbackQueue,
+        controller: cards,
+        execute: runProgram,
+        checkpointCards,
+        answerDecisionClick: runtime ? (args) => runtime.answerDecisionClick(args) : undefined,
+      });
+    } catch (error) {
+      await subscriber?.stop();
+      callbackQueue?.close();
+      cardStore?.close();
+      queue.close();
+      await catalog.close();
+      await hub.stop();
+      throw error;
+    }
+  }
+  const relay = new FeishuLoopRelay(config, {
+    nativeConfig: native,
+    configFile: file,
+    queue,
+    catalog,
+    controls,
+    cards,
+    ...(runtime
+      ? {
+          canCoordinate: (key, threadId) =>
+            (!threadId ||
+              (native.managedCodex?.boundChats?.[key]?.threadId === threadId &&
+                readConfig(config.nativeConfigFile).managedCodex?.boundChats?.[key]?.threadId === threadId)) &&
+            Array.isArray(native.managedCodex?.coordinatorProjectKeys) &&
+            native.managedCodex.coordinatorProjectKeys.includes(key) &&
+            !!runtime.layout().decisionChannel(config.profile, config.chatId),
+          readiness: (project) => runtime.readiness(project),
+          syncRules: (args) => runtime.sync(args),
+          answerCard: (args) => runtime.answerCard(args),
+        }
+      : {}),
+  });
+  const once = process.argv.includes("--once");
+  const noReply = process.argv.includes("--no-reply");
+  const notices =
+    runtime && !once && !noReply && config.proactiveNotices?.enabled
+      ? new BoundProgressNotices({
+          configFile: file,
+          config,
+          nativeConfig: native,
+          runtime,
+          onCheckpoint: checkpointCards ? (event) => checkpointCards.deliver(event) : undefined,
+        })
+      : null;
+  const statusFile = config.statusFile;
+  const artifacts =
+    !once && !noReply && config.artifactDelivery?.enabled
+      ? new ArtifactDelivery({
+          config,
+          nativeConfig: native,
+          readCurrent: () => {
+            const current = JSON.parse(readFileSync(file, "utf8"));
+            return { config: current, nativeConfig: readConfig(current.nativeConfigFile) };
+          },
+        })
+      : null;
+  let nextCompletionCheck = 0,
+    completionPending = false;
+  const settledControls = new Map();
+  const record = (value) => {
+    if (!statusFile) return;
+    mkdirSync(path.dirname(statusFile), { recursive: true, mode: 0o700 });
+    writeFileSync(statusFile + ".tmp", JSON.stringify(value, null, 2) + "\n", { mode: 0o600 });
+    renameSync(statusFile + ".tmp", statusFile);
+  };
+  process.on("SIGTERM", () => {
+    relay.stopping = true;
+    wake?.();
+  });
+  process.on("SIGINT", () => {
+    relay.stopping = true;
+    wake?.();
+  });
+  try {
+    do {
+      try {
+        notices?.pulse();
+        artifacts?.pulse();
+        if (
+          runtime &&
+          Date.now() >= nextCompletionCheck &&
+          (completionPending ||
+            controls
+              .list()
+              .some(
+                (c) =>
+                  c.maxSteps === null &&
+                  (c.mode === "active" ||
+                    (c.mode === "manual" &&
+                      c.actor === "goal-completion" &&
+                      settledControls.get(c.projectKey) !== c.revision)),
+              ))
+        ) {
+          const settled = await settleCompletedGoals({
+            nativeConfig: native,
+            configFile: config.nativeConfigFile,
+            controls,
+            runtime,
+          });
+          completionPending = settled.some((s) => s.status === "sync-pending");
+          for (const s of settled)
+            if (s.status === "completed") settledControls.set(s.projectKey, controls.get(s.projectKey).revision);
+          nextCompletionCheck = Date.now() + 5000;
+        }
+        const callbackState = callbackRelay ? await callbackRelay.tick() : undefined;
+        record({
+          status: "ready",
+          ...(await relay.tick({ sendReplies: !noReply })),
+          ...(artifacts ? { artifacts: artifacts.status() } : {}),
+          ...(subscriber
+            ? { callbacks: { ...subscriber.status(), verified: cards.enabled(), queue: callbackState?.queue } }
+            : {}),
+        });
+        if (subscriber && !subscriber.status().ready) throw failure("CARD_SUBSCRIBER_STOPPED");
+      } catch (error) {
+        record({ status: "blocked", errorCode: safeError(error), observedAt: new Date().toISOString() });
+        if (once || error.code === "CARD_SUBSCRIBER_STOPPED") throw error;
+      }
+      if (once || relay.stopping) break;
+      await new Promise((resolve) => {
+        const timer = setTimeout(() => {
+          wake = undefined;
+          resolve();
+        }, 2000);
+        wake = () => {
+          clearTimeout(timer);
+          wake = undefined;
+          resolve();
+        };
+      });
+    } while (!relay.stopping);
+  } finally {
+    relay.stopping = true;
+    relay.naturalAbort.abort();
+    await notices?.stop();
+    await artifacts?.stop();
+    await relay.drainNatural();
+    await subscriber?.stop();
+    callbackQueue?.close();
+    cardStore?.close();
+    queue.close();
+    await catalog.close();
+    await hub.stop();
+    record({ status: "stopped", observedAt: new Date().toISOString() });
+  }
+}
+if (process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1])) {
+  main().catch((error) => {
+    console.error(JSON.stringify({ error: safeError(error) }));
+    process.exitCode = 1;
+  });
+}
