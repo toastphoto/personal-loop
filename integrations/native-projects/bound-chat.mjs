@@ -96,12 +96,12 @@ function turnResult(turn, id, text) {
   if (turn.status !== "completed") return result;
   // Multiple user inputs in one turn can steer one another. Do not attribute that turn's answer to a single handoff.
   if (turn.items.filter((i) => i?.type === "userMessage").length !== 1)
-    return { ...result, code: "BOUND_AMBIGUOUS_TURN" };
+    return { ...result, code: "BOUND_AMBIGUOUS_TURN", nativeCompleted: true };
   const after = turn.items.slice(turn.items.indexOf(matches[0]) + 1);
   const finals = after.filter(
     (i) => i?.type === "agentMessage" && i.phase === "final_answer" && typeof i.text === "string" && i.text.trim(),
   );
-  if (finals.length !== 1) return { ...result, code: "BOUND_FINAL_UNCONFIRMED" };
+  if (finals.length !== 1) return { ...result, code: "BOUND_FINAL_UNCONFIRMED", nativeCompleted: true };
   return { ...result, status: "completed", reply: finals[0].text };
 }
 function journal(config, root, readOnly) {

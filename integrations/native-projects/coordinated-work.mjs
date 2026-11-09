@@ -273,6 +273,9 @@ export function coordinatorStage({ history, context, goal, subject, completedSte
       initialHandoff,
       ...known,
       plan: prior.plan ?? plan,
+      ...(prior.projectLed
+        ? { projectLed: true, ...(prior.reportSha256 ? { reportSha256: prior.reportSha256 } : {}) }
+        : {}),
       ...(prior.chosen ? { chosen: prior.chosen } : {}),
       ...(prior.chosenQuestion ? { chosenQuestion: prior.chosenQuestion } : {}),
     };

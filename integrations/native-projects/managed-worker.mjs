@@ -296,6 +296,7 @@ export async function runManagedWorker(
             current.root !== cwd ||
             current.projectId !== project.nativeId ||
             liveOptions.stateDir !== options.stateDir ||
+            liveOptions.coordinationMode !== options.coordinationMode ||
             liveOptions.projectRoots?.[projectKey] !== configuredRoot ||
             (configFile && liveOptions.command !== options.command)
           )

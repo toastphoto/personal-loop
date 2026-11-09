@@ -13,12 +13,25 @@ import {
 } from "./coordinated-work.mjs";
 import { failure } from "./catalog.mjs";
 import { redact } from "./project-activity.mjs";
+import {
+  readProjectReport,
+  projectReportAction,
+  reporterPrompt,
+  parseReporterSummary,
+  assertProjectReportUnchanged,
+} from "./project-report.mjs";
 const minute = 60000;
 const jsonReceipt = (summary, body) =>
   summary + "\n```agent-autoloop\n" + JSON.stringify(body).replaceAll("`", "\\u0060") + "\n```";
 export function boundHandoffText(goal, stage, canAsk) {
   const sentence = (text) => text.trim().replace(/[。]+$/u, "");
-  const lines = [stage.initialHandoff ? "大肥鱼接续目标：" + goal.objective : "大肥鱼续办"];
+  const lines = [
+    stage.initialHandoff
+      ? (stage.projectLed ? "项目自主接续目标：" : "大肥鱼接续目标：") + goal.objective
+      : stage.projectLed
+        ? "项目自主推进续接"
+        : "大肥鱼续办",
+  ];
   if (stage.freshAnswer) {
     if (stage.answerText) lines.push("本人新补充：" + stage.answerText + "\n以这次真实回复为准，事实仍需核实。");
     if (stage.chosen && stage.chosen !== "我已处理，重新核实")
@@ -41,6 +54,10 @@ export function boundHandoffText(goal, stage, canAsk) {
         "确需本人取舍时，用‘需要你拍板：’提出一个问题、2–5个真实选项及一句推荐理由；只缺资料时，用‘需要你协助：’说明缺什么，并写‘已核对：’。不要替本人编造已处理的事实。",
       );
   } else lines.push("沿已确认的范围和权限推进；阶段成果简报，重大取舍再问本人。");
+  if (stage.projectLed)
+    lines.push(
+      "具体安排来自你自己的项目报告。你负责主线和技术判断，发现偏离则自主纠正并说明。完成后更新PROJECT_REPORT.json，在最终回复开头附PROJECT_REPORT_SHA256:及文件实际SHA-256；临时汇报员只总结，不替你制定路线。",
+    );
   return lines.join("\n\n");
 }
 // Parse one complete, current-turn decision. Quotations, examples in longer answers and ordinary questions remain prose.
@@ -113,6 +130,17 @@ export async function runBoundStage(
   deps,
 ) {
   guard();
+  const projectLed = config?.managedCodex?.coordinationMode === "project-led";
+  // A mode cutover must review an old central plan, never blindly dispatch it after resume.
+  if (projectLed && stage.role === "worker" && !stage.projectLed && !stage.freshAnswer)
+    stage = { ...stage, role: "router" };
+  if (projectLed && stage.role === "worker" && stage.freshAnswer) {
+    const answer = projectReportAction({ status: "missing" }, stage);
+    stage = {
+      ...stage,
+      plan: { progress: answer.progress, nextStep: answer.nextStep, expectedResult: answer.expectedResult },
+    };
+  }
   if (stage.role === "router" || stage.role === "router-review") {
     if (config.providers?.codex?.allowConversationPreview !== true) throw failure("BOUND_PREVIEW_DISABLED");
     const primary = await (deps.readBoundProgress ?? readBoundProgress)({
@@ -132,6 +160,49 @@ export async function runBoundStage(
       boundProgress: primary,
     });
     const packet = JSON.parse(readFileSync(file, "utf8"));
+    if (projectLed) {
+      const source = readProjectReport({ cwd, primary });
+      const action = projectReportAction(source, stage);
+      // Validate the project's proposal using existing scope, duplicate-step and owner-decision rules before inference.
+      const parsed = coordinatedResult(JSON.stringify(action), {
+        stage,
+        goalId,
+        runId,
+        remaining,
+        subject,
+        untilDone: goal.maxSteps === null,
+      });
+      let summary, done;
+      if (source.status === "verified") {
+        done = await (deps.runEphemeralCoordinator ?? runEphemeralCoordinator)({
+          command: config.managedCodex.command,
+          prompt: reporterPrompt({ report: source, goal }),
+          timeoutMs: config.managedCodex.waitTimeoutMs,
+          signal,
+          beforeStart: guard,
+        });
+        summary = parseReporterSummary(done.text, source.sha256);
+        guard();
+        if (readProjectReport({ cwd, primary }).sha256 !== source.sha256) throw failure("PROJECT_REPORT_CHANGED");
+      }
+      return {
+        ...parsed,
+        state: "completed",
+        evidence: { ...evidence, projectReportStatus: source.status, reportSha256: source.sha256 },
+        originalText: JSON.stringify(action),
+        usageStatus: done?.turnUsageStatus ?? "not-reported",
+        ...(done?.turnUsage && { usage: done.turnUsage }),
+        coordinator: {
+          ...parsed.coordinator,
+          projectLed: true,
+          reportSha256: source.sha256,
+          reportSummary: summary,
+          ...(stage.role === "router-review" && {
+            reviewSource: { plan: stage.plan, reply: stage.reply, turnId: stage.previousTurn },
+          }),
+        },
+      };
+    }
     const prompt = coordinatedPrompt({ stage, goal, cwd, remaining, packet });
     const done = await (deps.runEphemeralCoordinator ?? runEphemeralCoordinator)({
       command: config.managedCodex.command,
@@ -186,6 +257,12 @@ export async function runBoundStage(
     };
   }
   const inspect = stage.role === "bound-observe";
+  const dispatchGuard = () => {
+    guard();
+    if (projectLed && !inspect && !stage.freshAnswer && stage.reportSha256)
+      assertProjectReportUnchanged(cwd, stage.reportSha256);
+  };
+  dispatchGuard();
   if (!inspect && !stage.answerCard && stage.completedStepHashes?.includes(planFingerprint(stage.plan)))
     throw failure("COORDINATOR_REPEATED_STEP");
   const now = Date.now();
@@ -194,8 +271,9 @@ export async function runBoundStage(
     ? stage.handoff
     : {
         requestId: "native-run:" + executionKey,
-        text: boundHandoffText(goal, stage, canAsk),
+        text: boundHandoffText(goal, { ...stage, projectLed }, canAsk),
         plan: stage.plan,
+        ...(stage.reportSha256 && { reportSha256: stage.reportSha256 }),
         ...(stage.chosen ? { chosen: stage.chosen } : {}),
         ...(stage.chosenQuestion ? { chosenQuestion: stage.chosenQuestion } : {}),
         ...(stage.decisions?.length ? { decisions: stage.decisions } : {}),
@@ -212,7 +290,7 @@ export async function runBoundStage(
     projectKey,
     requestId: handoff.requestId,
     text: handoff.text,
-    beforeMutation: guard,
+    beforeMutation: dispatchGuard,
   });
   const meta = {
     role: inspect ? "bound-observe" : "worker",
@@ -230,6 +308,28 @@ export async function runBoundStage(
     coordinator: { ...meta, ...extra },
     usageStatus: "not-reported",
   });
+  if (
+    projectLed &&
+    found.threadId === binding.threadId &&
+    found.turnId &&
+    found.nativeCompleted === true &&
+    ["BOUND_AMBIGUOUS_TURN", "BOUND_FINAL_UNCONFIRMED"].includes(found.code)
+  ) {
+    const timer = continuationTimer(goalId, runId, "review");
+    return summary(
+      "原回合已结束，按项目最新报告核对接续。",
+      { later: [timer] },
+      {
+        action: "review-progress",
+        timer,
+        turnId: found.turnId,
+        plan: stage.plan,
+        reply:
+          "旧回合已结束，但多条输入使单项任务的结果归属未能单独确认。不认定旧任务成功，不重派；下一步只依据原项目最新认可的报告，缺报告先请项目补齐。",
+        attribution: "completed-turn-unattributed",
+      },
+    );
+  }
   if (
     found.threadId === binding.threadId &&
     found.status === "completed" &&
