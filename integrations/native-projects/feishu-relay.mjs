@@ -26,6 +26,7 @@ import { BoundProgressNotices } from "./bound-progress-notices.mjs";
 import { CheckpointDecisionCards } from "./checkpoint-decision-card.mjs";
 import { settleCompletedGoals } from "./goal-completion.mjs";
 import { projectDiscoveryHints } from "./project-context.mjs";
+import { ArtifactDelivery } from "./artifact-delivery.mjs";
 
 export function acceptsCommand(event, config) {
   return (
@@ -599,6 +600,17 @@ async function main() {
         })
       : null;
   const statusFile = config.statusFile;
+  const artifacts =
+    !once && !noReply && config.artifactDelivery?.enabled
+      ? new ArtifactDelivery({
+          config,
+          nativeConfig: native,
+          readCurrent: () => {
+            const current = JSON.parse(readFileSync(file, "utf8"));
+            return { config: current, nativeConfig: readConfig(current.nativeConfigFile) };
+          },
+        })
+      : null;
   let nextCompletionCheck = 0,
     completionPending = false;
   const settledControls = new Map();
@@ -620,6 +632,7 @@ async function main() {
     do {
       try {
         notices?.pulse();
+        artifacts?.pulse();
         if (
           runtime &&
           Date.now() >= nextCompletionCheck &&
@@ -650,6 +663,7 @@ async function main() {
         record({
           status: "ready",
           ...(await relay.tick({ sendReplies: !noReply })),
+          ...(artifacts ? { artifacts: artifacts.status() } : {}),
           ...(subscriber
             ? { callbacks: { ...subscriber.status(), verified: cards.enabled(), queue: callbackState?.queue } }
             : {}),
@@ -676,6 +690,7 @@ async function main() {
     relay.stopping = true;
     relay.naturalAbort.abort();
     await notices?.stop();
+    await artifacts?.stop();
     await relay.drainNatural();
     await subscriber?.stop();
     callbackQueue?.close();

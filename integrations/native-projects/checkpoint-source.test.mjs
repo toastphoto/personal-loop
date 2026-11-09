@@ -14,6 +14,20 @@ const config = {
 };
 const target = { projectKey: key, threadId: tid };
 const at = Date.now();
+test("a stage artifact receipt is not also published as a duplicate short notification", async () => {
+  let calls = 0;
+  const item = { text: "<!-- PROJECT_DELIVERY: stage-v1 " + "a".repeat(64) + " -->\n阶段完成" };
+  assert.deepEqual(
+    await classifyCheckpoint(item, {
+      run: async () => {
+        calls++;
+        return { text: "" };
+      },
+    }),
+    { kind: "ignore" },
+  );
+  assert.equal(calls, 0);
+});
 function transport(entries) {
   return {
     connect: async () => {},

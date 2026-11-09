@@ -7,6 +7,7 @@ import { verifiedNoticeProject } from "./bound-progress-notices.mjs";
 import { redact } from "./project-activity.mjs";
 import { projectAlias } from "./feishu-commands.mjs";
 import { subjectFor } from "./controls.mjs";
+import { artifactReplySource } from "./artifact-delivery.mjs";
 
 const msg = (v) => typeof v === "string" && /^om_[A-Za-z0-9_-]{1,160}$/u.test(v);
 const topicId = (v) => typeof v === "string" && /^(?:omt|om)_[A-Za-z0-9_-]{1,160}$/u.test(v);
@@ -199,13 +200,25 @@ export function conversationContext(
       history: sorted.flatMap((v) => v.history),
     };
   };
+  const externalReply = (ref) => {
+    const artifact = artifactReplySource(config, nativeConfig, ref, explicitCut, at);
+    const alias = artifact && aliasFor(artifact.projectKey);
+    return alias
+      ? {
+          basis: "reply",
+          contextAlias: alias,
+          contextTopic: "project:" + alias,
+          history: [{ role: "assistant", text: clip(artifact.summary) }],
+        }
+      : (hubReply(ref, config, nativeConfig, controls, explicitCut, at, configFile) ?? empty());
+  };
   try {
     const direct = e.reply_to ?? e.parent_id;
     if (direct != null && direct !== "") {
       if (!msg(direct)) return empty();
       const hits = find(direct);
       if (hits.length > 1) return empty("ambiguous");
-      if (!hits.length) return hubReply(direct, config, nativeConfig, controls, explicitCut, at, configFile) ?? empty();
+      if (!hits.length) return externalReply(direct);
       const row = hits[0];
       if (!row.delivered) return empty();
       const earlier = msg(row.parent) ? find(row.parent) : [];
@@ -234,7 +247,7 @@ export function conversationContext(
     if (!rows.length && confined && msg(e.root_id)) {
       const root = find(e.root_id);
       if (root.length === 1 && root[0].delivered) return bundle("topic", root);
-      return hubReply(e.root_id, config, nativeConfig, controls, explicitCut, at, configFile) ?? empty();
+      return externalReply(e.root_id);
     }
     if (!rows.length) return empty();
     if (rows.length >= 13 || rows.some((v) => !v.delivered || (!confined && !v.affinity))) return empty("ambiguous");

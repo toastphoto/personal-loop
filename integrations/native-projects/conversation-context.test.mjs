@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import path from "node:path";
 import { tmpdir } from "node:os";
 import { createHash } from "node:crypto";
-import { chmodSync, realpathSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, realpathSync, mkdtempSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
 import { subjectFor } from "./controls.mjs";
 import { DatabaseSync } from "node:sqlite";
 import { conversationContext } from "./conversation-context.mjs";
@@ -106,6 +106,41 @@ test("direct references to the delivered bot reply or original owner message sel
   assert.equal(f.get().basis, "ambiguous");
   assert.deepEqual(f.get().history, []);
   assert.equal(f.get({ reply_to: "om_unknown", root_id: "om_a" }).basis, "none");
+});
+
+test("a reply to an automatically delivered image report retains its project without using another recent topic", (t) => {
+  const f = fixture(t),
+    root = realpathSync(mkdtempSync(path.join(tmpdir(), "artifact-reply-")));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  chmodSync(root, 0o700);
+  const key = "codex:local:company",
+    target = { projectKey: key, root: "/project", threadId: "original", projectName: "公司项目" };
+  const dir = path.join(root, "a".repeat(64));
+  mkdirSync(dir, { mode: 0o700 });
+  const file = path.join(dir, "delivery.json");
+  const state = {
+    status: "delivered",
+    messageId: "om_artifact",
+    verifiedAt: new Date(now - 500).toISOString(),
+    sendAttemptAt: now - 1500,
+    source: { at: now - 2000 },
+    destination: { profile: cfg.profile, chatId: chat, ownerId: owner },
+    target,
+    report: { title: "成果回源已修复", summary: "合成项目中回到正确所属项目" },
+    readback: { message_id: "om_artifact", chat_id: chat, deleted: false },
+  };
+  writeFileSync(file, JSON.stringify(state), { mode: 0o600 });
+  const config = { ...cfg, artifactDelivery: { stateDir: root, targets: [target] } },
+    nativeConfig = { managedCodex: { boundChats: { [key]: { threadId: "original", root: "/project" } } } };
+  f.add("other", { alias: second });
+  const got = f.get({ reply_to: "om_artifact" }, { nativeConfig }, config);
+  assert.equal(got.basis, "reply");
+  assert.match(got.contextAlias, /^C-/);
+  assert.notEqual(got.contextAlias, second);
+  assert(got.history[0].text.includes("成果回源"));
+  state.status = "retry";
+  writeFileSync(file, JSON.stringify(state));
+  assert.equal(f.get({ reply_to: "om_artifact" }, { nativeConfig }, config).contextAlias, undefined);
 });
 test("explicit thread affinity, group/owner scoping and no future or stale recent carry-over", (t) => {
   const f = fixture(t);

@@ -268,6 +268,9 @@ function decode(raw, item) {
   return v;
 }
 export async function classifyCheckpoint(item, { command, signal, beforeStart, run = runEphemeralCoordinator } = {}) {
+  // Explicit artifact receipts have their own image/link delivery path, not a second text-only notification.
+  if (/^(?:<!-- )?PROJECT_DELIVERY: [a-z0-9][a-z0-9_-]{0,79} [a-f0-9]{64}(?: -->)?(?:\r?\n|$)/.test(item?.text ?? ""))
+    return { kind: "ignore" };
   if (
     !item ||
     typeof item.text !== "string" ||
